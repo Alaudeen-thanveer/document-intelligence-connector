@@ -1,0 +1,16 @@
+{
+  "doc_type": "irrelevant",
+  "description": "Marketing newsletter — should classify via heuristics as irrelevant",
+  "input": {
+    "file_url": "https://example.com/fixtures/march-newsletter.txt",
+    "sender": "updates@mailchimp.com",
+    "filename": "march_newsletter_promo.pdf",
+    "source": "email"
+  },
+  "expected": {
+    "doc_type": "irrelevant",
+    "method": "heuristic",
+    "min_confidence": 0.85
+  },
+  "page1_text": "You're invited! Spring marketing promo — 20% off our webinar series. Unsubscribe anytime."
+}

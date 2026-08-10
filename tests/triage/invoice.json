@@ -1,0 +1,16 @@
+{
+  "doc_type": "invoice",
+  "description": "Clear invoice filename + billing sender — should classify via heuristics",
+  "input": {
+    "file_url": "https://example.com/fixtures/acme-invoice-1042.txt",
+    "sender": "billing@acme-supplies.com",
+    "filename": "INV-1042_acme_invoice.pdf",
+    "source": "email"
+  },
+  "expected": {
+    "doc_type": "invoice",
+    "method": "heuristic",
+    "min_confidence": 0.85
+  },
+  "page1_text": "ACME Supplies\nINVOICE #1042\nBill To: Contoso LLC\nTotal Due: $1,240.00\nDue Date: 2026-09-01"
+}

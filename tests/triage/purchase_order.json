@@ -1,0 +1,16 @@
+{
+  "doc_type": "purchase_order",
+  "description": "PO filename + purchasing sender — should classify via heuristics",
+  "input": {
+    "file_url": "https://example.com/fixtures/po-7781.txt",
+    "sender": "purchasing@contoso.com",
+    "filename": "PO-7781_office_supplies.pdf",
+    "source": "email"
+  },
+  "expected": {
+    "doc_type": "purchase_order",
+    "method": "heuristic",
+    "min_confidence": 0.85
+  },
+  "page1_text": "PURCHASE ORDER\nPO Number: 7781\nVendor: ACME Supplies\nShip To: Contoso Warehouse\nLine 1: Copier paper — Qty 50"
+}

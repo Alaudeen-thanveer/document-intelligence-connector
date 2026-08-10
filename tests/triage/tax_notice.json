@@ -1,0 +1,16 @@
+{
+  "doc_type": "tax_notice",
+  "description": "Tax notice filename + IRS sender — should classify via heuristics",
+  "input": {
+    "file_url": "https://example.com/fixtures/irs-cp2000.txt",
+    "sender": "notices@irs.gov",
+    "filename": "IRS_tax_notice_CP2000.pdf",
+    "source": "email"
+  },
+  "expected": {
+    "doc_type": "tax_notice",
+    "method": "heuristic",
+    "min_confidence": 0.85
+  },
+  "page1_text": "Department of the Treasury — Internal Revenue Service\nNotice CP2000\nWe are proposing changes to your tax return.\nTax Year: 2024\nProposed balance due: $420.00"
+}
