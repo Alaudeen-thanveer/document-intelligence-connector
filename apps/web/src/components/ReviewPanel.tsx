@@ -167,7 +167,7 @@ export function ReviewPanel({
       );
     } else if (zoho.vendors.length + zoho.customers.length > 0) {
       setMatchHint(
-        "No vendor or customer match — pick the posting type and party manually.",
+        "No vendor or customer match. Pick the party manually — if it is genuinely new, create it in Zoho Books first, then Sync. Vendors are never created from here.",
       );
     } else {
       setMatchHint(null);
@@ -982,7 +982,9 @@ export function ReviewPanel({
                 }}
               >
                 <option value="">
-                  {postAs === "bill" ? "— auto (create if new) —" : "— none —"}
+                  {postAs === "bill"
+                    ? "— auto-match from Zoho vendors —"
+                    : "— none —"}
                 </option>
                 {zoho.vendors.map((v) => (
                   <option key={v.zoho_id} value={v.zoho_id}>

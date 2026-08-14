@@ -537,62 +537,6 @@ async function fetchAccountsFromZoho(
   })).filter((a) => a.account_id && a.account_name);
 }
 
-async function ensureVendorInZoho(
-  accessToken: string,
-  vendorName: string,
-  opts?: { vatOnDocument?: boolean },
-): Promise<ZohoVendor> {
-  // Search first — Zoho allows duplicate contact names, so relying on the
-  // create call to reject duplicates silently multiplies vendors.
-  try {
-    const existing = await fetchVendorsFromZoho(accessToken);
-    const hit = existing.find((v) =>
-      v.vendor_name.trim().toLowerCase() === vendorName.trim().toLowerCase()
-    );
-    if (hit) return hit;
-  } catch (err) {
-    console.warn(
-      "vendor pre-search failed; proceeding to create:",
-      err instanceof Error ? err.message : String(err),
-    );
-  }
-
-  const body = {
-    contact_name: vendorName,
-    contact_type: "vendor",
-    // A vendor that charged VAT on this document must be VAT-registered.
-    // Zoho otherwise defaults to vat_not_registered and then rejects the
-    // bill's VAT lines with code 71538.
-    ...(opts?.vatOnDocument ? { tax_treatment: "vat_registered" } : {}),
-  };
-  const url =
-    `${apiBase()}/contacts?organization_id=${encodeURIComponent(orgId())}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Zoho-oauthtoken ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  const raw = await res.json();
-  if (!res.ok) {
-    // Duplicate name — re-fetch list and match.
-    const vendors = await fetchVendorsFromZoho(accessToken);
-    const hit = vendors.find((v) =>
-      v.vendor_name.trim().toLowerCase() === vendorName.trim().toLowerCase()
-    );
-    if (hit) return hit;
-    throw new Error(
-      `Zoho vendor create failed (${res.status}): ${JSON.stringify(raw)}`,
-    );
-  }
-  const contact = (raw as { contact?: Record<string, unknown> })?.contact;
-  return {
-    vendor_id: String(contact?.contact_id ?? ""),
-    vendor_name: String(contact?.contact_name ?? vendorName),
-  };
-}
 
 async function loadDocumentBytes(
   supabase: SupabaseClient,
@@ -1074,14 +1018,10 @@ Deno.serve(async (req) => {
     // input.expense_category stays supported as a per-request matching hint.
     const expenseCategory = input.expense_category ?? null;
     const defaultVendorId = Deno.env.get("ZOHO_DEFAULT_VENDOR_ID")?.trim();
-    const autoCreateVendor =
-      (Deno.env.get("ZOHO_AUTO_CREATE_VENDOR")?.trim() || "true")
-        .toLowerCase() !== "false";
 
     // Fast path: with an explicit account we can skip chart-of-accounts fetch.
     const needAccounts = accounts.length === 0 && !input.account_id?.trim();
-    const needVendors = vendors.length === 0 && !defaultVendorId &&
-      !autoCreateVendor;
+    const needVendors = vendors.length === 0 && !defaultVendorId;
 
     if (needVendors || needAccounts) {
       const { result: tokenProbe, accessToken: token, retried } =
@@ -1196,46 +1136,10 @@ Deno.serve(async (req) => {
       matched.unresolved = matched.unresolved_fields.length > 0;
     }
 
-    // New vendor → create in sandbox org rather than failing.
-    if (
-      matched.unresolved_fields.includes("vendor") &&
-      mapped.vendor_name &&
-      autoCreateVendor
-    ) {
-      const { result, accessToken: tok, retried: vendorRetried } =
-        await withZohoRetry(async (t) => {
-          try {
-            const created = await ensureVendorInZoho(t, mapped.vendor_name!, {
-              vatOnDocument: (mapped.tax_amount ?? 0) > 0,
-            });
-            vendors = [...vendors, created];
-            return { ok: true, status: 200, raw: created };
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            return { ok: false, status: 500, raw: { error: msg } };
-          }
-        });
-      accessToken = tok;
-      if (result.ok) {
-        const created = result.raw as ZohoVendor;
-        matched = {
-          ...matched,
-          unresolved_fields: matched.unresolved_fields.filter((f) =>
-            f !== "vendor"
-          ),
-          bill: { ...matched.bill, vendor_id: created.vendor_id },
-          vendor_match: {
-            vendor_id: created.vendor_id,
-            vendor_name: created.vendor_name,
-            confidence: 1,
-          },
-        };
-        matched.unresolved = matched.unresolved_fields.length > 0;
-        console.log(
-          `Ensured sandbox vendor for push (retried=${vendorRetried})`,
-        );
-      }
-    }
+    // Vendors are NEVER created from here — masters flow from Zoho Books
+    // into this app, not the other way around. An unmatched vendor routes
+    // the document to review, where the reviewer picks a synced vendor
+    // (creating it in Zoho Books first if it is genuinely new).
 
     if (matched.unresolved_fields.includes("vendor") && defaultVendorId) {
       matched = {
@@ -1316,7 +1220,7 @@ Deno.serve(async (req) => {
           unresolved_fields: matched.unresolved_fields,
           document_id: input.document_id,
           hint:
-            "Pick the account in the review UI, or save a default account rule for this vendor. Correct the vendor name if it should match a Zoho vendor.",
+            "Pick the vendor and account in the review UI. Vendors are never created from here — if this vendor is new, create it in Zoho Books, sync, then approve again.",
         },
         409,
       );
