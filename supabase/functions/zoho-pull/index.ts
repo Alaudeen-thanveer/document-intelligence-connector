@@ -353,6 +353,9 @@ async function fetchKind(
       extra: {
         company_name: c.company_name ?? null,
         status: c.status ?? null,
+        // Party-level default only; treatment is decided per transaction at
+        // push time (a VAT-registered party can have an out-of-scope bill).
+        tax_treatment: c.tax_treatment || null,
       },
     }))
     .filter((r) => r.zoho_id && r.name);

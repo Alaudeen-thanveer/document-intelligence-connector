@@ -31,6 +31,13 @@ interface PushInput {
   account_id?: string | null;
   /** Bank/cash account the expense was paid through (expense only). */
   paid_through_account_id?: string | null;
+  /**
+   * VAT treatment for THIS transaction (e.g. vat_registered, out_of_scope).
+   * Treatment is transactional, not just party-level — a VAT-registered
+   * vendor can still have an out-of-scope bill. When omitted, Zoho applies
+   * the contact's own default treatment.
+   */
+  tax_treatment?: string | null;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -685,6 +692,9 @@ Deno.serve(async (req) => {
           customer_id: input.customer_id.trim(),
           date: mapped.date,
           reference_number: referenceNumber,
+          ...(input.tax_treatment?.trim()
+            ? { tax_treatment: input.tax_treatment.trim() }
+            : {}),
           line_items: [
             {
               description: mapped.vendor_name
@@ -746,6 +756,9 @@ Deno.serve(async (req) => {
           date: mapped.date,
           amount: mapped.line_items[0].rate,
           reference_number: referenceNumber,
+          ...(input.tax_treatment?.trim()
+            ? { tax_treatment: input.tax_treatment.trim() }
+            : {}),
           description: mapped.vendor_name
             ? `Expense — ${mapped.vendor_name}`
             : "Imported expense",
@@ -1070,9 +1083,14 @@ Deno.serve(async (req) => {
       );
     }
 
-    const billBody = toZohoBillBody(matched.bill, {
-      billNumber: `DIC-${input.document_id.replace(/-/g, "").slice(0, 12)}-${Date.now().toString(36)}`,
-    });
+    const billBody = {
+      ...toZohoBillBody(matched.bill, {
+        billNumber: `DIC-${input.document_id.replace(/-/g, "").slice(0, 12)}-${Date.now().toString(36)}`,
+      }),
+      ...(input.tax_treatment?.trim()
+        ? { tax_treatment: input.tax_treatment.trim() }
+        : {}),
+    };
     const {
       result: createResult,
       accessToken: tokenAfterCreate,

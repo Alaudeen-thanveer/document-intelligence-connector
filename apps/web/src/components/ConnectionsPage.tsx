@@ -23,13 +23,29 @@ const ZOHO_KINDS: KindSection[] = [
   {
     key: "vendor",
     label: "Vendors",
-    detail: (r) => String((r.extra as { status?: unknown })?.status ?? ""),
+    detail: (r) => {
+      const extra = r.extra as {
+        status?: unknown;
+        tax_treatment?: unknown;
+      } | null;
+      return [extra?.status, extra?.tax_treatment ?? "no tax treatment"]
+        .filter(Boolean)
+        .join(" · ");
+    },
     emptyHint: "No vendors cached yet — run a sync.",
   },
   {
     key: "customer",
     label: "Customers",
-    detail: (r) => String((r.extra as { status?: unknown })?.status ?? ""),
+    detail: (r) => {
+      const extra = r.extra as {
+        status?: unknown;
+        tax_treatment?: unknown;
+      } | null;
+      return [extra?.status, extra?.tax_treatment ?? "no tax treatment"]
+        .filter(Boolean)
+        .join(" · ");
+    },
     emptyHint: "No customers cached yet — run a sync.",
   },
   {
