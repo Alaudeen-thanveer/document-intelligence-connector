@@ -49,7 +49,7 @@ export function ReviewPanel({
   const [accountId, setAccountId] = useState("");
   const [paidThroughId, setPaidThroughId] = useState("");
   const [matchHint, setMatchHint] = useState<string | null>(null);
-  const [vendorRule, setVendorRule] = useState<
+  const [partyRule, setPartyRule] = useState<
     { account_zoho_id: string; account_name: string } | null
   >(null);
   const [accountTouched, setAccountTouched] = useState(false);
@@ -68,36 +68,39 @@ export function ReviewPanel({
     setCustomerId("");
     setAccountId("");
     setPaidThroughId("");
-    setVendorRule(null);
+    setPartyRule(null);
     setAccountTouched(false);
   }, [extracted, document?.id]);
 
-  // Per-vendor default account rule: prefill the account when a vendor is
-  // chosen, unless the reviewer already edited the account for this
-  // transaction. The rule itself is never changed by a one-off override.
+  // Per-party default account rule (vendor for bills/expenses, customer for
+  // invoices): prefill the account when the party is chosen, unless the
+  // reviewer already edited the account for this transaction. The rule
+  // itself is never changed by a one-off override.
   useEffect(() => {
-    if (!vendorId) {
-      setVendorRule(null);
+    const isInvoice = postAs === "invoice";
+    const partyId = isInvoice ? customerId : vendorId;
+    if (!partyId) {
+      setPartyRule(null);
       return;
     }
     let cancelled = false;
     void supabase
-      .from("vendor_account_rules")
+      .from(isInvoice ? "customer_account_rules" : "vendor_account_rules")
       .select("account_zoho_id, account_name")
-      .eq("vendor_zoho_id", vendorId)
+      .eq(isInvoice ? "customer_zoho_id" : "vendor_zoho_id", partyId)
       .maybeSingle()
       .then(({ data }) => {
         if (cancelled) return;
         const rule = (data ?? null) as
           | { account_zoho_id: string; account_name: string }
           | null;
-        setVendorRule(rule);
+        setPartyRule(rule);
         if (rule && !accountTouched) setAccountId(rule.account_zoho_id);
       });
     return () => {
       cancelled = true;
     };
-  }, [vendorId, accountTouched, rulesVersion]);
+  }, [vendorId, customerId, postAs, accountTouched, rulesVersion]);
 
   // Auto-default the posting type from the extracted party name:
   // vendor match → Bill (user may still switch to Expense);
@@ -214,45 +217,59 @@ export function ReviewPanel({
     onChanged();
   }
 
-  async function saveVendorRule() {
-    if (!vendorId || !accountId) return;
-    const vendor = zoho.vendors.find((v) => v.zoho_id === vendorId);
+  async function savePartyRule() {
+    const isInvoice = postAs === "invoice";
+    const partyId = isInvoice ? customerId : vendorId;
+    const party = (isInvoice ? zoho.customers : zoho.vendors).find(
+      (e) => e.zoho_id === partyId,
+    );
     const account = zoho.accounts.find((a) => a.zoho_id === accountId);
-    if (!vendor || !account) return;
-    const { error: ruleError } = await supabase
-      .from("vendor_account_rules")
-      .upsert(
-        {
-          vendor_zoho_id: vendorId,
-          vendor_name: vendor.name,
-          account_zoho_id: accountId,
-          account_name: account.name,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "vendor_zoho_id" },
-      );
+    if (!partyId || !party || !account) return;
+    const { error: ruleError } = isInvoice
+      ? await supabase.from("customer_account_rules").upsert(
+          {
+            customer_zoho_id: partyId,
+            customer_name: party.name,
+            account_zoho_id: accountId,
+            account_name: account.name,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "customer_zoho_id" },
+        )
+      : await supabase.from("vendor_account_rules").upsert(
+          {
+            vendor_zoho_id: partyId,
+            vendor_name: party.name,
+            account_zoho_id: accountId,
+            account_name: account.name,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "vendor_zoho_id" },
+        );
     if (ruleError) {
-      setActionMsg(`Could not save vendor rule: ${ruleError.message}`);
+      setActionMsg(`Could not save rule: ${ruleError.message}`);
       return;
     }
-    setVendorRule({ account_zoho_id: accountId, account_name: account.name });
+    setPartyRule({ account_zoho_id: accountId, account_name: account.name });
     setActionMsg(
-      `Rule saved: ${vendor.name} now defaults to ${account.name}.`,
+      `Rule saved: ${party.name} now defaults to ${account.name}.`,
     );
   }
 
-  async function removeVendorRule() {
-    if (!vendorId) return;
+  async function removePartyRule() {
+    const isInvoice = postAs === "invoice";
+    const partyId = isInvoice ? customerId : vendorId;
+    if (!partyId) return;
     const { error: ruleError } = await supabase
-      .from("vendor_account_rules")
+      .from(isInvoice ? "customer_account_rules" : "vendor_account_rules")
       .delete()
-      .eq("vendor_zoho_id", vendorId);
+      .eq(isInvoice ? "customer_zoho_id" : "vendor_zoho_id", partyId);
     if (ruleError) {
-      setActionMsg(`Could not remove vendor rule: ${ruleError.message}`);
+      setActionMsg(`Could not remove rule: ${ruleError.message}`);
       return;
     }
-    setVendorRule(null);
-    setActionMsg("Vendor default rule removed.");
+    setPartyRule(null);
+    setActionMsg("Default account rule removed.");
   }
 
   async function runExtractAndJudgment() {
@@ -666,7 +683,10 @@ export function ReviewPanel({
               Customer
               <select
                 value={customerId}
-                onChange={(e) => setCustomerId(e.target.value)}
+                onChange={(e) => {
+                  setCustomerId(e.target.value);
+                  setAccountTouched(false);
+                }}
               >
                 <option value="">— select customer —</option>
                 {zoho.customers.map((c) => (
@@ -716,15 +736,19 @@ export function ReviewPanel({
           )}
         </div>
 
-        {postAs !== "invoice" && vendorId && (
+        {(postAs === "invoice" ? customerId : vendorId) && (
           <div className="rule-row">
             <span className="muted">
-              {vendorRule
-                ? `Default account for this vendor: ${vendorRule.account_name}` +
-                  (accountId && accountId !== vendorRule.account_zoho_id
+              {partyRule
+                ? `Default account for this ${
+                    postAs === "invoice" ? "customer" : "vendor"
+                  }: ${partyRule.account_name}` +
+                  (accountId && accountId !== partyRule.account_zoho_id
                     ? " (overridden for this transaction only)"
                     : "")
-                : "No default account rule for this vendor yet."}
+                : `No default account rule for this ${
+                    postAs === "invoice" ? "customer" : "vendor"
+                  } yet.`}
             </span>
             <span className="rule-actions">
               <button
@@ -733,18 +757,18 @@ export function ReviewPanel({
                 disabled={
                   !!busy ||
                   !accountId ||
-                  vendorRule?.account_zoho_id === accountId
+                  partyRule?.account_zoho_id === accountId
                 }
-                onClick={() => void saveVendorRule()}
+                onClick={() => void savePartyRule()}
               >
-                {vendorRule ? "Update default" : "Save as default"}
+                {partyRule ? "Update default" : "Save as default"}
               </button>
-              {vendorRule && (
+              {partyRule && (
                 <button
                   type="button"
                   className="btn ghost btn-small"
                   disabled={!!busy}
-                  onClick={() => void removeVendorRule()}
+                  onClick={() => void removePartyRule()}
                 >
                   Remove
                 </button>

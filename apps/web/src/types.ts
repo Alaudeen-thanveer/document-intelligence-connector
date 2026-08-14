@@ -37,10 +37,12 @@ export interface ZohoEntityRow {
   synced_at: string;
 }
 
-export interface VendorAccountRuleRow {
+/** Row shape shared by vendor_account_rules and customer_account_rules,
+ * with the party columns aliased to entity_zoho_id / entity_name. */
+export interface EntityAccountRuleRow {
   id: string;
-  vendor_zoho_id: string;
-  vendor_name: string;
+  entity_zoho_id: string;
+  entity_name: string;
   account_zoho_id: string;
   account_name: string;
   updated_at: string;

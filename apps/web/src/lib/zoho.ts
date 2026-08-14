@@ -41,3 +41,10 @@ export function isPostingAccount(a: ZohoEntityRow): boolean {
   if (!t) return true;
   return t.includes("expense") || t.includes("cost_of_goods");
 }
+
+/** Accounts an invoice line can be posted to (income-ish, or untyped). */
+export function isIncomeAccount(a: ZohoEntityRow): boolean {
+  const t = entityAccountType(a);
+  if (!t) return true;
+  return t.includes("income");
+}

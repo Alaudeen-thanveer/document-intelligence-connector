@@ -57,30 +57,32 @@ function getSupabase(): SupabaseClient {
   });
 }
 
-interface VendorAccountRule {
+interface DefaultAccountRule {
   account_zoho_id: string;
   account_name: string;
 }
 
 /**
- * Per-vendor default account rule ("if vendor is X, post to account Y").
- * Returns null when no rule exists — there is deliberately no global
- * default account.
+ * Per-party default account rule ("if vendor/customer is X, post to
+ * account Y"). Returns null when no rule exists — there is deliberately
+ * no global default account.
  */
-async function lookupVendorDefaultAccount(
+async function lookupDefaultAccountRule(
   supabase: SupabaseClient,
-  vendorZohoId: string,
-): Promise<VendorAccountRule | null> {
+  table: "vendor_account_rules" | "customer_account_rules",
+  idColumn: "vendor_zoho_id" | "customer_zoho_id",
+  entityZohoId: string,
+): Promise<DefaultAccountRule | null> {
   const { data, error } = await supabase
-    .from("vendor_account_rules")
+    .from(table)
     .select("account_zoho_id, account_name")
-    .eq("vendor_zoho_id", vendorZohoId)
+    .eq(idColumn, entityZohoId)
     .maybeSingle();
   if (error) {
-    console.log(`vendor_account_rules lookup failed: ${error.message}`);
+    console.log(`${table} lookup failed: ${error.message}`);
     return null;
   }
-  return (data as VendorAccountRule | null) ?? null;
+  return (data as DefaultAccountRule | null) ?? null;
 }
 
 function parseJsonEnv<T>(name: string): T | null {
@@ -664,6 +666,18 @@ Deno.serve(async (req) => {
             400,
           );
         }
+        // Income account: explicit UI choice, else this customer's default
+        // rule; otherwise Zoho's own income account default applies.
+        let invoiceAccountId = input.account_id?.trim() || null;
+        if (!invoiceAccountId) {
+          const rule = await lookupDefaultAccountRule(
+            supabase,
+            "customer_account_rules",
+            "customer_zoho_id",
+            input.customer_id.trim(),
+          );
+          if (rule) invoiceAccountId = rule.account_zoho_id;
+        }
         path = "invoices";
         rootKey = "invoice";
         idKey = "invoice_id";
@@ -678,9 +692,7 @@ Deno.serve(async (req) => {
                 : "Imported invoice",
               rate: mapped.line_items[0].rate,
               quantity: 1,
-              ...(input.account_id?.trim()
-                ? { account_id: input.account_id.trim() }
-                : {}),
+              ...(invoiceAccountId ? { account_id: invoiceAccountId } : {}),
             },
           ],
         };
@@ -689,8 +701,10 @@ Deno.serve(async (req) => {
         // No global default account.
         let expenseAccountId = input.account_id?.trim() || null;
         if (!expenseAccountId && input.vendor_id?.trim()) {
-          const rule = await lookupVendorDefaultAccount(
+          const rule = await lookupDefaultAccountRule(
             supabase,
+            "vendor_account_rules",
+            "vendor_zoho_id",
             input.vendor_id.trim(),
           );
           if (rule) expenseAccountId = rule.account_zoho_id;
@@ -1008,8 +1022,10 @@ Deno.serve(async (req) => {
     // (priority: explicit UI choice > vendor rule > category match) but never
     // an account the caller chose for this transaction.
     if (!input.account_id?.trim() && matched.bill.vendor_id) {
-      const rule = await lookupVendorDefaultAccount(
+      const rule = await lookupDefaultAccountRule(
         supabase,
+        "vendor_account_rules",
+        "vendor_zoho_id",
         matched.bill.vendor_id,
       );
       if (rule) {

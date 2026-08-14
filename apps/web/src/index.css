@@ -494,6 +494,28 @@ a {
   overflow-y: auto;
 }
 
+.tab-row {
+  display: flex;
+  gap: 8px;
+  margin: 14px 0 10px;
+}
+
+.tab-btn {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 6px 18px;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.tab-btn.active {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
 .rules-list {
   list-style: none;
   padding: 0;

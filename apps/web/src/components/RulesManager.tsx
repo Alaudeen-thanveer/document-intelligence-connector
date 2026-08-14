@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { useZohoEntities } from "../hooks/useZohoEntities";
-import { isPostingAccount } from "../lib/zoho";
+import { isIncomeAccount, isPostingAccount } from "../lib/zoho";
 import { supabase } from "../lib/supabase";
-import type { VendorAccountRuleRow } from "../types";
+import type { EntityAccountRuleRow, ZohoEntityRow } from "../types";
 
 interface Props {
   open: boolean;
@@ -11,34 +11,66 @@ interface Props {
   onChanged: () => void;
 }
 
+type RuleKind = "vendor" | "customer";
+
+interface KindConfig {
+  table: "vendor_account_rules" | "customer_account_rules";
+  idColumn: "vendor_zoho_id" | "customer_zoho_id";
+  nameColumn: "vendor_name" | "customer_name";
+  partyLabel: string;
+  accountFilter: (a: ZohoEntityRow) => boolean;
+}
+
+const KIND_CONFIG: Record<RuleKind, KindConfig> = {
+  vendor: {
+    table: "vendor_account_rules",
+    idColumn: "vendor_zoho_id",
+    nameColumn: "vendor_name",
+    partyLabel: "vendor",
+    accountFilter: isPostingAccount,
+  },
+  customer: {
+    table: "customer_account_rules",
+    idColumn: "customer_zoho_id",
+    nameColumn: "customer_name",
+    partyLabel: "customer",
+    accountFilter: isIncomeAccount,
+  },
+};
+
 /**
- * Modal for managing per-vendor default account rules:
- * "bills/expenses from vendor X post to account Y".
+ * Modal for managing default account rules, in two tabs:
+ * Vendor — "bills/expenses from vendor X post to account Y";
+ * Customer — "invoices for customer X post to income account Y".
  */
 export function RulesManager({ open, onClose, onChanged }: Props) {
   const zoho = useZohoEntities();
-  const [rules, setRules] = useState<VendorAccountRuleRow[]>([]);
+  const [kind, setKind] = useState<RuleKind>("vendor");
+  const [rules, setRules] = useState<EntityAccountRuleRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   // Per-row pending account edits (rule id → account id).
   const [edits, setEdits] = useState<Record<string, string>>({});
-  const [newVendorId, setNewVendorId] = useState("");
+  const [newPartyId, setNewPartyId] = useState("");
   const [newAccountId, setNewAccountId] = useState("");
 
-  const load = useCallback(async () => {
+  const cfg = KIND_CONFIG[kind];
+
+  const load = useCallback(async (activeKind: RuleKind) => {
+    const c = KIND_CONFIG[activeKind];
     setLoading(true);
     const { data, error } = await supabase
-      .from("vendor_account_rules")
+      .from(c.table)
       .select(
-        "id, vendor_zoho_id, vendor_name, account_zoho_id, account_name, updated_at",
+        `id, entity_zoho_id:${c.idColumn}, entity_name:${c.nameColumn}, account_zoho_id, account_name, updated_at`,
       )
-      .order("vendor_name");
+      .order(c.nameColumn);
     if (error) {
       setMsg(error.message);
       setRules([]);
     } else {
-      setRules((data ?? []) as VendorAccountRuleRow[]);
+      setRules((data ?? []) as unknown as EntityAccountRuleRow[]);
     }
     setLoading(false);
   }, []);
@@ -47,16 +79,17 @@ export function RulesManager({ open, onClose, onChanged }: Props) {
     if (!open) return;
     setMsg(null);
     setEdits({});
-    setNewVendorId("");
+    setNewPartyId("");
     setNewAccountId("");
-    void load();
-  }, [open, load]);
+    void load(kind);
+  }, [open, kind, load]);
 
   if (!open) return null;
 
-  const accountOptions = zoho.accounts.filter(isPostingAccount);
-  const vendorsWithoutRule = zoho.vendors.filter(
-    (v) => !rules.some((r) => r.vendor_zoho_id === v.zoho_id),
+  const parties = kind === "vendor" ? zoho.vendors : zoho.customers;
+  const accountOptions = zoho.accounts.filter(cfg.accountFilter);
+  const partiesWithoutRule = parties.filter(
+    (p) => !rules.some((r) => r.entity_zoho_id === p.zoho_id),
   );
 
   function accountName(accountZohoId: string): string {
@@ -65,13 +98,13 @@ export function RulesManager({ open, onClose, onChanged }: Props) {
     );
   }
 
-  async function saveEdit(rule: VendorAccountRuleRow) {
+  async function saveEdit(rule: EntityAccountRuleRow) {
     const nextAccountId = edits[rule.id];
     if (!nextAccountId || nextAccountId === rule.account_zoho_id) return;
     setBusy(true);
     setMsg(null);
     const { error } = await supabase
-      .from("vendor_account_rules")
+      .from(cfg.table)
       .update({
         account_zoho_id: nextAccountId,
         account_name: accountName(nextAccountId),
@@ -82,58 +115,55 @@ export function RulesManager({ open, onClose, onChanged }: Props) {
       setMsg(`Could not update rule: ${error.message}`);
     } else {
       setMsg(
-        `${rule.vendor_name} now defaults to ${accountName(nextAccountId)}.`,
+        `${rule.entity_name} now defaults to ${accountName(nextAccountId)}.`,
       );
       setEdits((prev) => {
         const { [rule.id]: _done, ...rest } = prev;
         return rest;
       });
-      await load();
+      await load(kind);
       onChanged();
     }
     setBusy(false);
   }
 
-  async function removeRule(rule: VendorAccountRuleRow) {
+  async function removeRule(rule: EntityAccountRuleRow) {
     setBusy(true);
     setMsg(null);
-    const { error } = await supabase
-      .from("vendor_account_rules")
-      .delete()
-      .eq("id", rule.id);
+    const { error } = await supabase.from(cfg.table).delete().eq("id", rule.id);
     if (error) {
       setMsg(`Could not remove rule: ${error.message}`);
     } else {
-      setMsg(`Removed the rule for ${rule.vendor_name}.`);
-      await load();
+      setMsg(`Removed the rule for ${rule.entity_name}.`);
+      await load(kind);
       onChanged();
     }
     setBusy(false);
   }
 
   async function addRule() {
-    if (!newVendorId || !newAccountId) return;
-    const vendor = zoho.vendors.find((v) => v.zoho_id === newVendorId);
-    if (!vendor) return;
+    if (!newPartyId || !newAccountId) return;
+    const party = parties.find((p) => p.zoho_id === newPartyId);
+    if (!party) return;
     setBusy(true);
     setMsg(null);
-    const { error } = await supabase.from("vendor_account_rules").upsert(
+    const { error } = await supabase.from(cfg.table).upsert(
       {
-        vendor_zoho_id: newVendorId,
-        vendor_name: vendor.name,
+        [cfg.idColumn]: newPartyId,
+        [cfg.nameColumn]: party.name,
         account_zoho_id: newAccountId,
         account_name: accountName(newAccountId),
         updated_at: new Date().toISOString(),
       },
-      { onConflict: "vendor_zoho_id" },
+      { onConflict: cfg.idColumn },
     );
     if (error) {
       setMsg(`Could not add rule: ${error.message}`);
     } else {
-      setMsg(`${vendor.name} now defaults to ${accountName(newAccountId)}.`);
-      setNewVendorId("");
+      setMsg(`${party.name} now defaults to ${accountName(newAccountId)}.`);
+      setNewPartyId("");
       setNewAccountId("");
-      await load();
+      await load(kind);
       onChanged();
     }
     setBusy(false);
@@ -144,29 +174,47 @@ export function RulesManager({ open, onClose, onChanged }: Props) {
       <div
         className="modal panel"
         role="dialog"
-        aria-label="Vendor default account rules"
+        aria-label="Default account rules"
         onClick={(e) => e.stopPropagation()}
       >
         <header className="panel-header">
           <div>
             <p className="eyebrow">Posting rules</p>
-            <h2>Vendor default accounts</h2>
+            <h2>Default accounts</h2>
           </div>
           <button type="button" className="btn ghost" onClick={onClose}>
             Close
           </button>
         </header>
 
+        <div className="tab-row" role="tablist">
+          {(["vendor", "customer"] as const).map((k) => (
+            <button
+              key={k}
+              type="button"
+              role="tab"
+              aria-selected={kind === k}
+              className={`tab-btn${kind === k ? " active" : ""}`}
+              onClick={() => setKind(k)}
+            >
+              {k === "vendor" ? "Vendors" : "Customers"}
+            </button>
+          ))}
+        </div>
+
         <p className="muted">
-          When a document's vendor matches a rule, its account is prefilled
-          automatically. Editing the account on a single document never changes
-          the rule — only this screen (or "Update default" in review) does.
+          {kind === "vendor"
+            ? "Bills and expenses from a matched vendor prefill this account."
+            : "Invoices for a matched customer prefill this income account."}{" "}
+          Editing the account on a single document never changes the rule.
         </p>
 
         {loading ? (
           <p className="muted">Loading rules…</p>
         ) : rules.length === 0 ? (
-          <p className="muted">No rules yet — add the first one below.</p>
+          <p className="muted">
+            No {cfg.partyLabel} rules yet — add the first one below.
+          </p>
         ) : (
           <ul className="rules-list">
             {rules.map((rule) => {
@@ -174,8 +222,8 @@ export function RulesManager({ open, onClose, onChanged }: Props) {
               const changed = pending !== rule.account_zoho_id;
               return (
                 <li key={rule.id} className="rules-item">
-                  <span className="rules-vendor" title={rule.vendor_name}>
-                    {rule.vendor_name}
+                  <span className="rules-vendor" title={rule.entity_name}>
+                    {rule.entity_name}
                   </span>
                   <select
                     value={pending}
@@ -221,14 +269,14 @@ export function RulesManager({ open, onClose, onChanged }: Props) {
           <h3>Add rule</h3>
           <div className="rules-item">
             <select
-              value={newVendorId}
+              value={newPartyId}
               disabled={busy}
-              onChange={(e) => setNewVendorId(e.target.value)}
+              onChange={(e) => setNewPartyId(e.target.value)}
             >
-              <option value="">— vendor —</option>
-              {vendorsWithoutRule.map((v) => (
-                <option key={v.zoho_id} value={v.zoho_id}>
-                  {v.name}
+              <option value="">{`— ${cfg.partyLabel} —`}</option>
+              {partiesWithoutRule.map((p) => (
+                <option key={p.zoho_id} value={p.zoho_id}>
+                  {p.name}
                 </option>
               ))}
             </select>
@@ -247,14 +295,23 @@ export function RulesManager({ open, onClose, onChanged }: Props) {
             <button
               type="button"
               className="btn primary btn-small"
-              disabled={busy || !newVendorId || !newAccountId}
+              disabled={busy || !newPartyId || !newAccountId}
               onClick={() => void addRule()}
             >
               Add rule
             </button>
           </div>
-          {vendorsWithoutRule.length === 0 && zoho.vendors.length > 0 && (
-            <p className="muted">Every cached vendor already has a rule.</p>
+          {parties.length === 0 ? (
+            <p className="muted">
+              No {cfg.partyLabel}s cached yet — use "Sync from Zoho" in the
+              review panel first.
+            </p>
+          ) : (
+            partiesWithoutRule.length === 0 && (
+              <p className="muted">
+                Every cached {cfg.partyLabel} already has a rule.
+              </p>
+            )
           )}
         </div>
 

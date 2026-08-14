@@ -72,7 +72,7 @@ export default function App() {
             className="btn ghost"
             onClick={() => setRulesOpen(true)}
           >
-            Vendor rules
+            Rules
           </button>
           <label className="reviewer-field">
             Reviewer
