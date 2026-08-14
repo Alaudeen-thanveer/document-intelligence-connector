@@ -638,11 +638,120 @@ a {
   font-size: 0.85rem;
 }
 
+/* Connections page */
+.view-nav {
+  display: flex;
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.connections-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px 28px 40px;
+  max-width: 960px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.connections-intro {
+  margin-top: -6px;
+}
+
+.connection-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.conn-header-side {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.conn-kind-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.conn-kind-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: calc(var(--radius) - 6px);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.conn-kind-tile:hover {
+  border-color: var(--accent);
+}
+
+.conn-kind-tile.active {
+  border-color: var(--accent);
+  background: rgba(61, 190, 160, 0.08);
+}
+
+.conn-kind-count {
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.conn-kind-label {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.conn-entity-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  max-height: 340px;
+  overflow-y: auto;
+}
+
+.conn-entity-list li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.conn-entity-list li:last-child {
+  border-bottom: none;
+}
+
+.conn-entity-list span {
+  color: var(--muted);
+  font-size: 0.85rem;
+  text-align: right;
+}
+
 @media (max-width: 900px) {
   .layout,
   .form-grid,
   .meta-grid {
     grid-template-columns: 1fr;
+  }
+
+  .connections-layout {
+    padding: 12px;
   }
 
   .topbar {

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { ConnectionsPage } from "./components/ConnectionsPage";
 import { DocumentList } from "./components/DocumentList";
 import { ReviewPanel } from "./components/ReviewPanel";
 import { RulesManager } from "./components/RulesManager";
@@ -17,6 +18,7 @@ export default function App() {
   const [tick, setTick] = useState(0);
   const [rulesOpen, setRulesOpen] = useState(false);
   const [rulesVersion, setRulesVersion] = useState(0);
+  const [view, setView] = useState<"documents" | "connections">("documents");
 
   const selected = useMemo(
     () => documents.find((d) => d.id === selectedId) ?? null,
@@ -64,9 +66,25 @@ export default function App() {
       <header className="topbar">
         <div>
           <p className="brand">Document Intelligence Connector</p>
-          <h1>Document review</h1>
+          <h1>{view === "connections" ? "Connections" : "Document review"}</h1>
         </div>
         <div className="topbar-actions">
+          <nav className="view-nav" aria-label="Pages">
+            <button
+              type="button"
+              className={`tab-btn${view === "documents" ? " active" : ""}`}
+              onClick={() => setView("documents")}
+            >
+              Documents
+            </button>
+            <button
+              type="button"
+              className={`tab-btn${view === "connections" ? " active" : ""}`}
+              onClick={() => setView("connections")}
+            >
+              Connections
+            </button>
+          </nav>
           <button
             type="button"
             className="btn ghost"
@@ -91,7 +109,9 @@ export default function App() {
         onChanged={() => setRulesVersion((n) => n + 1)}
       />
 
-      <main className="layout">
+      {view === "connections" && <ConnectionsPage />}
+
+      <main className="layout" hidden={view !== "documents"}>
         <section className="list-pane">
           <div className="pane-heading">
             <h2>Documents</h2>
