@@ -21,6 +21,16 @@ interface PushInput {
   vendors?: ZohoVendor[];
   /** Cached chart of accounts; falls back to ZOHO_ACCOUNTS_JSON env or live API. */
   accounts?: ZohoAccount[];
+  /** How to post into Zoho Books; defaults to "bill". */
+  post_as?: "bill" | "invoice" | "expense";
+  /** Explicit Zoho vendor contact id chosen in the review UI (bill/expense). */
+  vendor_id?: string | null;
+  /** Explicit Zoho customer contact id chosen in the review UI (invoice). */
+  customer_id?: string | null;
+  /** Explicit GL account id chosen in the review UI. */
+  account_id?: string | null;
+  /** Bank/cash account the expense was paid through (expense only). */
+  paid_through_account_id?: string | null;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -243,6 +253,70 @@ async function getZohoBill(
     }`;
   const res = await fetch(url, {
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+  });
+  const raw = await res.json().catch(async () => await res.text());
+  return { ok: res.ok, status: res.status, raw };
+}
+
+/** Create an invoice or expense in Zoho Books; extracts the created doc id. */
+async function createZohoDoc(
+  accessToken: string,
+  path: "invoices" | "expenses",
+  body: Record<string, unknown>,
+  rootKey: "invoice" | "expense",
+  idKey: "invoice_id" | "expense_id",
+): Promise<ZohoCallResult & { externalDocId?: string }> {
+  const url = `${apiBase()}/${path}?organization_id=${
+    encodeURIComponent(orgId())
+  }`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Zoho-oauthtoken ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const raw = await res.json().catch(async () => await res.text());
+  if (!res.ok) {
+    return { ok: false, status: res.status, raw };
+  }
+
+  const root = (raw as Record<string, unknown>)?.[rootKey] as
+    | Record<string, unknown>
+    | undefined;
+  const id = root?.[idKey];
+  return {
+    ok: true,
+    status: res.status,
+    externalDocId: id != null ? String(id) : undefined,
+    raw,
+  };
+}
+
+/** Attach the source file to an invoice (attachment) or expense (receipt). */
+async function attachToZohoDoc(
+  accessToken: string,
+  urlPath: string,
+  fieldName: "attachment" | "receipt",
+  bytes: Uint8Array,
+  contentType: string,
+  filename: string,
+): Promise<ZohoCallResult> {
+  const form = new FormData();
+  form.append(
+    fieldName,
+    new Blob([bytes], { type: contentType || "application/pdf" }),
+    filename || "document.pdf",
+  );
+  const url = `${apiBase()}/${urlPath}?organization_id=${
+    encodeURIComponent(orgId())
+  }`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    body: form,
   });
   const raw = await res.json().catch(async () => await res.text());
   return { ok: res.ok, status: res.status, raw };
@@ -535,6 +609,194 @@ Deno.serve(async (req) => {
       );
     }
 
+    const postAs: "bill" | "invoice" | "expense" = input.post_as ?? "bill";
+    const mapped = mapExtractedFieldsToZohoBill(extracted as ExtractedFieldsRow);
+    const referenceNumber = `DIC-${
+      input.document_id.replace(/-/g, "").slice(0, 12)
+    }`;
+
+    // ------------------------------------------------------------------
+    // Invoice / expense paths: entity ids come from the review UI, so no
+    // fuzzy matching or cache loading is needed.
+    // ------------------------------------------------------------------
+    if (postAs === "invoice" || postAs === "expense") {
+      let createBody: Record<string, unknown>;
+      let path: "invoices" | "expenses";
+      let rootKey: "invoice" | "expense";
+      let idKey: "invoice_id" | "expense_id";
+
+      if (postAs === "invoice") {
+        if (!input.customer_id?.trim()) {
+          return jsonResponse(
+            {
+              ok: false,
+              skipped: true,
+              reason: "customer_required",
+              error: "Select the Zoho customer this invoice belongs to.",
+              document_id: input.document_id,
+            },
+            400,
+          );
+        }
+        path = "invoices";
+        rootKey = "invoice";
+        idKey = "invoice_id";
+        createBody = {
+          customer_id: input.customer_id.trim(),
+          date: mapped.date,
+          reference_number: referenceNumber,
+          line_items: [
+            {
+              description: mapped.vendor_name
+                ? `Invoice — ${mapped.vendor_name}`
+                : "Imported invoice",
+              rate: mapped.line_items[0].rate,
+              quantity: 1,
+              ...(input.account_id?.trim()
+                ? { account_id: input.account_id.trim() }
+                : {}),
+            },
+          ],
+        };
+      } else {
+        const expenseAccountId = input.account_id?.trim() ||
+          Deno.env.get("ZOHO_DEFAULT_ACCOUNT_ID")?.trim();
+        if (!expenseAccountId) {
+          return jsonResponse(
+            {
+              ok: false,
+              skipped: true,
+              reason: "account_required",
+              error: "Select the expense account to post this expense to.",
+              document_id: input.document_id,
+            },
+            400,
+          );
+        }
+        const paidThrough = input.paid_through_account_id?.trim() ||
+          Deno.env.get("ZOHO_PAID_THROUGH_ACCOUNT_ID")?.trim();
+        if (!paidThrough) {
+          return jsonResponse(
+            {
+              ok: false,
+              skipped: true,
+              reason: "paid_through_required",
+              error:
+                "Select the bank/cash account this expense was paid through.",
+              document_id: input.document_id,
+            },
+            400,
+          );
+        }
+        path = "expenses";
+        rootKey = "expense";
+        idKey = "expense_id";
+        createBody = {
+          account_id: expenseAccountId,
+          paid_through_account_id: paidThrough,
+          date: mapped.date,
+          amount: mapped.line_items[0].rate,
+          reference_number: referenceNumber,
+          description: mapped.vendor_name
+            ? `Expense — ${mapped.vendor_name}`
+            : "Imported expense",
+          ...(input.vendor_id?.trim()
+            ? { vendor_id: input.vendor_id.trim() }
+            : {}),
+        };
+      }
+
+      const { result: createResult, retried: createRetried } =
+        await withZohoRetry((tok) =>
+          createZohoDoc(tok, path, createBody, rootKey, idKey)
+        );
+
+      if (
+        !createResult.ok || !("externalDocId" in createResult) ||
+        !createResult.externalDocId
+      ) {
+        throw new Error(
+          `Zoho ${rootKey} create failed (${createResult.status}): ${
+            JSON.stringify(createResult.raw)
+          }`,
+        );
+      }
+      const externalDocId =
+        (createResult as { externalDocId: string }).externalDocId;
+
+      // Record the sync before the attachment upload so a failed upload
+      // cannot lead to a duplicate document on re-push.
+      const { data: syncRow, error: syncError } = await supabase
+        .from("erp_sync_log")
+        .insert({
+          document_id: input.document_id,
+          source_type: "push",
+          erp_name: "zoho_books",
+          external_doc_id: externalDocId,
+          judgment_result_id: judgmentResultId,
+        })
+        .select("id")
+        .single();
+      if (syncError) {
+        throw new Error(`erp_sync_log insert failed: ${syncError.message}`);
+      }
+
+      await supabase
+        .from("documents")
+        .update({ status: "synced" })
+        .eq("id", input.document_id);
+
+      // Best-effort attachment; the Zoho document already exists either way.
+      let attachOk = false;
+      let attachRaw: unknown = null;
+      let filename = "";
+      try {
+        const file = await loadDocumentBytes(supabase, doc.file_url as string);
+        filename = file.filename;
+        const attachPath = postAs === "invoice"
+          ? `invoices/${encodeURIComponent(externalDocId)}/attachment`
+          : `expenses/${encodeURIComponent(externalDocId)}/receipt`;
+        const { result: attachResult } = await withZohoRetry((tok) =>
+          attachToZohoDoc(
+            tok,
+            attachPath,
+            postAs === "invoice" ? "attachment" : "receipt",
+            file.bytes,
+            file.contentType,
+            file.filename,
+          )
+        );
+        attachOk = attachResult.ok;
+        attachRaw = attachResult.raw;
+      } catch (attachErr) {
+        attachRaw = {
+          error: attachErr instanceof Error
+            ? attachErr.message
+            : String(attachErr),
+        };
+      }
+
+      return jsonResponse({
+        ok: true,
+        post_as: postAs,
+        document_id: input.document_id,
+        external_doc_id: externalDocId,
+        erp_sync_log_id: syncRow.id,
+        sandbox_organization_id: orgId(),
+        retried: createRetried,
+        attachment: {
+          uploaded: attachOk,
+          filename,
+          attach_response: attachRaw,
+        },
+        [postAs === "invoice" ? "zoho_invoice" : "zoho_expense"]:
+          createResult.raw,
+      });
+    }
+
+    // ------------------------------------------------------------------
+    // Bill path (default) — fuzzy matching with optional UI overrides.
+    // ------------------------------------------------------------------
     let accessToken = await getAccessToken();
     let vendors =
       input.vendors ??
@@ -606,7 +868,6 @@ Deno.serve(async (req) => {
       }
     }
 
-    const mapped = mapExtractedFieldsToZohoBill(extracted as ExtractedFieldsRow);
     let matched = matchEntities({
       bill: mapped,
       vendors,
@@ -614,8 +875,47 @@ Deno.serve(async (req) => {
       expense_category: expenseCategory,
     });
 
+    // Explicit UI selections take precedence over fuzzy matching.
+    if (input.vendor_id?.trim()) {
+      const chosenVendor = input.vendor_id.trim();
+      matched = {
+        ...matched,
+        unresolved_fields: matched.unresolved_fields.filter((f) =>
+          f !== "vendor"
+        ),
+        bill: { ...matched.bill, vendor_id: chosenVendor },
+        vendor_match: {
+          vendor_id: chosenVendor,
+          vendor_name: mapped.vendor_name ?? "selected",
+          confidence: 1,
+        },
+      };
+      matched.unresolved = matched.unresolved_fields.length > 0;
+    }
+    if (input.account_id?.trim()) {
+      const chosenAccount = input.account_id.trim();
+      matched = {
+        ...matched,
+        unresolved_fields: matched.unresolved_fields.filter((f) =>
+          f !== "account"
+        ),
+        bill: {
+          ...matched.bill,
+          line_items: matched.bill.line_items.map((item, i) =>
+            i === 0 ? { ...item, account_id: chosenAccount } : item
+          ),
+        },
+        account_match: {
+          account_id: chosenAccount,
+          account_name: "selected",
+          confidence: 1,
+        },
+      };
+      matched.unresolved = matched.unresolved_fields.length > 0;
+    }
+
     // Prefer configured default expense account when classification is missing.
-    if (defaultAccountId) {
+    if (defaultAccountId && !input.account_id?.trim()) {
       matched = {
         ...matched,
         unresolved_fields: matched.unresolved_fields.filter((f) =>
@@ -784,6 +1084,7 @@ Deno.serve(async (req) => {
 
     return jsonResponse({
       ok: true,
+      post_as: "bill",
       document_id: input.document_id,
       external_doc_id: externalDocId,
       erp_sync_log_id: syncRow.id,

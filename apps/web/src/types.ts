@@ -28,6 +28,15 @@ export interface JudgmentResultRow {
   reviewed_by: string | null;
 }
 
+export interface ZohoEntityRow {
+  id: string;
+  kind: "account" | "vendor" | "customer";
+  zoho_id: string;
+  name: string;
+  extra: Record<string, unknown> | null;
+  synced_at: string;
+}
+
 export type ReviewAction = "approve" | "correct" | "reject";
 
 export function isFlaggedStatus(status: string): boolean {

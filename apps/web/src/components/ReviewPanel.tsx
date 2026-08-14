@@ -1,12 +1,51 @@
 import { useEffect, useState } from "react";
 import { callEdgeFunction } from "../lib/functions";
 import { supabase } from "../lib/supabase";
+import { useZohoEntities } from "../hooks/useZohoEntities";
 import type {
   DocumentRow,
   ExtractedFieldsRow,
   JudgmentResultRow,
+  ZohoEntityRow,
 } from "../types";
 import { isFlaggedStatus } from "../types";
+
+type PostAs = "bill" | "expense" | "invoice";
+
+/** Normalize a name for vendor/customer matching (mirrors match-entities). */
+function normName(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Exact normalized match wins; otherwise first containment match. */
+function findByName<T>(
+  query: string,
+  items: T[],
+  getName: (item: T) => string,
+): T | null {
+  const q = normName(query);
+  if (!q) return null;
+  let containment: T | null = null;
+  for (const item of items) {
+    const c = normName(getName(item));
+    if (!c) continue;
+    if (c === q) return item;
+    if (!containment && (c.includes(q) || q.includes(c))) containment = item;
+  }
+  return containment;
+}
+
+function entityAccountType(a: ZohoEntityRow): string {
+  return String(
+    (a.extra as { account_type?: unknown } | null)?.account_type ?? "",
+  ).toLowerCase();
+}
 
 interface Props {
   document: DocumentRow | null;
@@ -34,6 +73,15 @@ export function ReviewPanel({
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [zohoBillId, setZohoBillId] = useState<string | null>(null);
 
+  const zoho = useZohoEntities();
+  const [postAs, setPostAs] = useState<PostAs>("bill");
+  const [postAsTouched, setPostAsTouched] = useState(false);
+  const [vendorId, setVendorId] = useState("");
+  const [customerId, setCustomerId] = useState("");
+  const [accountId, setAccountId] = useState("");
+  const [paidThroughId, setPaidThroughId] = useState("");
+  const [matchHint, setMatchHint] = useState<string | null>(null);
+
   useEffect(() => {
     setVendorRaw(extracted?.vendor_raw ?? "");
     setTotalAmount(
@@ -42,7 +90,46 @@ export function ReviewPanel({
     setInvoiceDate(extracted?.invoice_date ?? "");
     setActionMsg(null);
     setZohoBillId(null);
+    setPostAs("bill");
+    setPostAsTouched(false);
+    setVendorId("");
+    setCustomerId("");
+    setAccountId("");
+    setPaidThroughId("");
   }, [extracted, document?.id]);
+
+  // Auto-default the posting type from the extracted party name:
+  // vendor match → Bill (user may still switch to Expense);
+  // customer match → Invoice.
+  useEffect(() => {
+    const name = vendorRaw.trim();
+    if (!name) {
+      setMatchHint(null);
+      return;
+    }
+    const vendorHit = findByName(name, zoho.vendors, (v) => v.name);
+    const customerHit = findByName(name, zoho.customers, (c) => c.name);
+
+    if (vendorHit) {
+      setVendorId((prev) => prev || vendorHit.zoho_id);
+      if (!postAsTouched) setPostAs("bill");
+      setMatchHint(
+        `Matched Zoho vendor "${vendorHit.name}" — defaulting to Bill. You can still post it as an Expense.`,
+      );
+    } else if (customerHit) {
+      setCustomerId((prev) => prev || customerHit.zoho_id);
+      if (!postAsTouched) setPostAs("invoice");
+      setMatchHint(
+        `Matched Zoho customer "${customerHit.name}" — auto-selected Invoice.`,
+      );
+    } else if (zoho.vendors.length + zoho.customers.length > 0) {
+      setMatchHint(
+        "No vendor or customer match — pick the posting type and party manually.",
+      );
+    } else {
+      setMatchHint(null);
+    }
+  }, [vendorRaw, zoho.vendors, zoho.customers, postAsTouched, document?.id]);
 
   useEffect(() => {
     if (!document?.id) return;
@@ -75,6 +162,18 @@ export function ReviewPanel({
       </div>
     );
   }
+
+  const accountOptions = zoho.accounts.filter((a) => {
+    const t = entityAccountType(a);
+    if (!t) return true;
+    if (postAs === "invoice") return t.includes("income");
+    return t.includes("expense") || t.includes("cost_of_goods");
+  });
+
+  const paidThroughOptions = zoho.accounts.filter((a) => {
+    const t = entityAccountType(a);
+    return t.includes("bank") || t.includes("cash") || t === "credit_card";
+  });
 
   const failedRules = judgments.filter((j) => !j.passed);
   const entityUnresolvedHint =
@@ -172,6 +271,20 @@ export function ReviewPanel({
       setActionMsg("Total amount must be a positive number.");
       return;
     }
+    if (postAs === "invoice" && !customerId) {
+      setActionMsg("Select the customer to post this invoice to.");
+      return;
+    }
+    if (postAs === "expense" && !accountId) {
+      setActionMsg("Select the expense account to post to.");
+      return;
+    }
+    if (postAs === "expense" && !paidThroughId) {
+      setActionMsg(
+        "Select the bank/cash account the expense was paid through.",
+      );
+      return;
+    }
 
     setBusy("approve");
     setActionMsg(null);
@@ -246,6 +359,11 @@ export function ReviewPanel({
         expense_category:
           (import.meta.env.VITE_ZOHO_EXPENSE_CATEGORY as string | undefined) ??
           undefined,
+        post_as: postAs,
+        vendor_id: vendorId || undefined,
+        customer_id: customerId || undefined,
+        account_id: accountId || undefined,
+        paid_through_account_id: paidThroughId || undefined,
       });
       if (!push.ok) {
         const detail = String(
@@ -260,16 +378,21 @@ export function ReviewPanel({
           `Approved in app, but Zoho push failed: ${detail}.${gatewayHint} Status stays approved until a successful push sets synced.`,
         );
       } else {
-        const attachOk = Boolean(
-          (push.body.attachment as { present_on_bill?: boolean } | undefined)
-            ?.present_on_bill,
-        );
-        const billId = String(push.body.external_doc_id ?? "");
-        setZohoBillId(billId || null);
+        const attach = push.body.attachment as
+          | { present_on_bill?: boolean; uploaded?: boolean }
+          | undefined;
+        const attachOk = Boolean(attach?.present_on_bill ?? attach?.uploaded);
+        const docId = String(push.body.external_doc_id ?? "");
+        const label = postAs === "invoice"
+          ? "Invoice"
+          : postAs === "expense"
+            ? "Expense"
+            : "Bill";
+        setZohoBillId(docId || null);
         setActionMsg(
-          `Pushed to Zoho. Bill ${billId}` +
+          `Pushed to Zoho. ${label} ${docId}` +
             (attachOk ? " — attachment present." : " — attachment not confirmed.") +
-            " Check Zoho Books → Bills, or Studio table erp_sync_log.",
+            ` Check Zoho Books → ${label}s, or Studio table erp_sync_log.`,
         );
       }
     } catch {
@@ -426,6 +549,124 @@ export function ReviewPanel({
             </label>
           </div>
         )}
+      </section>
+
+      <section className="section">
+        <h3>Post to Zoho</h3>
+        <div className="zoho-sync-row">
+          <p className="muted">
+            {zoho.loading
+              ? "Loading Zoho cache…"
+              : zoho.vendors.length + zoho.customers.length +
+                    zoho.accounts.length === 0
+                ? "No Zoho data cached yet — sync to load accounts, vendors and customers."
+                : `${zoho.vendors.length} vendors · ${zoho.customers.length} customers · ${zoho.accounts.length} accounts cached.`}
+          </p>
+          <button
+            type="button"
+            className="btn ghost"
+            disabled={zoho.syncing || !!busy}
+            onClick={() => void zoho.sync()}
+          >
+            {zoho.syncing ? "Syncing…" : "Sync from Zoho"}
+          </button>
+        </div>
+        {zoho.error && <p className="error-text">{zoho.error}</p>}
+
+        <div className="radio-row">
+          {(["bill", "expense", "invoice"] as const).map((kind) => (
+            <label
+              key={kind}
+              className={`radio-pill${postAs === kind ? " active" : ""}`}
+            >
+              <input
+                type="radio"
+                name="post-as"
+                checked={postAs === kind}
+                onChange={() => {
+                  setPostAs(kind);
+                  setPostAsTouched(true);
+                  setAccountId("");
+                }}
+              />
+              {kind === "bill"
+                ? "Bill"
+                : kind === "expense"
+                  ? "Expense"
+                  : "Invoice"}
+            </label>
+          ))}
+        </div>
+        {matchHint && <p className="muted">{matchHint}</p>}
+
+        <div className="form-grid">
+          {postAs !== "invoice" && (
+            <label>
+              Vendor
+              <select
+                value={vendorId}
+                onChange={(e) => setVendorId(e.target.value)}
+              >
+                <option value="">
+                  {postAs === "bill" ? "— auto (create if new) —" : "— none —"}
+                </option>
+                {zoho.vendors.map((v) => (
+                  <option key={v.zoho_id} value={v.zoho_id}>
+                    {v.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {postAs === "invoice" && (
+            <label>
+              Customer
+              <select
+                value={customerId}
+                onChange={(e) => setCustomerId(e.target.value)}
+              >
+                <option value="">— select customer —</option>
+                {zoho.customers.map((c) => (
+                  <option key={c.zoho_id} value={c.zoho_id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <label>
+            {postAs === "invoice" ? "Income account" : "Expense account"}
+            <select
+              value={accountId}
+              onChange={(e) => setAccountId(e.target.value)}
+            >
+              <option value="">
+                {postAs === "expense" ? "— select account —" : "— default —"}
+              </option>
+              {accountOptions.map((a) => (
+                <option key={a.zoho_id} value={a.zoho_id}>
+                  {a.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          {postAs === "expense" && (
+            <label>
+              Paid through
+              <select
+                value={paidThroughId}
+                onChange={(e) => setPaidThroughId(e.target.value)}
+              >
+                <option value="">— select bank/cash —</option>
+                {paidThroughOptions.map((a) => (
+                  <option key={a.zoho_id} value={a.zoho_id}>
+                    {a.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+        </div>
       </section>
 
       <div className="actions">

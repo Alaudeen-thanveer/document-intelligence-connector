@@ -426,6 +426,51 @@ a {
   color: var(--muted);
 }
 
+.form-grid select {
+  border: 1px solid var(--line);
+  background: rgba(8, 14, 12, 0.55);
+  color: var(--text);
+  border-radius: 12px;
+  padding: 10px 12px;
+  font: inherit;
+  min-width: 180px;
+}
+
+.zoho-sync-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.radio-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 4px;
+}
+
+.radio-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.radio-pill.active {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.radio-pill input {
+  accent-color: var(--accent);
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;
