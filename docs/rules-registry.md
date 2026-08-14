@@ -10,7 +10,9 @@ registration + run scaffold.
 
 | rule_name | What it checks | Pass criteria | Notes / owner |
 |---|---|---|---|
-| *(none yet)* | — | — | Add a row here when you register a rule |
+| `duplicate_vendor_amount_date` | Same vendor + amount + invoice date within `company_config.duplicate_check_days` (default 3) | No peer match in window | Hardcoded in `checks.ts` (not engine registry) |
+| `missing_supporting_document` | Invoice has a supporting document | `documents.has_supporting_document = true` | Hardcoded in `checks.ts` |
+| `amount_above_threshold_no_po` | Amount above per-company PO threshold without a PO | amount ≤ threshold **or** `po_number` present | Threshold: `company_config.amount_requires_po_threshold` |
 
 ## How to add a rule
 

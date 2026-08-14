@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { functionsUrl, supabase } from "../lib/supabase";
+import { callEdgeFunction } from "../lib/functions";
+import { supabase } from "../lib/supabase";
 import type {
   DocumentRow,
   ExtractedFieldsRow,
@@ -31,6 +32,7 @@ export function ReviewPanel({
   const [invoiceDate, setInvoiceDate] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const [zohoBillId, setZohoBillId] = useState<string | null>(null);
 
   useEffect(() => {
     setVendorRaw(extracted?.vendor_raw ?? "");
@@ -39,7 +41,31 @@ export function ReviewPanel({
     );
     setInvoiceDate(extracted?.invoice_date ?? "");
     setActionMsg(null);
-  }, [extracted]);
+    setZohoBillId(null);
+  }, [extracted, document?.id]);
+
+  useEffect(() => {
+    if (!document?.id) return;
+    let cancelled = false;
+    void supabase
+      .from("erp_sync_log")
+      .select("external_doc_id")
+      .eq("document_id", document.id)
+      .eq("source_type", "push")
+      .order("synced_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (!cancelled) {
+          setZohoBillId(
+            data?.external_doc_id != null ? String(data.external_doc_id) : null,
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [document?.id, document?.status]);
 
   if (!document) {
     return (
@@ -88,69 +114,168 @@ export function ReviewPanel({
     onChanged();
   }
 
+  async function runExtractAndJudgment() {
+    if (!document) return;
+    setBusy("process");
+    setActionMsg(null);
+    try {
+      const extract = await callEdgeFunction("extract", {
+        document_id: document.id,
+      });
+      if (!extract.ok) {
+        setActionMsg(
+          `Extract failed: ${
+            extract.body.error ?? extract.body.reason ?? extract.status
+          }. Ensure functions serve is running.`,
+        );
+        setBusy(null);
+        return;
+      }
+      const judgment = await callEdgeFunction("judgment", {
+        document_id: document.id,
+      });
+      if (!judgment.ok) {
+        setActionMsg(
+          `Judgment failed: ${
+            judgment.body.error ?? judgment.body.reason ?? judgment.status
+          }`,
+        );
+        setBusy(null);
+        onChanged();
+        return;
+      }
+      setActionMsg(
+        "Extract + judgment finished. Fields and rules should appear below.",
+      );
+      onChanged();
+    } catch (err) {
+      setActionMsg(err instanceof Error ? err.message : String(err));
+    }
+    setBusy(null);
+  }
+
   async function approve() {
+    if (!extracted) {
+      setActionMsg(
+        "Cannot approve: run extract first (no extracted_fields for this document).",
+      );
+      return;
+    }
+    if (!vendorRaw.trim() || totalAmount.trim() === "") {
+      setActionMsg(
+        "Fill Vendor and Total amount, then Approve → Zoho. Empty fields cannot create a Zoho bill.",
+      );
+      return;
+    }
+    const amountNum = Number(totalAmount);
+    if (!Number.isFinite(amountNum) || amountNum <= 0) {
+      setActionMsg("Total amount must be a positive number.");
+      return;
+    }
+
     setBusy("approve");
     setActionMsg(null);
     const name = reviewerName.trim() || "reviewer";
+    // Zoho bill mapping requires a date; default to today when OCR left it blank.
+    const dateForPush =
+      invoiceDate.trim() || new Date().toISOString().slice(0, 10);
 
-    for (const row of failedRules) {
-      const { error: judgmentError } = await supabase
-        .from("judgment_results")
-        .update({
+    // Persist form values before push — zoho-push reads DB, not the UI inputs.
+    const { error: saveError } = await supabase
+      .from("extracted_fields")
+      .update({
+        vendor_raw: vendorRaw.trim(),
+        total_amount: amountNum,
+        invoice_date: dateForPush,
+      })
+      .eq("id", extracted.id);
+    if (saveError) {
+      setActionMsg(`Could not save fields before push: ${saveError.message}`);
+      setBusy(null);
+      return;
+    }
+    if (!invoiceDate.trim()) setInvoiceDate(dateForPush);
+
+    const alreadyApproved =
+      document!.status === "approved" || document!.status === "synced";
+
+    // Re-push path: status already approved after a failed Zoho call.
+    if (!alreadyApproved) {
+      for (const row of failedRules) {
+        const { error: judgmentError } = await supabase
+          .from("judgment_results")
+          .update({
+            passed: true,
+            notes: `${row.notes ?? ""}${row.notes ? " | " : ""}Approved by ${name}`,
+            reviewed_by: name,
+          })
+          .eq("id", row.id);
+        if (judgmentError) {
+          setActionMsg(judgmentError.message);
+          setBusy(null);
+          return;
+        }
+      }
+
+      // Record an explicit review approval when the flag was entity-unresolved only.
+      if (failedRules.length === 0) {
+        await supabase.from("judgment_results").insert({
+          document_id: document!.id,
+          rule_name: "human_review_approval",
           passed: true,
-          notes: `${row.notes ?? ""}${row.notes ? " | " : ""}Approved by ${name}`,
+          notes: "Reviewer approved for Zoho push",
           reviewed_by: name,
-        })
-        .eq("id", row.id);
-      if (judgmentError) {
-        setActionMsg(judgmentError.message);
+        });
+      }
+
+      const { error: statusError } = await supabase
+        .from("documents")
+        .update({ status: "approved" })
+        .eq("id", document!.id);
+
+      if (statusError) {
+        setActionMsg(statusError.message);
         setBusy(null);
         return;
       }
     }
 
-    // Record an explicit review approval when the flag was entity-unresolved only.
-    if (failedRules.length === 0) {
-      await supabase.from("judgment_results").insert({
-        document_id: document!.id,
-        rule_name: "human_review_approval",
-        passed: true,
-        notes: "Reviewer approved for Zoho push",
-        reviewed_by: name,
-      });
-    }
-
-    const { error: statusError } = await supabase
-      .from("documents")
-      .update({ status: "approved" })
-      .eq("id", document!.id);
-
-    if (statusError) {
-      setActionMsg(statusError.message);
-      setBusy(null);
-      return;
-    }
-
-    // Best-effort push; UI still succeeds if the function is not running.
     try {
-      const res = await fetch(`${functionsUrl}/zoho-push`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-        },
-        body: JSON.stringify({ document_id: document!.id }),
+      const push = await callEdgeFunction("zoho-push", {
+        document_id: document!.id,
+        expense_category:
+          (import.meta.env.VITE_ZOHO_EXPENSE_CATEGORY as string | undefined) ??
+          undefined,
       });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok || body.ok === false) {
+      if (!push.ok) {
+        const detail = String(
+          push.body.error ?? push.body.reason ?? push.status,
+        );
+        const gatewayHint =
+          push.status === 502 ||
+          /invalid response|upstream/i.test(detail)
+            ? " Edge Functions runtime was down or restarting — keep `npx supabase functions serve --env-file .env` running, then click Approve → Zoho again."
+            : "";
         setActionMsg(
-          `Approved. Push skipped or failed: ${body.error ?? body.reason ?? res.status}`,
+          `Approved in app, but Zoho push failed: ${detail}.${gatewayHint} Status stays approved until a successful push sets synced.`,
         );
       } else {
-        setActionMsg(`Approved and pushed. Zoho bill ${body.external_doc_id}`);
+        const attachOk = Boolean(
+          (push.body.attachment as { present_on_bill?: boolean } | undefined)
+            ?.present_on_bill,
+        );
+        const billId = String(push.body.external_doc_id ?? "");
+        setZohoBillId(billId || null);
+        setActionMsg(
+          `Pushed to Zoho. Bill ${billId}` +
+            (attachOk ? " — attachment present." : " — attachment not confirmed.") +
+            " Check Zoho Books → Bills, or Studio table erp_sync_log.",
+        );
       }
     } catch {
-      setActionMsg("Approved. Zoho push function is not reachable yet.");
+      setActionMsg(
+        "Approved in app. Zoho push function is not reachable — start `npx supabase functions serve --env-file .env`, then click Approve → Zoho again.",
+      );
     }
 
     setBusy(null);
@@ -224,6 +349,10 @@ export function ReviewPanel({
             </a>
           </dd>
         </div>
+        <div>
+          <dt>Zoho bill</dt>
+          <dd>{zohoBillId ?? (document.status === "synced" ? "synced (see erp_sync_log)" : "—")}</dd>
+        </div>
       </dl>
 
       {loading && <p className="muted">Loading review details…</p>}
@@ -255,7 +384,21 @@ export function ReviewPanel({
       <section className="section">
         <h3>Correct extracted fields</h3>
         {!extracted ? (
-          <p className="muted">No extracted_fields row for this document.</p>
+          <div>
+            <p className="muted">
+              No extracted_fields yet — upload alone does not read the invoice.
+              Run extract (needs Mindee + functions serve).
+            </p>
+            <button
+              type="button"
+              className="btn primary"
+              style={{ marginTop: "0.75rem" }}
+              disabled={!!busy}
+              onClick={() => void runExtractAndJudgment()}
+            >
+              {busy === "process" ? "Processing…" : "Run extract + judgment"}
+            </button>
+          </div>
         ) : (
           <div className="form-grid">
             <label>
@@ -305,10 +448,14 @@ export function ReviewPanel({
         <button
           type="button"
           className="btn primary"
-          disabled={!!busy}
+          disabled={!!busy || !extracted || document.status === "synced"}
           onClick={() => void approve()}
         >
-          {busy === "approve" ? "Approving…" : "Approve"}
+          {busy === "approve"
+            ? "Pushing…"
+            : document.status === "approved" && !zohoBillId
+              ? "Retry Zoho push"
+              : "Approve → Zoho"}
         </button>
       </div>
 

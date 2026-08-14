@@ -101,12 +101,14 @@ export default function App() {
               is running.
             </p>
           )}
-          <DocumentList
-            documents={documents}
-            selectedId={selectedId}
-            onSelect={setSelectedId}
-            failedJudgmentIds={failedJudgmentIds}
-          />
+          <div className="doc-list-scroll">
+            <DocumentList
+              documents={documents}
+              selectedId={selectedId}
+              onSelect={setSelectedId}
+              failedJudgmentIds={failedJudgmentIds}
+            />
+          </div>
         </section>
 
         <ReviewPanel

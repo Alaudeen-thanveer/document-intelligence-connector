@@ -44,8 +44,10 @@ a {
 .app-shell {
   position: relative;
   min-height: 100vh;
-  padding: 28px clamp(16px, 3vw, 40px) 48px;
-  overflow: hidden;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  padding: 28px clamp(16px, 3vw, 40px) 24px;
 }
 
 .atmosphere {
@@ -106,6 +108,8 @@ a {
   grid-template-columns: minmax(280px, 360px) 1fr;
   gap: 20px;
   align-items: start;
+  flex: 1;
+  min-height: 0;
 }
 
 .list-pane,
@@ -118,8 +122,43 @@ a {
 }
 
 .list-pane {
+  display: flex;
+  flex-direction: column;
   padding: 18px;
-  min-height: 70vh;
+  /* Keep left list viewport-bound so cards scroll inside the pane */
+  height: calc(100dvh - 140px);
+  max-height: calc(100dvh - 140px);
+  min-height: 320px;
+  overflow: hidden;
+  position: sticky;
+  top: 16px;
+}
+
+.doc-list-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(61, 190, 160, 0.45) transparent;
+}
+
+.doc-list-scroll::-webkit-scrollbar {
+  width: 5px;
+}
+
+.doc-list-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.doc-list-scroll::-webkit-scrollbar-thumb {
+  background: rgba(61, 190, 160, 0.4);
+  border-radius: 999px;
+}
+
+.doc-list-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(61, 190, 160, 0.65);
 }
 
 .pane-heading,
@@ -301,7 +340,6 @@ a {
 
 .panel {
   padding: 22px;
-  min-height: 70vh;
 }
 
 .eyebrow {
@@ -468,8 +506,17 @@ a {
     align-items: stretch;
   }
 
-  .list-pane,
-  .panel {
-    min-height: auto;
+  .layout {
+    overflow: visible;
+  }
+
+  .list-pane {
+    position: static;
+    height: auto;
+    max-height: min(50vh, 420px);
+  }
+
+  .doc-list-scroll {
+    max-height: 100%;
   }
 }
