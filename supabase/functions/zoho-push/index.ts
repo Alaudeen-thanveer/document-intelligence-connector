@@ -1,6 +1,6 @@
-// Push a judged, entity-resolved invoice bill to Zoho Books.
-// Credentials come only from environment variables — never hardcoded.
-import "@supabase/functions-js/edge-runtime.d.ts";
+// Push a human-approved invoice bill to Zoho Books (sandbox org via env).
+// Uses existing OAuth refresh + single retry. Never hardcode credentials.
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import {
   mapExtractedFieldsToZohoBill,
@@ -17,9 +17,9 @@ interface PushInput {
   document_id: string;
   /** Optional expense category hint for GL matching. */
   expense_category?: string | null;
-  /** Cached Zoho vendors; falls back to ZOHO_VENDORS_JSON env. */
+  /** Cached Zoho vendors; falls back to ZOHO_VENDORS_JSON env or live API. */
   vendors?: ZohoVendor[];
-  /** Cached chart of accounts; falls back to ZOHO_ACCOUNTS_JSON env. */
+  /** Cached chart of accounts; falls back to ZOHO_ACCOUNTS_JSON env or live API. */
   accounts?: ZohoAccount[];
 }
 
@@ -57,7 +57,21 @@ function parseJsonEnv<T>(name: string): T | null {
   }
 }
 
-function toZohoBillBody(bill: ZohoBillMapped): Record<string, unknown> {
+function apiBase(): string {
+  return (
+    Deno.env.get("ZOHO_API_BASE_URL")?.trim() ||
+    "https://www.zohoapis.com/books/v3"
+  );
+}
+
+function orgId(): string {
+  return requireEnv("ZOHO_ORGANIZATION_ID");
+}
+
+function toZohoBillBody(
+  bill: ZohoBillMapped,
+  opts?: { billNumber?: string },
+): Record<string, unknown> {
   if (!bill.vendor_id) {
     throw new Error("vendor_id is required before Zoho push");
   }
@@ -67,8 +81,14 @@ function toZohoBillBody(bill: ZohoBillMapped): Record<string, unknown> {
     }
   }
 
+  // Many Zoho orgs (esp. India) require an explicit bill_number when
+  // auto-generation is off — omit/invalid values return code 4.
+  const billNumber = (opts?.billNumber ?? "").trim() ||
+    `DIC-${Date.now()}`;
+
   return {
     vendor_id: bill.vendor_id,
+    bill_number: billNumber,
     date: bill.date,
     ...(bill.reference_number
       ? { reference_number: bill.reference_number }
@@ -112,16 +132,52 @@ async function refreshAccessToken(): Promise<string> {
   return String(payload.access_token);
 }
 
+async function getAccessToken(): Promise<string> {
+  const existing = Deno.env.get("ZOHO_ACCESS_TOKEN")?.trim();
+  if (existing) return existing;
+  return await refreshAccessToken();
+}
+
+type ZohoCallResult = {
+  ok: boolean;
+  status: number;
+  raw: unknown;
+};
+
+/**
+ * Run a Zoho HTTP call; on 401/403/5xx refresh token and retry once.
+ */
+async function withZohoRetry(
+  call: (accessToken: string) => Promise<ZohoCallResult>,
+): Promise<{ result: ZohoCallResult; accessToken: string; retried: boolean }> {
+  let accessToken = await getAccessToken();
+  let retried = false;
+  let result = await call(accessToken);
+
+  if (!result.ok) {
+    const shouldRetry =
+      result.status === 401 ||
+      result.status === 403 ||
+      result.status >= 500;
+    if (shouldRetry) {
+      console.log(
+        `Zoho call failed (${result.status}); refreshing token and retrying once`,
+      );
+      accessToken = await refreshAccessToken();
+      retried = true;
+      result = await call(accessToken);
+    }
+  }
+
+  return { result, accessToken, retried };
+}
+
 async function createZohoBill(
   accessToken: string,
   billBody: Record<string, unknown>,
-): Promise<{ ok: boolean; status: number; externalDocId?: string; raw: unknown }> {
-  const orgId = requireEnv("ZOHO_ORGANIZATION_ID");
-  const apiBase =
-    Deno.env.get("ZOHO_API_BASE_URL")?.trim() ||
-    "https://www.zohoapis.com/books/v3";
-
-  const url = `${apiBase}/bills?organization_id=${encodeURIComponent(orgId)}`;
+): Promise<ZohoCallResult & { externalDocId?: string }> {
+  const url =
+    `${apiBase()}/bills?organization_id=${encodeURIComponent(orgId())}`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -148,54 +204,190 @@ async function createZohoBill(
   };
 }
 
-/**
- * POST bill to Zoho; on auth/transient failure refresh token and retry once.
- */
-async function pushBillWithRetry(
-  billBody: Record<string, unknown>,
-): Promise<{ externalDocId: string; raw: unknown; retried: boolean }> {
-  let accessToken = Deno.env.get("ZOHO_ACCESS_TOKEN")?.trim() || "";
-  let retried = false;
+async function attachBillDocument(
+  accessToken: string,
+  billId: string,
+  bytes: Uint8Array,
+  contentType: string,
+  filename: string,
+): Promise<ZohoCallResult> {
+  const form = new FormData();
+  form.append(
+    "attachment",
+    new Blob([bytes], { type: contentType || "application/pdf" }),
+    filename || "invoice.pdf",
+  );
 
-  if (!accessToken) {
-    accessToken = await refreshAccessToken();
-  }
+  const url =
+    `${apiBase()}/bills/${encodeURIComponent(billId)}/attachment?organization_id=${
+      encodeURIComponent(orgId())
+    }`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Zoho-oauthtoken ${accessToken}`,
+    },
+    body: form,
+  });
+  const raw = await res.json().catch(async () => await res.text());
+  return { ok: res.ok, status: res.status, raw };
+}
 
-  let result = await createZohoBill(accessToken, billBody);
+async function getZohoBill(
+  accessToken: string,
+  billId: string,
+): Promise<ZohoCallResult> {
+  const url =
+    `${apiBase()}/bills/${encodeURIComponent(billId)}?organization_id=${
+      encodeURIComponent(orgId())
+    }`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+  });
+  const raw = await res.json().catch(async () => await res.text());
+  return { ok: res.ok, status: res.status, raw };
+}
 
-  if (!result.ok) {
-    const shouldRetry =
-      result.status === 401 ||
-      result.status === 403 ||
-      result.status >= 500;
-
-    if (!shouldRetry) {
-      throw new Error(
-        `Zoho bill create failed (${result.status}): ${JSON.stringify(result.raw)}`,
-      );
-    }
-
-    console.log(
-      `Zoho bill create failed (${result.status}); refreshing token and retrying once`,
-    );
-    accessToken = await refreshAccessToken();
-    retried = true;
-    result = await createZohoBill(accessToken, billBody);
-
-    if (!result.ok) {
-      throw new Error(
-        `Zoho bill create failed after retry (${result.status}): ${JSON.stringify(result.raw)}`,
-      );
-    }
-  }
-
-  if (!result.externalDocId) {
+async function fetchVendorsFromZoho(
+  accessToken: string,
+): Promise<ZohoVendor[]> {
+  const url =
+    `${apiBase()}/contacts?organization_id=${encodeURIComponent(orgId())}&contact_type=vendor&per_page=200`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+  });
+  const raw = await res.json();
+  if (!res.ok) {
     throw new Error(
-      `Zoho bill create succeeded but no bill_id in response: ${JSON.stringify(result.raw)}`,
+      `Zoho vendors fetch failed (${res.status}): ${JSON.stringify(raw)}`,
     );
   }
+  const contacts = (raw as { contacts?: Array<Record<string, unknown>> })
+    ?.contacts ?? [];
+  return contacts.map((c) => ({
+    vendor_id: String(c.contact_id ?? c.vendor_id ?? ""),
+    vendor_name: String(c.contact_name ?? c.vendor_name ?? ""),
+  })).filter((v) => v.vendor_id && v.vendor_name);
+}
 
-  return { externalDocId: result.externalDocId, raw: result.raw, retried };
+async function fetchAccountsFromZoho(
+  accessToken: string,
+): Promise<ZohoAccount[]> {
+  const url =
+    `${apiBase()}/chartofaccounts?organization_id=${encodeURIComponent(orgId())}&per_page=200`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+  });
+  const raw = await res.json();
+  if (!res.ok) {
+    throw new Error(
+      `Zoho chart of accounts fetch failed (${res.status}): ${JSON.stringify(raw)}`,
+    );
+  }
+  const accounts = (raw as { chartofaccounts?: Array<Record<string, unknown>> })
+    ?.chartofaccounts ?? [];
+  return accounts.map((a) => ({
+    account_id: String(a.account_id ?? ""),
+    account_name: String(a.account_name ?? ""),
+    account_type: a.account_type != null ? String(a.account_type) : null,
+  })).filter((a) => a.account_id && a.account_name);
+}
+
+async function ensureVendorInZoho(
+  accessToken: string,
+  vendorName: string,
+): Promise<ZohoVendor> {
+  const body = {
+    contact_name: vendorName,
+    contact_type: "vendor",
+  };
+  const url =
+    `${apiBase()}/contacts?organization_id=${encodeURIComponent(orgId())}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Zoho-oauthtoken ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const raw = await res.json();
+  if (!res.ok) {
+    // Duplicate name — re-fetch list and match.
+    const vendors = await fetchVendorsFromZoho(accessToken);
+    const hit = vendors.find((v) =>
+      v.vendor_name.trim().toLowerCase() === vendorName.trim().toLowerCase()
+    );
+    if (hit) return hit;
+    throw new Error(
+      `Zoho vendor create failed (${res.status}): ${JSON.stringify(raw)}`,
+    );
+  }
+  const contact = (raw as { contact?: Record<string, unknown> })?.contact;
+  return {
+    vendor_id: String(contact?.contact_id ?? ""),
+    vendor_name: String(contact?.contact_name ?? vendorName),
+  };
+}
+
+async function loadDocumentBytes(
+  supabase: SupabaseClient,
+  fileUrl: string,
+): Promise<{ bytes: Uint8Array; contentType: string; filename: string }> {
+  const publicMarker = "/storage/v1/object/public/invoices/";
+  const publicIdx = fileUrl.indexOf(publicMarker);
+  if (publicIdx >= 0) {
+    const path = decodeURIComponent(
+      fileUrl.slice(publicIdx + publicMarker.length),
+    );
+    const { data, error } = await supabase.storage.from("invoices").download(
+      path,
+    );
+    if (error || !data) {
+      throw new Error(`storage download failed: ${error?.message ?? "no data"}`);
+    }
+    const bytes = new Uint8Array(await data.arrayBuffer());
+    return {
+      bytes,
+      contentType: data.type || "application/pdf",
+      filename: path.split("/").pop() || "document.pdf",
+    };
+  }
+
+  const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "http://127.0.0.1:54321";
+  const fetchable = fileUrl
+    .replace("http://127.0.0.1:54321", supabaseUrl)
+    .replace("http://localhost:54321", supabaseUrl);
+
+  const fileRes = await fetch(fetchable);
+  if (!fileRes.ok) {
+    throw new Error(`Failed to fetch document file (${fileRes.status})`);
+  }
+  const bytes = new Uint8Array(await fileRes.arrayBuffer());
+  return {
+    bytes,
+    contentType: fileRes.headers.get("content-type") ?? "application/pdf",
+    filename: fileUrl.split("/").pop()?.split("?")[0] || "document.pdf",
+  };
+}
+
+async function assertHumanApproved(
+  supabase: SupabaseClient,
+  documentId: string,
+): Promise<void> {
+  const { data: doc, error } = await supabase
+    .from("documents")
+    .select("id, status")
+    .eq("id", documentId)
+    .single();
+  if (error || !doc) {
+    throw new Error(`Document not found: ${error?.message ?? documentId}`);
+  }
+  if (doc.status !== "approved") {
+    throw new Error(
+      `Document must be human-approved before Zoho push (status=${doc.status})`,
+    );
+  }
 }
 
 async function assertJudgmentsPassed(
@@ -224,12 +416,39 @@ async function assertJudgmentsPassed(
     throw new Error(`Judgment failed for rule(s): ${names}`);
   }
 
-  // Link sync log to the latest passing judgment row when available.
   const judgmentResultId = rows[rows.length - 1]?.id ?? null;
   return { judgmentResultId };
 }
 
+function attachmentPresent(billRaw: unknown): {
+  present: boolean;
+  documents: unknown[];
+} {
+  const bill = (billRaw as { bill?: Record<string, unknown> })?.bill ??
+    (billRaw as Record<string, unknown>);
+  const docs = (bill?.documents as unknown[]) ??
+    (bill?.document as unknown[]) ??
+    [];
+  const list = Array.isArray(docs) ? docs : docs ? [docs] : [];
+  const name = bill?.attachment_name ?? bill?.file_name;
+  return {
+    present: list.length > 0 || Boolean(name),
+    documents: list,
+  };
+}
+
 Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers":
+          "authorization, content-type, apikey, x-client-info",
+      },
+    });
+  }
+
   if (req.method !== "POST") {
     return jsonResponse({ error: "Method not allowed" }, 405);
   }
@@ -248,6 +467,31 @@ Deno.serve(async (req) => {
   try {
     const supabase = getSupabase();
 
+    try {
+      await assertHumanApproved(supabase, input.document_id);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return jsonResponse(
+        {
+          ok: false,
+          skipped: true,
+          reason: "not_human_approved",
+          error: message,
+          document_id: input.document_id,
+        },
+        409,
+      );
+    }
+
+    const { data: doc, error: docError } = await supabase
+      .from("documents")
+      .select("id, file_url, status")
+      .eq("id", input.document_id)
+      .single();
+    if (docError || !doc) {
+      throw new Error(`Document not found: ${docError?.message ?? input.document_id}`);
+    }
+
     const { data: extracted, error: extractedError } = await supabase
       .from("extracted_fields")
       .select(
@@ -263,7 +507,10 @@ Deno.serve(async (req) => {
     }
     if (!extracted) {
       return jsonResponse(
-        { error: "No extracted_fields row for document_id", document_id: input.document_id },
+        {
+          error: "No extracted_fields row for document_id",
+          document_id: input.document_id,
+        },
         404,
       );
     }
@@ -288,36 +535,161 @@ Deno.serve(async (req) => {
       );
     }
 
-    const vendors =
+    let accessToken = await getAccessToken();
+    let vendors =
       input.vendors ??
       parseJsonEnv<ZohoVendor[]>("ZOHO_VENDORS_JSON") ??
       [];
-    const accounts =
+    let accounts =
       input.accounts ??
       parseJsonEnv<ZohoAccount[]>("ZOHO_ACCOUNTS_JSON") ??
       [];
 
-    if (vendors.length === 0 || accounts.length === 0) {
-      return jsonResponse(
-        {
-          ok: false,
-          skipped: true,
-          reason: "missing_entity_cache",
-          error:
-            "Provide vendors/accounts in the request body or set ZOHO_VENDORS_JSON and ZOHO_ACCOUNTS_JSON",
-          document_id: input.document_id,
-        },
-        400,
-      );
+    const expenseCategory = input.expense_category ??
+      Deno.env.get("ZOHO_EXPENSE_CATEGORY")?.trim() ??
+      null;
+    const defaultVendorId = Deno.env.get("ZOHO_DEFAULT_VENDOR_ID")?.trim();
+    const defaultAccountId = Deno.env.get("ZOHO_DEFAULT_ACCOUNT_ID")?.trim();
+    const autoCreateVendor =
+      (Deno.env.get("ZOHO_AUTO_CREATE_VENDOR")?.trim() || "true")
+        .toLowerCase() !== "false";
+
+    // Fast path: with DEFAULT_ACCOUNT_ID we can skip chart-of-accounts fetch.
+    const needAccounts = accounts.length === 0 && !defaultAccountId;
+    const needVendors = vendors.length === 0 && !defaultVendorId &&
+      !autoCreateVendor;
+
+    if (needVendors || needAccounts) {
+      const { result: tokenProbe, accessToken: token, retried } =
+        await withZohoRetry(async (tok) => {
+          try {
+            if (needVendors && vendors.length === 0) {
+              vendors = await fetchVendorsFromZoho(tok);
+            }
+            if (needAccounts && accounts.length === 0) {
+              accounts = await fetchAccountsFromZoho(tok);
+            }
+            return {
+              ok: true,
+              status: 200,
+              raw: { vendors: vendors.length, accounts: accounts.length },
+            };
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            const status = msg.includes("(401)") || msg.includes("401")
+              ? 401
+              : msg.includes("(403)") || msg.includes("403")
+              ? 403
+              : 500;
+            return { ok: false, status, raw: { error: msg } };
+          }
+        });
+      accessToken = token;
+      if (
+        !resultOk(tokenProbe) &&
+        ((needVendors && vendors.length === 0) ||
+          (needAccounts && accounts.length === 0))
+      ) {
+        return jsonResponse(
+          {
+            ok: false,
+            skipped: true,
+            reason: "missing_entity_cache",
+            error:
+              "Could not load Zoho vendors/accounts. Set ZOHO_DEFAULT_ACCOUNT_ID / fix OAuth, or provide ZOHO_VENDORS_JSON / ZOHO_ACCOUNTS_JSON.",
+            detail: tokenProbe.raw,
+            retried,
+            document_id: input.document_id,
+          },
+          400,
+        );
+      }
     }
 
     const mapped = mapExtractedFieldsToZohoBill(extracted as ExtractedFieldsRow);
-    const matched = matchEntities({
+    let matched = matchEntities({
       bill: mapped,
       vendors,
       accounts,
-      expense_category: input.expense_category,
+      expense_category: expenseCategory,
     });
+
+    // Prefer configured default expense account when classification is missing.
+    if (defaultAccountId) {
+      matched = {
+        ...matched,
+        unresolved_fields: matched.unresolved_fields.filter((f) =>
+          f !== "account"
+        ),
+        bill: {
+          ...matched.bill,
+          line_items: matched.bill.line_items.map((item, i) =>
+            i === 0 ? { ...item, account_id: defaultAccountId } : item
+          ),
+        },
+        account_match: {
+          account_id: defaultAccountId,
+          account_name: expenseCategory ?? "default",
+          confidence: 1,
+        },
+      };
+      matched.unresolved = matched.unresolved_fields.length > 0;
+    }
+
+    // New vendor → create in sandbox org rather than failing.
+    if (
+      matched.unresolved_fields.includes("vendor") &&
+      mapped.vendor_name &&
+      autoCreateVendor
+    ) {
+      const { result, accessToken: tok, retried: vendorRetried } =
+        await withZohoRetry(async (t) => {
+          try {
+            const created = await ensureVendorInZoho(t, mapped.vendor_name!);
+            vendors = [...vendors, created];
+            return { ok: true, status: 200, raw: created };
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return { ok: false, status: 500, raw: { error: msg } };
+          }
+        });
+      accessToken = tok;
+      if (result.ok) {
+        const created = result.raw as ZohoVendor;
+        matched = {
+          ...matched,
+          unresolved_fields: matched.unresolved_fields.filter((f) =>
+            f !== "vendor"
+          ),
+          bill: { ...matched.bill, vendor_id: created.vendor_id },
+          vendor_match: {
+            vendor_id: created.vendor_id,
+            vendor_name: created.vendor_name,
+            confidence: 1,
+          },
+        };
+        matched.unresolved = matched.unresolved_fields.length > 0;
+        console.log(
+          `Ensured sandbox vendor for push (retried=${vendorRetried})`,
+        );
+      }
+    }
+
+    if (matched.unresolved_fields.includes("vendor") && defaultVendorId) {
+      matched = {
+        ...matched,
+        unresolved_fields: matched.unresolved_fields.filter((f) =>
+          f !== "vendor"
+        ),
+        bill: { ...matched.bill, vendor_id: defaultVendorId },
+        vendor_match: {
+          vendor_id: defaultVendorId,
+          vendor_name: mapped.vendor_name ?? "default",
+          confidence: 1,
+        },
+      };
+      matched.unresolved = matched.unresolved_fields.length > 0;
+    }
 
     if (matched.unresolved) {
       await supabase
@@ -332,13 +704,62 @@ Deno.serve(async (req) => {
           reason: "entities_unresolved",
           unresolved_fields: matched.unresolved_fields,
           document_id: input.document_id,
+          hint:
+            "Set ZOHO_EXPENSE_CATEGORY / ZOHO_DEFAULT_ACCOUNT_ID for sandbox, or correct vendor to match a Zoho vendor.",
         },
         409,
       );
     }
 
-    const billBody = toZohoBillBody(matched.bill);
-    const { externalDocId, raw, retried } = await pushBillWithRetry(billBody);
+    const billBody = toZohoBillBody(matched.bill, {
+      billNumber: `DIC-${input.document_id.replace(/-/g, "").slice(0, 12)}-${Date.now().toString(36)}`,
+    });
+    const {
+      result: createResult,
+      accessToken: tokenAfterCreate,
+      retried: createRetried,
+    } = await withZohoRetry((tok) => createZohoBill(tok, billBody));
+    accessToken = tokenAfterCreate;
+
+    if (!createResult.ok || !("externalDocId" in createResult) ||
+      !createResult.externalDocId) {
+      throw new Error(
+        `Zoho bill create failed (${createResult.status}): ${
+          JSON.stringify(createResult.raw)
+        }`,
+      );
+    }
+
+    const externalDocId = createResult.externalDocId;
+    const file = await loadDocumentBytes(supabase, doc.file_url as string);
+
+    const {
+      result: attachResult,
+      accessToken: tokenAfterAttach,
+      retried: attachRetried,
+    } = await withZohoRetry((tok) =>
+      attachBillDocument(
+        tok,
+        externalDocId,
+        file.bytes,
+        file.contentType,
+        file.filename,
+      )
+    );
+    accessToken = tokenAfterAttach;
+
+    if (!attachResult.ok) {
+      throw new Error(
+        `Zoho bill ${externalDocId} created but attachment failed (${attachResult.status}): ${
+          JSON.stringify(attachResult.raw)
+        }`,
+      );
+    }
+
+    const { result: getResult } = await withZohoRetry((tok) =>
+      getZohoBill(tok, externalDocId)
+    );
+    const attachInfo = attachmentPresent(getResult.raw);
 
     const { data: syncRow, error: syncError } = await supabase
       .from("erp_sync_log")
@@ -366,8 +787,16 @@ Deno.serve(async (req) => {
       document_id: input.document_id,
       external_doc_id: externalDocId,
       erp_sync_log_id: syncRow.id,
-      retried,
-      zoho_response: raw,
+      sandbox_organization_id: orgId(),
+      retried: createRetried || attachRetried,
+      attachment: {
+        uploaded: attachResult.ok,
+        present_on_bill: attachInfo.present,
+        filename: file.filename,
+        documents: attachInfo.documents,
+        attach_response: attachResult.raw,
+      },
+      zoho_bill: getResult.ok ? getResult.raw : createResult.raw,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -375,3 +804,7 @@ Deno.serve(async (req) => {
     return jsonResponse({ ok: false, error: message }, 500);
   }
 });
+
+function resultOk(r: ZohoCallResult): boolean {
+  return r.ok;
+}

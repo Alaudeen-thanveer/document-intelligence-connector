@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { callEdgeFunction } from "../lib/functions";
 import { supabase } from "../lib/supabase";
 
 const ALLOWED_TYPES = new Set([
@@ -67,8 +68,9 @@ export function UploadInvoice({ onUploaded }: Props) {
         .insert({
           source: "upload",
           file_url: fileUrl,
-          status: "needs_review",
+          status: "uploaded",
           doc_type: "invoice",
+          has_supporting_document: true,
         })
         .select("id")
         .single();
@@ -77,8 +79,42 @@ export function UploadInvoice({ onUploaded }: Props) {
         throw new Error(insertError?.message ?? "Failed to create document row");
       }
 
-      setMessage(`Uploaded ${file.name}`);
-      onUploaded(doc.id as string);
+      const documentId = doc.id as string;
+      setMessage(`Uploaded ${file.name}. Running extract…`);
+
+      const extract = await callEdgeFunction("extract", {
+        document_id: documentId,
+      });
+      if (!extract.ok) {
+        throw new Error(
+          `Extract failed: ${
+            extract.body.error ?? extract.body.reason ?? extract.status
+          }. Is "npx supabase functions serve --env-file .env" running?`,
+        );
+      }
+
+      setMessage(`Extracted. Running judgment…`);
+      const judgment = await callEdgeFunction("judgment", {
+        document_id: documentId,
+      });
+      if (!judgment.ok) {
+        throw new Error(
+          `Judgment failed: ${
+            judgment.body.error ?? judgment.body.reason ?? judgment.status
+          }`,
+        );
+      }
+
+      const vendor =
+        (extract.body.fields as { vendor_raw?: string } | undefined)
+          ?.vendor_raw ?? "—";
+      const amount =
+        (extract.body.fields as { total_amount?: number } | undefined)
+          ?.total_amount ?? "—";
+      setMessage(
+        `Ready for review: vendor=${vendor}, amount=${amount}. Select the doc to inspect fields / Approve → Zoho.`,
+      );
+      onUploaded(documentId);
       if (inputRef.current) inputRef.current.value = "";
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -92,7 +128,9 @@ export function UploadInvoice({ onUploaded }: Props) {
       <div className="upload-row">
         <div>
           <p className="upload-title">Upload invoice</p>
-          <p className="upload-hint">PDF or image → Storage + documents row</p>
+          <p className="upload-hint">
+            Upload → extract → judgment (needs functions serve)
+          </p>
         </div>
         <button
           type="button"
@@ -100,7 +138,7 @@ export function UploadInvoice({ onUploaded }: Props) {
           disabled={busy}
           onClick={() => inputRef.current?.click()}
         >
-          {busy ? "Uploading…" : "Choose file"}
+          {busy ? "Processing…" : "Choose file"}
         </button>
         <input
           ref={inputRef}
