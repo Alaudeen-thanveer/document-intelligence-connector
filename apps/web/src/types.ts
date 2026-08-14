@@ -17,6 +17,8 @@ export interface ExtractedFieldsRow {
   invoice_date: string | null;
   currency: string | null;
   tax_amount: number | string | null;
+  invoice_number: string | null;
+  due_date: string | null;
   confidence_scores: Record<string, unknown> | null;
   ai_fallback_used: boolean;
 }
@@ -59,6 +61,20 @@ export interface EntityAccountRuleRow {
   account_zoho_id: string;
   account_name: string;
   updated_at: string;
+}
+
+export interface ExtractedLineItemRow {
+  id: string;
+  document_id: string;
+  extracted_fields_id: string;
+  line_no: number;
+  description: string | null;
+  quantity: number | string | null;
+  rate: number | string | null;
+  amount: number | string | null;
+  account_zoho_id: string | null;
+  tax_zoho_id: string | null;
+  source: "ocr" | "gemini" | "manual";
 }
 
 export type ReviewAction = "approve" | "correct" | "reject";

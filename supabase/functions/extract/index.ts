@@ -5,7 +5,10 @@
 // Secrets (never hardcoded): MINDEE_API_KEY, GEMINI_API_KEY
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
-import { reExtractFieldWithGemini } from "./gemini_fallback.ts";
+import {
+  extractLineItemsWithGemini,
+  reExtractFieldWithGemini,
+} from "./gemini_fallback.ts";
 
 const DEFAULT_EXTRACTION_CONFIDENCE_THRESHOLD = 0.8;
 const MINDEE_V1_INVOICE_URL =
@@ -16,7 +19,15 @@ const MINDEE_V2_JOB_URL = "https://api-v2.mindee.net/v2/jobs";
 type ExtractableField = "vendor_raw" | "total_amount" | "invoice_date";
 /** Fields that fall back to Gemini only when OCR found no value at all —
  * they skip the confidence threshold so they add no cost when OCR reads them. */
-type PresenceField = "currency" | "tax_amount";
+type PresenceField = "currency" | "tax_amount" | "invoice_number" | "due_date";
+
+interface ExtractedLine {
+  description: string | null;
+  quantity: number;
+  rate: number | null;
+  amount: number | null;
+  source: "ocr" | "gemini";
+}
 
 interface ExtractInput {
   document_id: string;
@@ -40,6 +51,9 @@ interface ExtractionResult {
   invoice_date: FieldValue;
   currency: FieldValue;
   tax_amount: FieldValue;
+  invoice_number: FieldValue;
+  due_date: FieldValue;
+  line_items: ExtractedLine[];
   raw_ocr_json: unknown;
   ai_fallback_used: boolean;
   threshold_used: number;
@@ -344,11 +358,53 @@ function mindeeTaxAmount(
   return found ? sum : null;
 }
 
+/** Line items across Mindee shapes: v1 `line_items[]` flat objects,
+ * v2 `line_items.items[]` where values may nest under `fields`. */
+function mindeeLineItems(
+  prediction: Record<string, unknown>,
+): ExtractedLine[] {
+  const raw = prediction.line_items as
+    | { items?: unknown[] }
+    | unknown[]
+    | undefined;
+  const items = Array.isArray(raw) ? raw : raw?.items;
+  if (!Array.isArray(items)) return [];
+
+  const lines: ExtractedLine[] = [];
+  for (const item of items) {
+    const it = item as Record<string, unknown>;
+    const f = (it.fields ?? it) as Record<string, unknown>;
+    const get = (key: string): unknown => {
+      const v = f[key];
+      return v != null && typeof v === "object" && "value" in (v as object)
+        ? (v as { value?: unknown }).value
+        : v;
+    };
+    const description = get("description") != null
+      ? String(get("description"))
+      : null;
+    const quantity = asNumber(get("quantity")) ?? 1;
+    const rate = asNumber(get("unit_price")) ?? asNumber(get("rate"));
+    const amount = asNumber(get("total_amount")) ?? asNumber(get("amount"));
+    if (description || rate != null || amount != null) {
+      lines.push({ description, quantity, rate, amount, source: "ocr" });
+    }
+  }
+  return lines;
+}
+
 function mapMindeeToFields(
   prediction: Record<string, unknown>,
 ): Pick<
   ExtractionResult,
-  "vendor_raw" | "total_amount" | "invoice_date" | "currency" | "tax_amount"
+  | "vendor_raw"
+  | "total_amount"
+  | "invoice_date"
+  | "currency"
+  | "tax_amount"
+  | "invoice_number"
+  | "due_date"
+  | "line_items"
 > {
   const supplier = pickField(prediction, [
     "supplier_name",
@@ -394,6 +450,28 @@ function mapMindeeToFields(
       confidence: mindeeTaxAmount(prediction) != null ? 1 : 0,
       source: "mindee",
     },
+    invoice_number: (() => {
+      const v = pickField(prediction, [
+        "invoice_number",
+        "document_number",
+        "bill_number",
+      ]);
+      const s = v.value != null ? String(v.value).trim() : null;
+      return {
+        value: s || null,
+        confidence: s ? 1 : 0,
+        source: "mindee" as const,
+      };
+    })(),
+    due_date: (() => {
+      const v = asDateString(pickField(prediction, ["due_date"]).value);
+      return {
+        value: v,
+        confidence: v != null ? 1 : 0,
+        source: "mindee" as const,
+      };
+    })(),
+    line_items: mindeeLineItems(prediction),
   };
 }
 
@@ -430,7 +508,14 @@ async function applyFieldFallbacks(
   imageUrl: string,
   fields: Pick<
     ExtractionResult,
-    "vendor_raw" | "total_amount" | "invoice_date" | "currency" | "tax_amount"
+    | "vendor_raw"
+    | "total_amount"
+    | "invoice_date"
+    | "currency"
+    | "tax_amount"
+    | "invoice_number"
+    | "due_date"
+    | "line_items"
   >,
   threshold: number,
 ): Promise<ExtractionResult> {
@@ -483,9 +568,14 @@ async function applyFieldFallbacks(
     }
   }
 
-  // Currency / tax fall back only when OCR found nothing — presence, not
+  // These fall back only when OCR found nothing — presence, not
   // confidence — so they never add Gemini cost when Mindee already read them.
-  const presenceTargets: PresenceField[] = ["currency", "tax_amount"];
+  const presenceTargets: PresenceField[] = [
+    "currency",
+    "tax_amount",
+    "invoice_number",
+    "due_date",
+  ];
   for (const field of presenceTargets) {
     const current = result[field];
     result[field] = {
@@ -510,6 +600,25 @@ async function applyFieldFallbacks(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`Gemini fallback failed for ${field}:`, message);
+    }
+  }
+
+  // Line items: one Gemini call for the whole table, only when OCR found none.
+  if (result.line_items.length === 0) {
+    try {
+      console.log("OCR found no line items; running Gemini fallback");
+      const { items } = await extractLineItemsWithGemini(imageUrl);
+      result.line_items = items.map((li) => ({
+        description: li.description,
+        quantity: li.quantity ?? 1,
+        rate: li.unit_price,
+        amount: li.amount,
+        source: "gemini" as const,
+      }));
+      if (result.line_items.length > 0) aiFallbackUsed = true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("Gemini line-items fallback failed:", message);
     }
   }
 
@@ -558,6 +667,10 @@ async function persistExtraction(
       ? String(extraction.currency.value)
       : null,
     tax_amount: asNumber(extraction.tax_amount.value),
+    invoice_number: extraction.invoice_number.value != null
+      ? String(extraction.invoice_number.value)
+      : null,
+    due_date: asDateString(extraction.due_date.value),
     confidence_scores: confidenceScores,
     raw_ocr_json: extraction.raw_ocr_json,
     ai_fallback_used: extraction.ai_fallback_used,
@@ -570,7 +683,29 @@ async function persistExtraction(
     .single();
 
   if (error) throw new Error(`extracted_fields insert failed: ${error.message}`);
-  return data.id as string;
+  const extractedId = data.id as string;
+
+  if (extraction.line_items.length > 0) {
+    const lineRows = extraction.line_items.map((li, i) => ({
+      document_id: documentId,
+      extracted_fields_id: extractedId,
+      line_no: i + 1,
+      description: li.description,
+      quantity: li.quantity,
+      rate: li.rate,
+      amount: li.amount,
+      source: li.source,
+    }));
+    const { error: lineError } = await supabase
+      .from("extracted_line_items")
+      .insert(lineRows);
+    if (lineError) {
+      // Header extraction stands even if line detail fails; review can add lines.
+      console.error(`extracted_line_items insert failed: ${lineError.message}`);
+    }
+  }
+
+  return extractedId;
 }
 
 Deno.serve(async (req) => {
@@ -730,6 +865,9 @@ Deno.serve(async (req) => {
           invoice_date: extraction.invoice_date.value,
           currency: extraction.currency.value,
           tax_amount: extraction.tax_amount.value,
+          invoice_number: extraction.invoice_number.value,
+          due_date: extraction.due_date.value,
+          line_items: extraction.line_items,
         },
         warnings,
       });

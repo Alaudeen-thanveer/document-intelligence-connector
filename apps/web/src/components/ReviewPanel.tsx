@@ -12,6 +12,21 @@ import { isFlaggedStatus } from "../types";
 
 type PostAs = "bill" | "expense" | "invoice";
 
+/** One editable invoice line in the review form. */
+interface EditableLine {
+  key: string;
+  description: string;
+  quantity: string;
+  rate: string;
+  accountId: string;
+}
+
+let lineKeyCounter = 0;
+function nextLineKey(): string {
+  lineKeyCounter += 1;
+  return `line-${lineKeyCounter}`;
+}
+
 /** UAE-edition VAT treatments (transaction-level; Zoho validates). */
 const TAX_TREATMENTS: Array<{ value: string; label: string }> = [
   { value: "vat_registered", label: "VAT registered" },
@@ -51,6 +66,9 @@ export function ReviewPanel({
   const [currency, setCurrency] = useState("");
   const [taxAmount, setTaxAmount] = useState("");
   const [taxTreatment, setTaxTreatment] = useState("");
+  const [invoiceNumber, setInvoiceNumber] = useState("");
+  const [dueDate, setDueDate] = useState("");
+  const [lineItems, setLineItems] = useState<EditableLine[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [zohoBillId, setZohoBillId] = useState<string | null>(null);
@@ -79,6 +97,8 @@ export function ReviewPanel({
       extracted?.tax_amount != null ? String(extracted.tax_amount) : "",
     );
     setTaxTreatment("");
+    setInvoiceNumber(extracted?.invoice_number ?? "");
+    setDueDate(extracted?.due_date ?? "");
     setActionMsg(null);
     setZohoBillId(null);
     setPostAs("bill");
@@ -154,6 +174,43 @@ export function ReviewPanel({
     }
   }, [vendorRaw, zoho.vendors, zoho.customers, postAsTouched, document?.id]);
 
+  // Load the extracted line items for this document's latest extraction.
+  useEffect(() => {
+    if (!extracted?.id) {
+      setLineItems([]);
+      return;
+    }
+    let cancelled = false;
+    void supabase
+      .from("extracted_line_items")
+      .select("line_no, description, quantity, rate, amount, account_zoho_id")
+      .eq("extracted_fields_id", extracted.id)
+      .order("line_no")
+      .then(({ data }) => {
+        if (cancelled) return;
+        setLineItems(
+          (data ?? []).map((row) => {
+            const qty = row.quantity != null ? Number(row.quantity) : 1;
+            const rate = row.rate != null
+              ? Number(row.rate)
+              : row.amount != null && qty > 0
+                ? Number(row.amount) / qty
+                : null;
+            return {
+              key: nextLineKey(),
+              description: row.description ?? "",
+              quantity: String(qty),
+              rate: rate != null ? String(Math.round(rate * 100) / 100) : "",
+              accountId: row.account_zoho_id ?? "",
+            };
+          }),
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [extracted?.id]);
+
   useEffect(() => {
     if (!document?.id) return;
     let cancelled = false;
@@ -218,6 +275,57 @@ export function ReviewPanel({
     failedRules.length === 0 &&
     document.status === "needs_review";
 
+  /** Persist header fields + line items; returns an error message or null. */
+  async function saveExtractedEdits(
+    overrides?: { invoice_date?: string },
+  ): Promise<string | null> {
+    if (!extracted) return "No extracted fields row.";
+    const { error: updateError } = await supabase
+      .from("extracted_fields")
+      .update({
+        vendor_raw: vendorRaw.trim() || null,
+        total_amount: totalAmount === "" ? null : Number(totalAmount),
+        invoice_date: overrides?.invoice_date ?? (invoiceDate || null),
+        currency: currency.trim().toUpperCase() || null,
+        tax_amount: taxAmount === "" ? null : Number(taxAmount),
+        invoice_number: invoiceNumber.trim() || null,
+        due_date: dueDate || null,
+      })
+      .eq("id", extracted.id);
+    if (updateError) return updateError.message;
+
+    // Replace the line set with what the reviewer sees now.
+    const { error: delError } = await supabase
+      .from("extracted_line_items")
+      .delete()
+      .eq("extracted_fields_id", extracted.id);
+    if (delError) return delError.message;
+
+    const rows = lineItems
+      .filter((li) => li.description.trim() || li.rate.trim())
+      .map((li, i) => ({
+        document_id: document!.id,
+        extracted_fields_id: extracted.id,
+        line_no: i + 1,
+        description: li.description.trim() || null,
+        quantity: li.quantity.trim() === "" ? 1 : Number(li.quantity),
+        rate: li.rate.trim() === "" ? null : Number(li.rate),
+        amount: li.rate.trim() === ""
+          ? null
+          : Number(li.rate) *
+            (li.quantity.trim() === "" ? 1 : Number(li.quantity)),
+        account_zoho_id: li.accountId || null,
+        source: "manual" as const,
+      }));
+    if (rows.length > 0) {
+      const { error: insError } = await supabase
+        .from("extracted_line_items")
+        .insert(rows);
+      if (insError) return insError.message;
+    }
+    return null;
+  }
+
   async function correct() {
     if (!extracted) {
       setActionMsg("No extracted fields to correct.");
@@ -225,19 +333,9 @@ export function ReviewPanel({
     }
     setBusy("correct");
     setActionMsg(null);
-    const { error: updateError } = await supabase
-      .from("extracted_fields")
-      .update({
-        vendor_raw: vendorRaw.trim() || null,
-        total_amount: totalAmount === "" ? null : Number(totalAmount),
-        invoice_date: invoiceDate || null,
-        currency: currency.trim().toUpperCase() || null,
-        tax_amount: taxAmount === "" ? null : Number(taxAmount),
-      })
-      .eq("id", extracted.id);
-
-    if (updateError) {
-      setActionMsg(updateError.message);
+    const saveErr = await saveExtractedEdits();
+    if (saveErr) {
+      setActionMsg(saveErr);
       setBusy(null);
       return;
     }
@@ -388,18 +486,9 @@ export function ReviewPanel({
       invoiceDate.trim() || new Date().toISOString().slice(0, 10);
 
     // Persist form values before push — zoho-push reads DB, not the UI inputs.
-    const { error: saveError } = await supabase
-      .from("extracted_fields")
-      .update({
-        vendor_raw: vendorRaw.trim(),
-        total_amount: amountNum,
-        invoice_date: dateForPush,
-        currency: currency.trim().toUpperCase() || null,
-        tax_amount: taxAmount === "" ? null : Number(taxAmount),
-      })
-      .eq("id", extracted.id);
+    const saveError = await saveExtractedEdits({ invoice_date: dateForPush });
     if (saveError) {
-      setActionMsg(`Could not save fields before push: ${saveError.message}`);
+      setActionMsg(`Could not save fields before push: ${saveError}`);
       setBusy(null);
       return;
     }
@@ -659,9 +748,166 @@ export function ReviewPanel({
                 placeholder="blank = no VAT on document"
               />
             </label>
+            <label>
+              Invoice number
+              <input
+                value={invoiceNumber}
+                onChange={(e) => setInvoiceNumber(e.target.value)}
+                placeholder="as printed, e.g. INV-2210"
+              />
+            </label>
+            <label>
+              Due date
+              <input
+                type="date"
+                value={dueDate}
+                onChange={(e) => setDueDate(e.target.value)}
+              />
+            </label>
           </div>
         )}
       </section>
+
+      {extracted && (
+        <section className="section">
+          <h3>Line items</h3>
+          {lineItems.length === 0 && (
+            <p className="muted">
+              No line items captured — the whole amount posts as one line.
+              Add lines to split it.
+            </p>
+          )}
+          {lineItems.map((li, idx) => (
+            <div key={li.key} className="line-item-row">
+              <input
+                className="li-desc"
+                value={li.description}
+                placeholder={`Line ${idx + 1} description`}
+                onChange={(e) =>
+                  setLineItems((prev) =>
+                    prev.map((p) =>
+                      p.key === li.key
+                        ? { ...p, description: e.target.value }
+                        : p,
+                    ),
+                  )
+                }
+              />
+              <input
+                className="li-qty"
+                value={li.quantity}
+                inputMode="decimal"
+                placeholder="Qty"
+                onChange={(e) =>
+                  setLineItems((prev) =>
+                    prev.map((p) =>
+                      p.key === li.key
+                        ? { ...p, quantity: e.target.value }
+                        : p,
+                    ),
+                  )
+                }
+              />
+              <input
+                className="li-rate"
+                value={li.rate}
+                inputMode="decimal"
+                placeholder="Rate"
+                onChange={(e) =>
+                  setLineItems((prev) =>
+                    prev.map((p) =>
+                      p.key === li.key ? { ...p, rate: e.target.value } : p,
+                    ),
+                  )
+                }
+              />
+              <select
+                className="li-account"
+                value={li.accountId}
+                onChange={(e) =>
+                  setLineItems((prev) =>
+                    prev.map((p) =>
+                      p.key === li.key
+                        ? { ...p, accountId: e.target.value }
+                        : p,
+                    ),
+                  )
+                }
+              >
+                <option value="">— account: use default —</option>
+                {accountOptions.map((a) => (
+                  <option key={a.zoho_id} value={a.zoho_id}>
+                    {a.name}
+                  </option>
+                ))}
+              </select>
+              <span className="li-amount">
+                {(() => {
+                  const q = Number(li.quantity) || 1;
+                  const r = Number(li.rate);
+                  return Number.isFinite(r) && li.rate.trim() !== ""
+                    ? (q * r).toFixed(2)
+                    : "—";
+                })()}
+              </span>
+              <button
+                type="button"
+                className="btn ghost btn-small"
+                onClick={() =>
+                  setLineItems((prev) => prev.filter((p) => p.key !== li.key))
+                }
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+          <div className="line-items-footer">
+            <button
+              type="button"
+              className="btn ghost btn-small"
+              onClick={() =>
+                setLineItems((prev) => [
+                  ...prev,
+                  {
+                    key: nextLineKey(),
+                    description: "",
+                    quantity: "1",
+                    rate: "",
+                    accountId: "",
+                  },
+                ])
+              }
+            >
+              + Add line
+            </button>
+            {lineItems.length > 0 && (
+              <span className="muted">
+                {(() => {
+                  const sum = lineItems.reduce((acc, li) => {
+                    const q = Number(li.quantity) || 1;
+                    const r = Number(li.rate);
+                    return acc +
+                      (Number.isFinite(r) && li.rate.trim() !== "" ? q * r : 0);
+                  }, 0);
+                  const vat = taxAmount.trim() === "" ? 0 : Number(taxAmount);
+                  const total = totalAmount.trim() === ""
+                    ? null
+                    : Number(totalAmount);
+                  const expected = sum + (Number.isFinite(vat) ? vat : 0);
+                  const mismatch = total != null &&
+                    Math.abs(expected - total) > 0.01;
+                  return `Lines ${sum.toFixed(2)} + VAT ${
+                    (Number.isFinite(vat) ? vat : 0).toFixed(2)
+                  } = ${expected.toFixed(2)}` +
+                    (mismatch
+                      ? ` — does not match total ${total?.toFixed(2)}`
+                      : "");
+                })()}
+              </span>
+            )}
+          </div>
+        </section>
+      )}
 
       <section className="section">
         <h3>Post to Zoho</h3>

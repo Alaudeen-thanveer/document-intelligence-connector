@@ -5,6 +5,7 @@ import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import {
   mapExtractedFieldsToZohoBill,
   type ExtractedFieldsRow,
+  type ExtractedLineItemRow,
   type ZohoBillMapped,
 } from "./mapping.ts";
 import {
@@ -200,6 +201,7 @@ function toZohoBillBody(
     vendor_id: bill.vendor_id,
     bill_number: billNumber,
     date: bill.date,
+    ...(bill.due_date ? { due_date: bill.due_date } : {}),
     ...(bill.reference_number
       ? { reference_number: bill.reference_number }
       : {}),
@@ -208,6 +210,7 @@ function toZohoBillBody(
       rate: item.rate,
       quantity: item.quantity,
       account_id: item.account_id,
+      ...(item.tax_id ? { tax_id: item.tax_id } : {}),
     })),
   };
 }
@@ -669,7 +672,7 @@ Deno.serve(async (req) => {
     const { data: extracted, error: extractedError } = await supabase
       .from("extracted_fields")
       .select(
-        "id, document_id, doc_type, vendor_raw, total_amount, invoice_date, currency, tax_amount, confidence_scores, raw_ocr_json, ai_fallback_used",
+        "id, document_id, doc_type, vendor_raw, total_amount, invoice_date, currency, tax_amount, invoice_number, due_date, confidence_scores, raw_ocr_json, ai_fallback_used",
       )
       .eq("document_id", input.document_id)
       .order("id", { ascending: false })
@@ -710,7 +713,24 @@ Deno.serve(async (req) => {
     }
 
     const postAs: "bill" | "invoice" | "expense" = input.post_as ?? "bill";
-    const mapped = mapExtractedFieldsToZohoBill(extracted as ExtractedFieldsRow);
+    // Reviewer-curated line items (with per-line accounts) when present.
+    const { data: lineRowsData } = await supabase
+      .from("extracted_line_items")
+      .select(
+        "line_no, description, quantity, rate, amount, account_zoho_id, tax_zoho_id",
+      )
+      .eq("extracted_fields_id", (extracted as { id: string }).id)
+      .order("line_no");
+    const lineRows = (lineRowsData ?? []) as ExtractedLineItemRow[];
+    const hasRealLines = lineRows.length > 0;
+
+    const mapped = mapExtractedFieldsToZohoBill(
+      extracted as ExtractedFieldsRow,
+      lineRows,
+    );
+    const grossTotal = Number(
+      String((extracted as ExtractedFieldsRow).total_amount).replace(/,/g, ""),
+    );
     const referenceNumber = `DIC-${
       input.document_id.replace(/-/g, "").slice(0, 12)
     }`;
@@ -756,33 +776,48 @@ Deno.serve(async (req) => {
         const invoiceMoney = await resolveCurrencyAndTax(
           supabase,
           mapped.currency,
-          mapped.line_items[0].rate,
+          grossTotal,
           mapped.tax_amount,
         );
         createBody = {
           customer_id: input.customer_id.trim(),
           date: mapped.date,
           reference_number: referenceNumber,
+          ...(mapped.due_date ? { due_date: mapped.due_date } : {}),
           ...(input.tax_treatment?.trim()
             ? { tax_treatment: input.tax_treatment.trim() }
             : {}),
           ...(invoiceMoney.currencyId
             ? { currency_id: invoiceMoney.currencyId }
             : {}),
-          line_items: [
-            {
-              description: mapped.vendor_name
-                ? `Invoice — ${mapped.vendor_name}`
-                : "Imported invoice",
-              // Net + tax_id when VAT matched, else the gross as extracted.
-              rate: invoiceMoney.taxId && invoiceMoney.netRate != null
-                ? invoiceMoney.netRate
-                : mapped.line_items[0].rate,
-              quantity: 1,
-              ...(invoiceMoney.taxId ? { tax_id: invoiceMoney.taxId } : {}),
-              ...(invoiceAccountId ? { account_id: invoiceAccountId } : {}),
-            },
-          ],
+          // Real extracted lines when present (each with its own account /
+          // tax, falling back to the transaction-level choices); else one
+          // implicit line — net + tax_id when VAT matched, else the gross.
+          line_items: hasRealLines
+            ? mapped.line_items.map((li) => ({
+              description: li.description,
+              rate: li.rate,
+              quantity: li.quantity,
+              ...(li.tax_id ?? invoiceMoney.taxId
+                ? { tax_id: li.tax_id ?? invoiceMoney.taxId }
+                : {}),
+              ...(li.account_id ?? invoiceAccountId
+                ? { account_id: li.account_id ?? invoiceAccountId }
+                : {}),
+            }))
+            : [
+              {
+                description: mapped.vendor_name
+                  ? `Invoice — ${mapped.vendor_name}`
+                  : "Imported invoice",
+                rate: invoiceMoney.taxId && invoiceMoney.netRate != null
+                  ? invoiceMoney.netRate
+                  : mapped.line_items[0].rate,
+                quantity: 1,
+                ...(invoiceMoney.taxId ? { tax_id: invoiceMoney.taxId } : {}),
+                ...(invoiceAccountId ? { account_id: invoiceAccountId } : {}),
+              },
+            ],
         };
       } else {
         // Account: explicit UI choice, else this vendor's default rule.
@@ -1015,6 +1050,24 @@ Deno.serve(async (req) => {
       expense_category: expenseCategory,
     });
 
+    // Per-line account/tax choices from review outrank fuzzy matching —
+    // matchEntities overwrites or strips account_id uniformly, so restore.
+    matched = {
+      ...matched,
+      bill: {
+        ...matched.bill,
+        line_items: matched.bill.line_items.map((item, i) => ({
+          ...item,
+          ...(mapped.line_items[i]?.account_id
+            ? { account_id: mapped.line_items[i].account_id }
+            : {}),
+          ...(mapped.line_items[i]?.tax_id
+            ? { tax_id: mapped.line_items[i].tax_id }
+            : {}),
+        })),
+      },
+    };
+
     // Explicit UI selections take precedence over fuzzy matching.
     if (input.vendor_id?.trim()) {
       const chosenVendor = input.vendor_id.trim();
@@ -1041,8 +1094,10 @@ Deno.serve(async (req) => {
         ),
         bill: {
           ...matched.bill,
-          line_items: matched.bill.line_items.map((item, i) =>
-            i === 0 ? { ...item, account_id: chosenAccount } : item
+          // The transaction-level choice fills every line that has no
+          // per-line account of its own.
+          line_items: matched.bill.line_items.map((item) =>
+            item.account_id ? item : { ...item, account_id: chosenAccount }
           ),
         },
         account_match: {
@@ -1127,8 +1182,11 @@ Deno.serve(async (req) => {
           ),
           bill: {
             ...matched.bill,
-            line_items: matched.bill.line_items.map((item, i) =>
-              i === 0 ? { ...item, account_id: rule.account_zoho_id } : item
+            // Vendor default rule fills every line without its own account.
+            line_items: matched.bill.line_items.map((item) =>
+              item.account_id
+                ? item
+                : { ...item, account_id: rule.account_zoho_id }
             ),
           },
           account_match: {
@@ -1139,6 +1197,20 @@ Deno.serve(async (req) => {
         };
         matched.unresolved = matched.unresolved_fields.length > 0;
       }
+    }
+
+    // Account resolution is per line now: unresolved iff any line lacks one.
+    {
+      const missingAccount = matched.bill.line_items.some(
+        (li) => !li.account_id,
+      );
+      const withoutAccount = matched.unresolved_fields.filter(
+        (f) => f !== "account",
+      );
+      matched.unresolved_fields = missingAccount
+        ? [...withoutAccount, "account"]
+        : withoutAccount;
+      matched.unresolved = matched.unresolved_fields.length > 0;
     }
 
     if (matched.unresolved) {
@@ -1164,30 +1236,42 @@ Deno.serve(async (req) => {
     const money = await resolveCurrencyAndTax(
       supabase,
       mapped.currency,
-      mapped.line_items[0].rate,
+      grossTotal,
       mapped.tax_amount,
     );
 
     const billBody = {
       ...toZohoBillBody(matched.bill, {
-        billNumber: `DIC-${input.document_id.replace(/-/g, "").slice(0, 12)}-${Date.now().toString(36)}`,
+        // The document's own number is the bill number (Zoho flags true
+        // duplicates per vendor); the DIC ref stays as reference_number.
+        billNumber: mapped.invoice_number ||
+          `DIC-${input.document_id.replace(/-/g, "").slice(0, 12)}-${Date.now().toString(36)}`,
       }),
       ...(input.tax_treatment?.trim()
         ? { tax_treatment: input.tax_treatment.trim() }
         : {}),
       ...(money.currencyId ? { currency_id: money.currencyId } : {}),
+      // From the extracted row, not matched.bill — match-entities rebuilds
+      // the bill object and drops passthrough header fields like due_date.
+      ...(mapped.due_date ? { due_date: mapped.due_date } : {}),
     };
 
-    // VAT belongs in the tax field: post the NET amount with the matched
-    // tax_id so Zoho recomputes the invoice's gross total itself.
-    if (money.taxId && money.netRate != null) {
+    // VAT belongs in the tax field, never inside the line amount.
+    if (money.taxId) {
       billBody.line_items = (billBody.line_items as Array<
         Record<string, unknown>
-      >).map((item, i) =>
-        i === 0
+      >).map((item, i) => {
+        if (hasRealLines) {
+          // Extracted lines are the printed (net) amounts: attach the
+          // matched rate to lines without their own tax; keep rates as-is.
+          return item.tax_id ? item : { ...item, tax_id: money.taxId };
+        }
+        // Implicit single line holds the gross: post net + tax_id so Zoho
+        // recomputes the same gross the document shows.
+        return i === 0 && money.netRate != null
           ? { ...item, rate: money.netRate, tax_id: money.taxId }
-          : item
-      );
+          : item;
+      });
     }
     const {
       result: createResult,

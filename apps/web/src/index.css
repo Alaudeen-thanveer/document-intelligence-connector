@@ -638,6 +638,41 @@ a {
   font-size: 0.85rem;
 }
 
+/* Review line items */
+.line-item-row {
+  display: grid;
+  grid-template-columns: 1fr 64px 96px 180px 80px 32px;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.line-item-row input,
+.line-item-row select {
+  width: 100%;
+  min-width: 0;
+}
+
+.li-amount {
+  text-align: right;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.line-items-footer {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 4px;
+}
+
+@media (max-width: 900px) {
+  .line-item-row {
+    grid-template-columns: 1fr 56px 80px;
+    grid-auto-rows: auto;
+  }
+}
+
 /* Connections page */
 .view-nav {
   display: flex;
