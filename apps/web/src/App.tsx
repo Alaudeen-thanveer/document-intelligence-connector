@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { DocumentList } from "./components/DocumentList";
 import { ReviewPanel } from "./components/ReviewPanel";
+import { RulesManager } from "./components/RulesManager";
 import { UploadInvoice } from "./components/UploadInvoice";
 import { useDocumentDetail } from "./hooks/useDocumentDetail";
 import { useDocuments } from "./hooks/useDocuments";
@@ -14,6 +15,8 @@ export default function App() {
     () => new Set(),
   );
   const [tick, setTick] = useState(0);
+  const [rulesOpen, setRulesOpen] = useState(false);
+  const [rulesVersion, setRulesVersion] = useState(0);
 
   const selected = useMemo(
     () => documents.find((d) => d.id === selectedId) ?? null,
@@ -63,15 +66,30 @@ export default function App() {
           <p className="brand">Document Intelligence Connector</p>
           <h1>Document review</h1>
         </div>
-        <label className="reviewer-field">
-          Reviewer
-          <input
-            value={reviewerName}
-            onChange={(e) => setReviewerName(e.target.value)}
-            placeholder="Your name"
-          />
-        </label>
+        <div className="topbar-actions">
+          <button
+            type="button"
+            className="btn ghost"
+            onClick={() => setRulesOpen(true)}
+          >
+            Vendor rules
+          </button>
+          <label className="reviewer-field">
+            Reviewer
+            <input
+              value={reviewerName}
+              onChange={(e) => setReviewerName(e.target.value)}
+              placeholder="Your name"
+            />
+          </label>
+        </div>
       </header>
+
+      <RulesManager
+        open={rulesOpen}
+        onClose={() => setRulesOpen(false)}
+        onChanged={() => setRulesVersion((n) => n + 1)}
+      />
 
       <main className="layout">
         <section className="list-pane">
@@ -118,6 +136,7 @@ export default function App() {
           loading={detail.loading}
           error={detail.error}
           reviewerName={reviewerName}
+          rulesVersion={rulesVersion}
           onChanged={() => {
             // Reload list from source of truth after mutations.
             void supabase

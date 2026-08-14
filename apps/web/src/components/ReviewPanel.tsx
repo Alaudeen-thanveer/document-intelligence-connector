@@ -1,51 +1,16 @@
 import { useEffect, useState } from "react";
 import { callEdgeFunction } from "../lib/functions";
 import { supabase } from "../lib/supabase";
+import { entityAccountType, findByName } from "../lib/zoho";
 import { useZohoEntities } from "../hooks/useZohoEntities";
 import type {
   DocumentRow,
   ExtractedFieldsRow,
   JudgmentResultRow,
-  ZohoEntityRow,
 } from "../types";
 import { isFlaggedStatus } from "../types";
 
 type PostAs = "bill" | "expense" | "invoice";
-
-/** Normalize a name for vendor/customer matching (mirrors match-entities). */
-function normName(value: string): string {
-  return value
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[̀-ͯ]/g, "")
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-/** Exact normalized match wins; otherwise first containment match. */
-function findByName<T>(
-  query: string,
-  items: T[],
-  getName: (item: T) => string,
-): T | null {
-  const q = normName(query);
-  if (!q) return null;
-  let containment: T | null = null;
-  for (const item of items) {
-    const c = normName(getName(item));
-    if (!c) continue;
-    if (c === q) return item;
-    if (!containment && (c.includes(q) || q.includes(c))) containment = item;
-  }
-  return containment;
-}
-
-function entityAccountType(a: ZohoEntityRow): string {
-  return String(
-    (a.extra as { account_type?: unknown } | null)?.account_type ?? "",
-  ).toLowerCase();
-}
 
 interface Props {
   document: DocumentRow | null;
@@ -54,6 +19,8 @@ interface Props {
   loading: boolean;
   error: string | null;
   reviewerName: string;
+  /** Bumped by the rules manager so the vendor-rule prefill refetches. */
+  rulesVersion?: number;
   onChanged: () => void;
 }
 
@@ -64,6 +31,7 @@ export function ReviewPanel({
   loading,
   error,
   reviewerName,
+  rulesVersion = 0,
   onChanged,
 }: Props) {
   const [vendorRaw, setVendorRaw] = useState("");
@@ -129,7 +97,7 @@ export function ReviewPanel({
     return () => {
       cancelled = true;
     };
-  }, [vendorId, accountTouched]);
+  }, [vendorId, accountTouched, rulesVersion]);
 
   // Auto-default the posting type from the extracted party name:
   // vendor match → Bill (user may still switch to Expense);

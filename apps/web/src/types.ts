@@ -37,6 +37,15 @@ export interface ZohoEntityRow {
   synced_at: string;
 }
 
+export interface VendorAccountRuleRow {
+  id: string;
+  vendor_zoho_id: string;
+  vendor_name: string;
+  account_zoho_id: string;
+  account_name: string;
+  updated_at: string;
+}
+
 export type ReviewAction = "approve" | "correct" | "reject";
 
 export function isFlaggedStatus(status: string): boolean {
