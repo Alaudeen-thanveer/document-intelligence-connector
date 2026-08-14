@@ -15,6 +15,8 @@ export interface ExtractedFieldsRow {
   vendor_raw: string | null;
   total_amount: number | string | null;
   invoice_date: string | null;
+  currency: string | null;
+  tax_amount: number | string | null;
   confidence_scores: Record<string, unknown> | null;
   ai_fallback_used: boolean;
 }

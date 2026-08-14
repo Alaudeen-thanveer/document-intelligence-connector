@@ -14,6 +14,10 @@ export interface ExtractedFieldsRow {
   vendor_raw: string | null;
   total_amount: number | string | null;
   invoice_date: string | Date | null;
+  /** ISO 4217 code as printed on the invoice (e.g. AED, USD). */
+  currency?: string | null;
+  /** VAT/tax amount shown on the invoice, in invoice currency. */
+  tax_amount?: number | string | null;
   confidence_scores?: unknown;
   raw_ocr_json?: unknown;
   ai_fallback_used?: boolean;
@@ -48,6 +52,10 @@ export interface ZohoBillMapped {
   vendor_id?: string;
   /** Zoho `reference_number` — optional passthrough when known. */
   reference_number?: string;
+  /** Invoice currency code; resolved to Zoho currency_id at push time. */
+  currency?: string | null;
+  /** VAT amount from the document; resolved to a Zoho tax_id at push time. */
+  tax_amount?: number | null;
 }
 
 function toNumber(value: number | string | null | undefined): number {
@@ -107,9 +115,17 @@ export function mapExtractedFieldsToZohoBill(
     ? `Bill from ${vendorName}`
     : "Imported bill";
 
+  const taxAmount = row.tax_amount == null || row.tax_amount === ""
+    ? null
+    : Number(String(row.tax_amount).replace(/,/g, ""));
+
   return {
     date,
     vendor_name: vendorName,
+    currency: row.currency?.trim().toUpperCase() || null,
+    tax_amount: taxAmount != null && Number.isFinite(taxAmount)
+      ? taxAmount
+      : null,
     line_items: [
       {
         description,

@@ -14,6 +14,9 @@ const MINDEE_V2_ENQUEUE_URL = "https://api-v2.mindee.net/v2/inferences/enqueue";
 const MINDEE_V2_JOB_URL = "https://api-v2.mindee.net/v2/jobs";
 
 type ExtractableField = "vendor_raw" | "total_amount" | "invoice_date";
+/** Fields that fall back to Gemini only when OCR found no value at all —
+ * they skip the confidence threshold so they add no cost when OCR reads them. */
+type PresenceField = "currency" | "tax_amount";
 
 interface ExtractInput {
   document_id: string;
@@ -35,6 +38,8 @@ interface ExtractionResult {
   vendor_raw: FieldValue;
   total_amount: FieldValue;
   invoice_date: FieldValue;
+  currency: FieldValue;
+  tax_amount: FieldValue;
   raw_ocr_json: unknown;
   ai_fallback_used: boolean;
   threshold_used: number;
@@ -285,9 +290,66 @@ async function callMindeeInvoice(
   }
 }
 
+/** Currency hides in nested shapes: v2 `locale.fields.currency.value`,
+ * v1 `locale.value`/`locale.currency`, or a flat `currency` field. */
+function mindeeCurrency(
+  prediction: Record<string, unknown>,
+): string | null {
+  const flat = mindeeField(prediction, "currency").value;
+  const locale = prediction.locale as
+    | {
+      value?: unknown;
+      currency?: unknown;
+      fields?: { currency?: { value?: unknown } };
+    }
+    | undefined;
+  const candidate = flat ?? locale?.fields?.currency?.value ??
+    locale?.currency ?? locale?.value;
+  if (candidate == null) return null;
+  const code = String(candidate).trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(code) ? code : null;
+}
+
+/** VAT amount: prefer `total_tax`; else sum the `taxes` line items
+ * (v2 shape taxes.items[].fields.amount.value, v1 taxes[].value). */
+function mindeeTaxAmount(
+  prediction: Record<string, unknown>,
+): number | null {
+  const flat = asNumber(pickField(prediction, ["total_tax", "tax"]).value);
+  if (flat != null) return flat;
+
+  const taxes = prediction.taxes as
+    | { items?: unknown[] }
+    | unknown[]
+    | undefined;
+  const items = Array.isArray(taxes) ? taxes : taxes?.items;
+  if (!Array.isArray(items) || items.length === 0) return null;
+
+  let sum = 0;
+  let found = false;
+  for (const item of items) {
+    const it = item as {
+      value?: unknown;
+      amount?: unknown;
+      fields?: { amount?: { value?: unknown } };
+    };
+    const amount = asNumber(
+      it.fields?.amount?.value ?? it.amount ?? it.value,
+    );
+    if (amount != null) {
+      sum += amount;
+      found = true;
+    }
+  }
+  return found ? sum : null;
+}
+
 function mapMindeeToFields(
   prediction: Record<string, unknown>,
-): Pick<ExtractionResult, "vendor_raw" | "total_amount" | "invoice_date"> {
+): Pick<
+  ExtractionResult,
+  "vendor_raw" | "total_amount" | "invoice_date" | "currency" | "tax_amount"
+> {
   const supplier = pickField(prediction, [
     "supplier_name",
     "vendor_name",
@@ -320,6 +382,16 @@ function mapMindeeToFields(
     invoice_date: {
       value: asDateString(date.value),
       confidence: date.confidence,
+      source: "mindee",
+    },
+    currency: {
+      value: mindeeCurrency(prediction),
+      confidence: mindeeCurrency(prediction) != null ? 1 : 0,
+      source: "mindee",
+    },
+    tax_amount: {
+      value: mindeeTaxAmount(prediction),
+      confidence: mindeeTaxAmount(prediction) != null ? 1 : 0,
       source: "mindee",
     },
   };
@@ -356,7 +428,10 @@ async function loadExtractionThreshold(
 
 async function applyFieldFallbacks(
   imageUrl: string,
-  fields: Pick<ExtractionResult, "vendor_raw" | "total_amount" | "invoice_date">,
+  fields: Pick<
+    ExtractionResult,
+    "vendor_raw" | "total_amount" | "invoice_date" | "currency" | "tax_amount"
+  >,
   threshold: number,
 ): Promise<ExtractionResult> {
   let aiFallbackUsed = false;
@@ -408,6 +483,36 @@ async function applyFieldFallbacks(
     }
   }
 
+  // Currency / tax fall back only when OCR found nothing — presence, not
+  // confidence — so they never add Gemini cost when Mindee already read them.
+  const presenceTargets: PresenceField[] = ["currency", "tax_amount"];
+  for (const field of presenceTargets) {
+    const current = result[field];
+    result[field] = {
+      ...current,
+      ocr_confidence: current.confidence,
+      ai_fallback_triggered: false,
+    };
+    if (current.value != null) continue;
+
+    try {
+      console.log(`OCR found no ${field}; running Gemini fallback`);
+      const replaced = await reExtractFieldWithGemini(imageUrl, field);
+      result[field] = {
+        value: replaced.value,
+        confidence: replaced.confidence,
+        source: "gemini",
+        ocr_confidence: current.confidence,
+        ai_fallback_triggered: true,
+        gemini_raw: replaced.raw_text,
+      };
+      aiFallbackUsed = true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`Gemini fallback failed for ${field}:`, message);
+    }
+  }
+
   result.ai_fallback_used = aiFallbackUsed;
   return result;
 }
@@ -449,6 +554,10 @@ async function persistExtraction(
       : null,
     total_amount: asNumber(extraction.total_amount.value),
     invoice_date: asDateString(extraction.invoice_date.value),
+    currency: extraction.currency.value != null
+      ? String(extraction.currency.value)
+      : null,
+    tax_amount: asNumber(extraction.tax_amount.value),
     confidence_scores: confidenceScores,
     raw_ocr_json: extraction.raw_ocr_json,
     ai_fallback_used: extraction.ai_fallback_used,
@@ -619,6 +728,8 @@ Deno.serve(async (req) => {
           vendor_raw: extraction.vendor_raw.value,
           total_amount: extraction.total_amount.value,
           invoice_date: extraction.invoice_date.value,
+          currency: extraction.currency.value,
+          tax_amount: extraction.tax_amount.value,
         },
         warnings,
       });

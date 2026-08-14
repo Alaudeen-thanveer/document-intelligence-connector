@@ -12,6 +12,17 @@ import { isFlaggedStatus } from "../types";
 
 type PostAs = "bill" | "expense" | "invoice";
 
+/** UAE-edition VAT treatments (transaction-level; Zoho validates). */
+const TAX_TREATMENTS: Array<{ value: string; label: string }> = [
+  { value: "vat_registered", label: "VAT registered" },
+  { value: "vat_not_registered", label: "VAT not registered" },
+  { value: "gcc_vat_registered", label: "GCC VAT registered" },
+  { value: "gcc_vat_not_registered", label: "GCC VAT not registered" },
+  { value: "non_gcc", label: "Non GCC" },
+  { value: "dz_vat_registered", label: "Designated zone (registered)" },
+  { value: "dz_vat_not_registered", label: "Designated zone (not registered)" },
+];
+
 interface Props {
   document: DocumentRow | null;
   extracted: ExtractedFieldsRow | null;
@@ -37,6 +48,9 @@ export function ReviewPanel({
   const [vendorRaw, setVendorRaw] = useState("");
   const [totalAmount, setTotalAmount] = useState("");
   const [invoiceDate, setInvoiceDate] = useState("");
+  const [currency, setCurrency] = useState("");
+  const [taxAmount, setTaxAmount] = useState("");
+  const [taxTreatment, setTaxTreatment] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [zohoBillId, setZohoBillId] = useState<string | null>(null);
@@ -60,6 +74,11 @@ export function ReviewPanel({
       extracted?.total_amount != null ? String(extracted.total_amount) : "",
     );
     setInvoiceDate(extracted?.invoice_date ?? "");
+    setCurrency(extracted?.currency ?? "");
+    setTaxAmount(
+      extracted?.tax_amount != null ? String(extracted.tax_amount) : "",
+    );
+    setTaxTreatment("");
     setActionMsg(null);
     setZohoBillId(null);
     setPostAs("bill");
@@ -179,6 +198,20 @@ export function ReviewPanel({
     return t.includes("bank") || t.includes("cash") || t === "credit_card";
   });
 
+  // The selected party's treatment from the cache — shown as the default
+  // option. Treatment is transactional: a VAT-registered party can still
+  // have e.g. an out-of-scope document, hence the per-document dropdown.
+  const selectedParty = postAs === "invoice"
+    ? zoho.customers.find((c) => c.zoho_id === customerId)
+    : zoho.vendors.find((v) => v.zoho_id === vendorId);
+  const partyTreatment = String(
+    (selectedParty?.extra as { tax_treatment?: unknown } | null)
+      ?.tax_treatment ?? "",
+  );
+  const partyTreatmentLabel = TAX_TREATMENTS.find(
+    (t) => t.value === partyTreatment,
+  )?.label;
+
   const failedRules = judgments.filter((j) => !j.passed);
   const entityUnresolvedHint =
     isFlaggedStatus(document.status) &&
@@ -198,6 +231,8 @@ export function ReviewPanel({
         vendor_raw: vendorRaw.trim() || null,
         total_amount: totalAmount === "" ? null : Number(totalAmount),
         invoice_date: invoiceDate || null,
+        currency: currency.trim().toUpperCase() || null,
+        tax_amount: taxAmount === "" ? null : Number(taxAmount),
       })
       .eq("id", extracted.id);
 
@@ -359,6 +394,8 @@ export function ReviewPanel({
         vendor_raw: vendorRaw.trim(),
         total_amount: amountNum,
         invoice_date: dateForPush,
+        currency: currency.trim().toUpperCase() || null,
+        tax_amount: taxAmount === "" ? null : Number(taxAmount),
       })
       .eq("id", extracted.id);
     if (saveError) {
@@ -420,6 +457,7 @@ export function ReviewPanel({
         customer_id: customerId || undefined,
         account_id: accountId || undefined,
         paid_through_account_id: paidThroughId || undefined,
+        tax_treatment: taxTreatment || undefined,
       });
       if (!push.ok) {
         const detail = String(
@@ -603,6 +641,24 @@ export function ReviewPanel({
                 onChange={(e) => setInvoiceDate(e.target.value)}
               />
             </label>
+            <label>
+              Currency
+              <input
+                value={currency}
+                onChange={(e) => setCurrency(e.target.value.toUpperCase())}
+                placeholder="AED"
+                maxLength={3}
+              />
+            </label>
+            <label>
+              VAT amount
+              <input
+                value={taxAmount}
+                onChange={(e) => setTaxAmount(e.target.value)}
+                inputMode="decimal"
+                placeholder="blank = no VAT on document"
+              />
+            </label>
           </div>
         )}
       </section>
@@ -734,7 +790,31 @@ export function ReviewPanel({
               </select>
             </label>
           )}
+          <label>
+            Tax treatment
+            <select
+              value={taxTreatment}
+              onChange={(e) => setTaxTreatment(e.target.value)}
+            >
+              <option value="">
+                {partyTreatmentLabel
+                  ? `— party default (${partyTreatmentLabel}) —`
+                  : "— party default —"}
+              </option>
+              {TAX_TREATMENTS.map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
+        {taxTreatment && partyTreatment && taxTreatment !== partyTreatment && (
+          <p className="muted">
+            Overriding this party's default treatment for this transaction
+            only — the party master in Zoho is not changed.
+          </p>
+        )}
 
         {(postAs === "invoice" ? customerId : vendorId) && (
           <div className="rule-row">

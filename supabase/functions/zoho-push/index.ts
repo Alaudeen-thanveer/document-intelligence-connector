@@ -92,6 +92,71 @@ async function lookupDefaultAccountRule(
   return (data as DefaultAccountRule | null) ?? null;
 }
 
+/**
+ * Resolve the document's currency code and VAT amount against the synced
+ * zoho_entities cache. VAT sits in Zoho's tax field, never inside the line
+ * amount: when a tax rate matches, the line becomes the NET amount plus a
+ * tax_id, so Zoho recomputes the same gross total the invoice shows.
+ */
+async function resolveCurrencyAndTax(
+  supabase: SupabaseClient,
+  currencyCode: string | null | undefined,
+  grossAmount: number,
+  taxAmount: number | null | undefined,
+): Promise<{
+  currencyId: string | null;
+  taxId: string | null;
+  taxName: string | null;
+  netRate: number | null;
+  notes: string[];
+}> {
+  const notes: string[] = [];
+  let currencyId: string | null = null;
+  let taxId: string | null = null;
+  let taxName: string | null = null;
+  let netRate: number | null = null;
+
+  if (currencyCode) {
+    const { data } = await supabase
+      .from("zoho_entities")
+      .select("zoho_id")
+      .eq("kind", "currency")
+      .eq("name", currencyCode)
+      .maybeSingle();
+    if (data?.zoho_id) {
+      currencyId = String(data.zoho_id);
+    } else {
+      notes.push(
+        `currency ${currencyCode} not in synced Zoho currencies — Zoho default applies`,
+      );
+    }
+  }
+
+  if (taxAmount != null && taxAmount >= 0 && grossAmount > taxAmount) {
+    const net = grossAmount - taxAmount;
+    const pct = (taxAmount / net) * 100;
+    const { data: taxes } = await supabase
+      .from("zoho_entities")
+      .select("zoho_id, name, extra")
+      .eq("kind", "tax");
+    const match = (taxes ?? []).find((t) => {
+      const p = Number((t.extra as { percentage?: unknown })?.percentage);
+      return Number.isFinite(p) && Math.abs(p - pct) <= 0.5;
+    });
+    if (match) {
+      taxId = String(match.zoho_id);
+      taxName = String(match.name);
+      netRate = Math.round(net * 100) / 100;
+    } else {
+      notes.push(
+        `VAT ${taxAmount} on ${grossAmount} (~${pct.toFixed(1)}%) matches no synced Zoho tax rate — posted gross without tax_id`,
+      );
+    }
+  }
+
+  return { currencyId, taxId, taxName, netRate, notes };
+}
+
 function parseJsonEnv<T>(name: string): T | null {
   const raw = Deno.env.get(name)?.trim();
   if (!raw) return null;
@@ -604,7 +669,7 @@ Deno.serve(async (req) => {
     const { data: extracted, error: extractedError } = await supabase
       .from("extracted_fields")
       .select(
-        "id, document_id, doc_type, vendor_raw, total_amount, invoice_date, confidence_scores, raw_ocr_json, ai_fallback_used",
+        "id, document_id, doc_type, vendor_raw, total_amount, invoice_date, currency, tax_amount, confidence_scores, raw_ocr_json, ai_fallback_used",
       )
       .eq("document_id", input.document_id)
       .order("id", { ascending: false })
@@ -688,6 +753,12 @@ Deno.serve(async (req) => {
         path = "invoices";
         rootKey = "invoice";
         idKey = "invoice_id";
+        const invoiceMoney = await resolveCurrencyAndTax(
+          supabase,
+          mapped.currency,
+          mapped.line_items[0].rate,
+          mapped.tax_amount,
+        );
         createBody = {
           customer_id: input.customer_id.trim(),
           date: mapped.date,
@@ -695,13 +766,20 @@ Deno.serve(async (req) => {
           ...(input.tax_treatment?.trim()
             ? { tax_treatment: input.tax_treatment.trim() }
             : {}),
+          ...(invoiceMoney.currencyId
+            ? { currency_id: invoiceMoney.currencyId }
+            : {}),
           line_items: [
             {
               description: mapped.vendor_name
                 ? `Invoice — ${mapped.vendor_name}`
                 : "Imported invoice",
-              rate: mapped.line_items[0].rate,
+              // Net + tax_id when VAT matched, else the gross as extracted.
+              rate: invoiceMoney.taxId && invoiceMoney.netRate != null
+                ? invoiceMoney.netRate
+                : mapped.line_items[0].rate,
               quantity: 1,
+              ...(invoiceMoney.taxId ? { tax_id: invoiceMoney.taxId } : {}),
               ...(invoiceAccountId ? { account_id: invoiceAccountId } : {}),
             },
           ],
@@ -1083,6 +1161,13 @@ Deno.serve(async (req) => {
       );
     }
 
+    const money = await resolveCurrencyAndTax(
+      supabase,
+      mapped.currency,
+      mapped.line_items[0].rate,
+      mapped.tax_amount,
+    );
+
     const billBody = {
       ...toZohoBillBody(matched.bill, {
         billNumber: `DIC-${input.document_id.replace(/-/g, "").slice(0, 12)}-${Date.now().toString(36)}`,
@@ -1090,7 +1175,20 @@ Deno.serve(async (req) => {
       ...(input.tax_treatment?.trim()
         ? { tax_treatment: input.tax_treatment.trim() }
         : {}),
+      ...(money.currencyId ? { currency_id: money.currencyId } : {}),
     };
+
+    // VAT belongs in the tax field: post the NET amount with the matched
+    // tax_id so Zoho recomputes the invoice's gross total itself.
+    if (money.taxId && money.netRate != null) {
+      billBody.line_items = (billBody.line_items as Array<
+        Record<string, unknown>
+      >).map((item, i) =>
+        i === 0
+          ? { ...item, rate: money.netRate, tax_id: money.taxId }
+          : item
+      );
+    }
     const {
       result: createResult,
       accessToken: tokenAfterCreate,
@@ -1166,6 +1264,15 @@ Deno.serve(async (req) => {
       external_doc_id: externalDocId,
       erp_sync_log_id: syncRow.id,
       sandbox_organization_id: orgId(),
+      money_mapping: {
+        currency: mapped.currency ?? null,
+        currency_id: money.currencyId,
+        tax_id: money.taxId,
+        tax_name: money.taxName,
+        net_rate: money.netRate,
+        tax_amount: mapped.tax_amount ?? null,
+        notes: money.notes,
+      },
       retried: createRetried || attachRetried,
       attachment: {
         uploaded: attachResult.ok,

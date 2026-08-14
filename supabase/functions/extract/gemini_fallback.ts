@@ -4,7 +4,12 @@
  */
 import { GoogleGenerativeAI } from "npm:@google/generative-ai@0.24.1";
 
-export type ExtractableField = "vendor_raw" | "total_amount" | "invoice_date";
+export type ExtractableField =
+  | "vendor_raw"
+  | "total_amount"
+  | "invoice_date"
+  | "currency"
+  | "tax_amount";
 
 export interface GeminiFieldValue {
   value: string | number | null;
@@ -110,6 +115,10 @@ const FIELD_INSTRUCTIONS: Record<ExtractableField, string> = {
     'Extract only the invoice total amount as a number. Return JSON only: {"value": number|null, "confidence": number between 0 and 1}',
   invoice_date:
     'Extract only the invoice date as YYYY-MM-DD. Return JSON only: {"value": string|null, "confidence": number between 0 and 1}',
+  currency:
+    'Extract only the invoice currency as a 3-letter ISO code (e.g. AED, USD, EUR). Infer from the currency symbol or text if no code is printed. Return JSON only: {"value": string|null, "confidence": number between 0 and 1}',
+  tax_amount:
+    'Extract only the total VAT/tax amount as a number in the invoice currency. If the invoice shows no VAT/tax line, return null. Return JSON only: {"value": number|null, "confidence": number between 0 and 1}',
 };
 
 export async function reExtractFieldWithGemini(
@@ -187,9 +196,20 @@ export async function reExtractFieldWithGemini(
   }
   const confidence = Math.max(0, Math.min(1, confidenceNum));
 
-  if (field === "total_amount") {
+  if (field === "total_amount" || field === "tax_amount") {
     return {
       value: asNumber(parsed.value),
+      confidence,
+      source: "gemini",
+      raw_text: rawText,
+    };
+  }
+  if (field === "currency") {
+    const code = parsed.value != null
+      ? String(parsed.value).trim().toUpperCase()
+      : null;
+    return {
+      value: code && /^[A-Z]{3}$/.test(code) ? code : null,
       confidence,
       source: "gemini",
       raw_text: rawText,
