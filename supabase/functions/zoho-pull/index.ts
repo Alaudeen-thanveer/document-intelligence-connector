@@ -1,6 +1,7 @@
-// Pull Zoho Books entities (chart of accounts, vendors, customers, reporting
-// tags, currencies, projects) into the local zoho_entities cache so the
-// review UI can offer posting dropdowns.
+// Pull Zoho Books masters (chart of accounts, vendors, customers, reporting
+// tags, currencies, projects, taxes, bank accounts, payment terms, items,
+// users) into the local zoho_entities cache so the review UI can offer
+// posting dropdowns.
 // Read-only against Zoho; replaces cached rows per kind on each sync.
 // Credentials come only from environment variables — never hardcoded.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
@@ -12,7 +13,12 @@ type EntityKind =
   | "customer"
   | "reporting_tag"
   | "currency"
-  | "project";
+  | "project"
+  | "tax"
+  | "bank_account"
+  | "payment_term"
+  | "item"
+  | "user";
 
 const ALL_KINDS: EntityKind[] = [
   "account",
@@ -21,6 +27,11 @@ const ALL_KINDS: EntityKind[] = [
   "reporting_tag",
   "currency",
   "project",
+  "tax",
+  "bank_account",
+  "payment_term",
+  "item",
+  "user",
 ];
 
 interface PullInput {
@@ -135,8 +146,12 @@ async function fetchAllPages(
         `Zoho ${path} fetch failed (${res.status}): ${JSON.stringify(raw)}`,
       );
     }
+    // Most list endpoints put the array at the top level; a few (e.g.
+    // settings/paymentterms) nest it under a `data` object.
+    const body = raw as Record<string, unknown>;
+    const nested = (body.data as Record<string, unknown> | undefined) ?? {};
     const items =
-      ((raw as Record<string, unknown>)[listKey] as Array<
+      ((body[listKey] ?? nested[listKey]) as Array<
         Record<string, unknown>
       >) ?? [];
     out.push(...items);
@@ -231,6 +246,94 @@ async function fetchKind(
           customer_id: p.customer_id != null ? String(p.customer_id) : null,
           customer_name: p.customer_name ?? null,
           status: p.status ?? null,
+        },
+      }))
+      .filter((r) => r.zoho_id && r.name);
+  }
+
+  if (kind === "tax") {
+    const taxes = await fetchAllPages(accessToken, "settings/taxes", "taxes");
+    return taxes
+      .map((t) => ({
+        kind: "tax" as const,
+        zoho_id: String(t.tax_id ?? ""),
+        name: String(t.tax_name ?? ""),
+        extra: {
+          percentage: t.tax_percentage ?? null,
+          tax_type: t.tax_type ?? null,
+        },
+      }))
+      .filter((r) => r.zoho_id && r.name);
+  }
+
+  if (kind === "bank_account") {
+    const banks = await fetchAllPages(
+      accessToken,
+      "bankaccounts",
+      "bankaccounts",
+    );
+    return banks
+      .map((b) => ({
+        kind: "bank_account" as const,
+        zoho_id: String(b.account_id ?? ""),
+        name: String(b.account_name ?? ""),
+        extra: {
+          account_type: b.account_type ?? null,
+          currency_code: b.currency_code ?? null,
+          is_active: b.is_active ?? null,
+        },
+      }))
+      .filter((r) => r.zoho_id && r.name);
+  }
+
+  if (kind === "payment_term") {
+    const terms = await fetchAllPages(
+      accessToken,
+      "settings/paymentterms",
+      "payment_terms",
+    );
+    return terms
+      .map((t) => ({
+        kind: "payment_term" as const,
+        zoho_id: String(t.payment_terms_id ?? ""),
+        name: String(
+          t.payment_terms_label ??
+            (t.payment_terms != null ? `Net ${t.payment_terms}` : ""),
+        ),
+        extra: {
+          days: t.payment_terms ?? null,
+        },
+      }))
+      .filter((r) => r.zoho_id && r.name);
+  }
+
+  if (kind === "item") {
+    const items = await fetchAllPages(accessToken, "items", "items");
+    return items
+      .map((i) => ({
+        kind: "item" as const,
+        zoho_id: String(i.item_id ?? ""),
+        name: String(i.name ?? ""),
+        extra: {
+          rate: i.rate ?? null,
+          status: i.status ?? null,
+          product_type: i.product_type ?? null,
+        },
+      }))
+      .filter((r) => r.zoho_id && r.name);
+  }
+
+  if (kind === "user") {
+    const users = await fetchAllPages(accessToken, "users", "users");
+    return users
+      .map((u) => ({
+        kind: "user" as const,
+        zoho_id: String(u.user_id ?? ""),
+        name: String(u.name ?? ""),
+        extra: {
+          email: u.email ?? null,
+          role: u.user_role ?? u.role_id ?? null,
+          status: u.status ?? null,
         },
       }))
       .filter((r) => r.zoho_id && r.name);

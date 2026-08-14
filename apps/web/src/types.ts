@@ -36,7 +36,12 @@ export interface ZohoEntityRow {
     | "customer"
     | "reporting_tag"
     | "currency"
-    | "project";
+    | "project"
+    | "tax"
+    | "bank_account"
+    | "payment_term"
+    | "item"
+    | "user";
   zoho_id: string;
   name: string;
   extra: Record<string, unknown> | null;

@@ -68,6 +68,73 @@ const ZOHO_KINDS: KindSection[] = [
     emptyHint:
       "None defined in Zoho Books yet (Settings → Reporting Tags), or not synced.",
   },
+  {
+    key: "tax",
+    label: "Taxes",
+    detail: (r) => {
+      const extra = r.extra as {
+        percentage?: unknown;
+        tax_type?: unknown;
+      } | null;
+      return [
+        extra?.percentage != null ? `${extra.percentage}%` : null,
+        extra?.tax_type,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+    },
+    emptyHint:
+      "No tax rates defined in Zoho Books yet (Settings → Taxes), or not synced.",
+  },
+  {
+    key: "bank_account",
+    label: "Bank accounts",
+    detail: (r) => {
+      const extra = r.extra as {
+        account_type?: unknown;
+        currency_code?: unknown;
+      } | null;
+      return [extra?.account_type, extra?.currency_code]
+        .filter(Boolean)
+        .join(" · ");
+    },
+    emptyHint: "No bank or cash accounts cached yet — run a sync.",
+  },
+  {
+    key: "payment_term",
+    label: "Payment terms",
+    detail: (r) => {
+      // Zoho encodes "due end of month"-style terms as negative day codes;
+      // the term name already says it, so only show real day counts.
+      const days = Number((r.extra as { days?: unknown } | null)?.days);
+      return Number.isFinite(days) && days >= 0 ? `${days} day(s)` : "";
+    },
+    emptyHint: "No payment terms cached yet — run a sync.",
+  },
+  {
+    key: "item",
+    label: "Items",
+    detail: (r) => {
+      const extra = r.extra as {
+        rate?: unknown;
+        product_type?: unknown;
+      } | null;
+      return [extra?.product_type, extra?.rate != null ? String(extra.rate) : null]
+        .filter(Boolean)
+        .join(" · ");
+    },
+    emptyHint:
+      "No items defined in Zoho Books yet (Items), or not synced.",
+  },
+  {
+    key: "user",
+    label: "Users",
+    detail: (r) => {
+      const extra = r.extra as { email?: unknown; role?: unknown } | null;
+      return [extra?.email, extra?.role].filter(Boolean).join(" · ");
+    },
+    emptyHint: "No users cached yet — run a sync.",
+  },
 ];
 
 function formatSynced(iso: string | null): string {
@@ -94,6 +161,11 @@ export function ConnectionsPage() {
     ...zoho.reportingTags,
     ...zoho.currencies,
     ...zoho.projects,
+    ...zoho.taxes,
+    ...zoho.bankAccounts,
+    ...zoho.paymentTerms,
+    ...zoho.items,
+    ...zoho.users,
   ];
 
   const byKind = (kind: ZohoEntityRow["kind"]): ZohoEntityRow[] =>

@@ -4,10 +4,11 @@ import { supabase } from "../lib/supabase";
 import type { ZohoEntityRow } from "../types";
 
 /**
- * Cached Zoho Books entities (chart of accounts, vendors, customers,
- * reporting tags, currencies, projects) from the zoho_entities table, plus a
- * sync() that refreshes them via the zoho-pull edge function (needs functions
- * serve running with Zoho credentials).
+ * Cached Zoho Books masters (chart of accounts, vendors, customers,
+ * reporting tags, currencies, projects, taxes, bank accounts, payment terms,
+ * items, users) from the zoho_entities table, plus a sync() that refreshes
+ * them via the zoho-pull edge function (needs functions serve running with
+ * Zoho credentials).
  */
 export function useZohoEntities() {
   const [rows, setRows] = useState<ZohoEntityRow[]>([]);
@@ -58,6 +59,11 @@ export function useZohoEntities() {
     reportingTags: rows.filter((r) => r.kind === "reporting_tag"),
     currencies: rows.filter((r) => r.kind === "currency"),
     projects: rows.filter((r) => r.kind === "project"),
+    taxes: rows.filter((r) => r.kind === "tax"),
+    bankAccounts: rows.filter((r) => r.kind === "bank_account"),
+    paymentTerms: rows.filter((r) => r.kind === "payment_term"),
+    items: rows.filter((r) => r.kind === "item"),
+    users: rows.filter((r) => r.kind === "user"),
     loading,
     syncing,
     error,
