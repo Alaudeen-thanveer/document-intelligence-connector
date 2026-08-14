@@ -1,14 +1,30 @@
-// Pull Zoho Books entities (chart of accounts, vendors, customers) into the
-// local zoho_entities cache so the review UI can offer posting dropdowns.
+// Pull Zoho Books entities (chart of accounts, vendors, customers, reporting
+// tags, currencies, projects) into the local zoho_entities cache so the
+// review UI can offer posting dropdowns.
 // Read-only against Zoho; replaces cached rows per kind on each sync.
 // Credentials come only from environment variables — never hardcoded.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 
-type EntityKind = "account" | "vendor" | "customer";
+type EntityKind =
+  | "account"
+  | "vendor"
+  | "customer"
+  | "reporting_tag"
+  | "currency"
+  | "project";
+
+const ALL_KINDS: EntityKind[] = [
+  "account",
+  "vendor",
+  "customer",
+  "reporting_tag",
+  "currency",
+  "project",
+];
 
 interface PullInput {
-  /** Which kinds to refresh; defaults to all three. */
+  /** Which kinds to refresh; defaults to all. */
   kinds?: EntityKind[];
 }
 
@@ -158,6 +174,68 @@ async function fetchKind(
       .filter((r) => r.zoho_id && r.name);
   }
 
+  if (kind === "reporting_tag") {
+    // Note: the older `settings/tags` endpoint is retired (400 "no longer
+    // available", verified on the .in DC); `reportingtags` returns { tags: [] }.
+    const tags = await fetchAllPages(accessToken, "reportingtags", "tags");
+    return tags
+      .map((t) => ({
+        kind: "reporting_tag" as const,
+        zoho_id: String(t.tag_id ?? ""),
+        name: String(t.tag_name ?? ""),
+        extra: {
+          is_active: t.is_active ?? null,
+          // Tag options are what a bill/invoice line actually gets tagged with.
+          options: Array.isArray(t.tag_options)
+            ? (t.tag_options as Array<Record<string, unknown>>).map((o) => ({
+                id: o.tag_option_id != null ? String(o.tag_option_id) : null,
+                name: o.tag_option_name != null
+                  ? String(o.tag_option_name)
+                  : null,
+              }))
+            : [],
+        },
+      }))
+      .filter((r) => r.zoho_id && r.name);
+  }
+
+  if (kind === "currency") {
+    const currencies = await fetchAllPages(
+      accessToken,
+      "settings/currencies",
+      "currencies",
+    );
+    return currencies
+      .map((c) => ({
+        kind: "currency" as const,
+        zoho_id: String(c.currency_id ?? ""),
+        name: String(c.currency_code ?? c.currency_name ?? ""),
+        extra: {
+          currency_name: c.currency_name ?? null,
+          symbol: c.currency_symbol ?? null,
+          is_base_currency: c.is_base_currency ?? null,
+          exchange_rate: c.exchange_rate ?? null,
+        },
+      }))
+      .filter((r) => r.zoho_id && r.name);
+  }
+
+  if (kind === "project") {
+    const projects = await fetchAllPages(accessToken, "projects", "projects");
+    return projects
+      .map((p) => ({
+        kind: "project" as const,
+        zoho_id: String(p.project_id ?? ""),
+        name: String(p.project_name ?? ""),
+        extra: {
+          customer_id: p.customer_id != null ? String(p.customer_id) : null,
+          customer_name: p.customer_name ?? null,
+          status: p.status ?? null,
+        },
+      }))
+      .filter((r) => r.zoho_id && r.name);
+  }
+
   const contacts = await fetchAllPages(
     accessToken,
     "contacts",
@@ -195,9 +273,7 @@ Deno.serve(async (req) => {
   }
 
   const kinds: EntityKind[] =
-    input.kinds && input.kinds.length > 0
-      ? input.kinds
-      : ["account", "vendor", "customer"];
+    input.kinds && input.kinds.length > 0 ? input.kinds : ALL_KINDS;
 
   try {
     const supabase = getSupabase();

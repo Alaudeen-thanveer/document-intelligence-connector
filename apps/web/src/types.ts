@@ -30,7 +30,13 @@ export interface JudgmentResultRow {
 
 export interface ZohoEntityRow {
   id: string;
-  kind: "account" | "vendor" | "customer";
+  kind:
+    | "account"
+    | "vendor"
+    | "customer"
+    | "reporting_tag"
+    | "currency"
+    | "project";
   zoho_id: string;
   name: string;
   extra: Record<string, unknown> | null;
