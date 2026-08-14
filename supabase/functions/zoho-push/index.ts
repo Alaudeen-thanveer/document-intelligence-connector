@@ -57,6 +57,32 @@ function getSupabase(): SupabaseClient {
   });
 }
 
+interface VendorAccountRule {
+  account_zoho_id: string;
+  account_name: string;
+}
+
+/**
+ * Per-vendor default account rule ("if vendor is X, post to account Y").
+ * Returns null when no rule exists — there is deliberately no global
+ * default account.
+ */
+async function lookupVendorDefaultAccount(
+  supabase: SupabaseClient,
+  vendorZohoId: string,
+): Promise<VendorAccountRule | null> {
+  const { data, error } = await supabase
+    .from("vendor_account_rules")
+    .select("account_zoho_id, account_name")
+    .eq("vendor_zoho_id", vendorZohoId)
+    .maybeSingle();
+  if (error) {
+    console.log(`vendor_account_rules lookup failed: ${error.message}`);
+    return null;
+  }
+  return (data as VendorAccountRule | null) ?? null;
+}
+
 function parseJsonEnv<T>(name: string): T | null {
   const raw = Deno.env.get(name)?.trim();
   if (!raw) return null;
@@ -659,15 +685,24 @@ Deno.serve(async (req) => {
           ],
         };
       } else {
-        const expenseAccountId = input.account_id?.trim() ||
-          Deno.env.get("ZOHO_DEFAULT_ACCOUNT_ID")?.trim();
+        // Account: explicit UI choice, else this vendor's default rule.
+        // No global default account.
+        let expenseAccountId = input.account_id?.trim() || null;
+        if (!expenseAccountId && input.vendor_id?.trim()) {
+          const rule = await lookupVendorDefaultAccount(
+            supabase,
+            input.vendor_id.trim(),
+          );
+          if (rule) expenseAccountId = rule.account_zoho_id;
+        }
         if (!expenseAccountId) {
           return jsonResponse(
             {
               ok: false,
               skipped: true,
               reason: "account_required",
-              error: "Select the expense account to post this expense to.",
+              error:
+                "Select the expense account, or save a default account rule for this vendor.",
               document_id: input.document_id,
             },
             400,
@@ -807,17 +842,17 @@ Deno.serve(async (req) => {
       parseJsonEnv<ZohoAccount[]>("ZOHO_ACCOUNTS_JSON") ??
       [];
 
-    const expenseCategory = input.expense_category ??
-      Deno.env.get("ZOHO_EXPENSE_CATEGORY")?.trim() ??
-      null;
+    // Account defaults come from per-vendor rules (vendor_account_rules) or
+    // the caller's explicit choice — never from a global env default.
+    // input.expense_category stays supported as a per-request matching hint.
+    const expenseCategory = input.expense_category ?? null;
     const defaultVendorId = Deno.env.get("ZOHO_DEFAULT_VENDOR_ID")?.trim();
-    const defaultAccountId = Deno.env.get("ZOHO_DEFAULT_ACCOUNT_ID")?.trim();
     const autoCreateVendor =
       (Deno.env.get("ZOHO_AUTO_CREATE_VENDOR")?.trim() || "true")
         .toLowerCase() !== "false";
 
-    // Fast path: with DEFAULT_ACCOUNT_ID we can skip chart-of-accounts fetch.
-    const needAccounts = accounts.length === 0 && !defaultAccountId;
+    // Fast path: with an explicit account we can skip chart-of-accounts fetch.
+    const needAccounts = accounts.length === 0 && !input.account_id?.trim();
     const needVendors = vendors.length === 0 && !defaultVendorId &&
       !autoCreateVendor;
 
@@ -858,7 +893,7 @@ Deno.serve(async (req) => {
             skipped: true,
             reason: "missing_entity_cache",
             error:
-              "Could not load Zoho vendors/accounts. Set ZOHO_DEFAULT_ACCOUNT_ID / fix OAuth, or provide ZOHO_VENDORS_JSON / ZOHO_ACCOUNTS_JSON.",
+              "Could not load Zoho vendors/accounts. Fix OAuth, pick an account in the review UI, or provide ZOHO_VENDORS_JSON / ZOHO_ACCOUNTS_JSON.",
             detail: tokenProbe.raw,
             retried,
             document_id: input.document_id,
@@ -908,28 +943,6 @@ Deno.serve(async (req) => {
         account_match: {
           account_id: chosenAccount,
           account_name: "selected",
-          confidence: 1,
-        },
-      };
-      matched.unresolved = matched.unresolved_fields.length > 0;
-    }
-
-    // Prefer configured default expense account when classification is missing.
-    if (defaultAccountId && !input.account_id?.trim()) {
-      matched = {
-        ...matched,
-        unresolved_fields: matched.unresolved_fields.filter((f) =>
-          f !== "account"
-        ),
-        bill: {
-          ...matched.bill,
-          line_items: matched.bill.line_items.map((item, i) =>
-            i === 0 ? { ...item, account_id: defaultAccountId } : item
-          ),
-        },
-        account_match: {
-          account_id: defaultAccountId,
-          account_name: expenseCategory ?? "default",
           confidence: 1,
         },
       };
@@ -991,6 +1004,36 @@ Deno.serve(async (req) => {
       matched.unresolved = matched.unresolved_fields.length > 0;
     }
 
+    // Per-vendor default account rule. Overrides the generic category match
+    // (priority: explicit UI choice > vendor rule > category match) but never
+    // an account the caller chose for this transaction.
+    if (!input.account_id?.trim() && matched.bill.vendor_id) {
+      const rule = await lookupVendorDefaultAccount(
+        supabase,
+        matched.bill.vendor_id,
+      );
+      if (rule) {
+        matched = {
+          ...matched,
+          unresolved_fields: matched.unresolved_fields.filter((f) =>
+            f !== "account"
+          ),
+          bill: {
+            ...matched.bill,
+            line_items: matched.bill.line_items.map((item, i) =>
+              i === 0 ? { ...item, account_id: rule.account_zoho_id } : item
+            ),
+          },
+          account_match: {
+            account_id: rule.account_zoho_id,
+            account_name: rule.account_name,
+            confidence: 1,
+          },
+        };
+        matched.unresolved = matched.unresolved_fields.length > 0;
+      }
+    }
+
     if (matched.unresolved) {
       await supabase
         .from("documents")
@@ -1005,7 +1048,7 @@ Deno.serve(async (req) => {
           unresolved_fields: matched.unresolved_fields,
           document_id: input.document_id,
           hint:
-            "Set ZOHO_EXPENSE_CATEGORY / ZOHO_DEFAULT_ACCOUNT_ID for sandbox, or correct vendor to match a Zoho vendor.",
+            "Pick the account in the review UI, or save a default account rule for this vendor. Correct the vendor name if it should match a Zoho vendor.",
         },
         409,
       );

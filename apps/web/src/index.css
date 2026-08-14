@@ -471,6 +471,26 @@ a {
   accent-color: var(--accent);
 }
 
+.rule-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  font-size: 0.8rem;
+}
+
+.rule-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.btn.btn-small {
+  padding: 6px 10px;
+  font-size: 0.78rem;
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;
