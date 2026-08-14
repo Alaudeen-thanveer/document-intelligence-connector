@@ -117,10 +117,48 @@ async function refreshAccessToken(): Promise<string> {
   return String(payload.access_token);
 }
 
+/** Best-effort write-through of the token cache (service-role only table). */
+async function cacheAccessToken(token: string): Promise<void> {
+  try {
+    const supabase = getSupabase();
+    await supabase.from("zoho_oauth_tokens").upsert({
+      id: 1,
+      access_token: token,
+      expires_at: new Date(Date.now() + 55 * 60_000).toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.warn(
+      "zoho_oauth_tokens cache write failed:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
 async function getAccessToken(): Promise<string> {
   const existing = Deno.env.get("ZOHO_ACCESS_TOKEN")?.trim();
   if (existing) return existing;
-  return await refreshAccessToken();
+  // Cached token when still valid — Zoho throttles the refresh endpoint
+  // hard, and a refresh per function call locks the connection out.
+  try {
+    const supabase = getSupabase();
+    const { data } = await supabase
+      .from("zoho_oauth_tokens")
+      .select("access_token, expires_at")
+      .eq("id", 1)
+      .maybeSingle();
+    if (
+      data?.access_token &&
+      new Date(String(data.expires_at)).getTime() > Date.now() + 120_000
+    ) {
+      return String(data.access_token);
+    }
+  } catch {
+    // Cache is an optimization only.
+  }
+  const token = await refreshAccessToken();
+  await cacheAccessToken(token);
+  return token;
 }
 
 /** Fetch every page of a Zoho list endpoint (per_page=200). */
@@ -396,6 +434,7 @@ Deno.serve(async (req) => {
         if (/\((401|403|5\d\d)\)/.test(msg)) {
           console.log(`zoho-pull ${kind} failed (${msg}); retrying once`);
           accessToken = await refreshAccessToken();
+          await cacheAccessToken(accessToken);
           rows = await fetchKind(accessToken, kind);
         } else {
           throw err;

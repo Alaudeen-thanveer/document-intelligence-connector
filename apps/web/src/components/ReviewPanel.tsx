@@ -255,6 +255,16 @@ export function ReviewPanel({
     return t.includes("bank") || t.includes("cash") || t === "credit_card";
   });
 
+  // When every line item carries its own account, the transaction-level
+  // account selector is moot for bills/invoices (expenses post as a single
+  // amount and still need one): show "as per line items" instead.
+  const allLinesHaveAccounts = postAs !== "expense" &&
+    lineItems.length > 0 &&
+    lineItems.every((li) => li.accountId);
+  const someLinesHaveAccounts = postAs !== "expense" &&
+    !allLinesHaveAccounts &&
+    lineItems.some((li) => li.accountId);
+
   // The selected party's treatment from the cache — shown as the default
   // option. Treatment is transactional: a VAT-registered party can still
   // have e.g. an out-of-scope document, hence the per-document dropdown.
@@ -544,7 +554,9 @@ export function ReviewPanel({
         post_as: postAs,
         vendor_id: vendorId || undefined,
         customer_id: customerId || undefined,
-        account_id: accountId || undefined,
+        // With per-line accounts on every line, no transaction-level
+        // account is sent — each line already says where it posts.
+        account_id: allLinesHaveAccounts ? undefined : accountId || undefined,
         paid_through_account_id: paidThroughId || undefined,
         tax_treatment: taxTreatment || undefined,
       });
@@ -1001,24 +1013,32 @@ export function ReviewPanel({
           )}
           <label>
             {postAs === "invoice" ? "Income account" : "Expense account"}
-            <select
-              value={accountId}
-              onChange={(e) => {
-                setAccountId(e.target.value);
-                setAccountTouched(true);
-              }}
-            >
-              <option value="">
-                {postAs === "expense"
-                  ? "— select account —"
-                  : "— vendor rule / review —"}
-              </option>
-              {accountOptions.map((a) => (
-                <option key={a.zoho_id} value={a.zoho_id}>
-                  {a.name}
+            {allLinesHaveAccounts ? (
+              <select value="" disabled>
+                <option value="">as per line items</option>
+              </select>
+            ) : (
+              <select
+                value={accountId}
+                onChange={(e) => {
+                  setAccountId(e.target.value);
+                  setAccountTouched(true);
+                }}
+              >
+                <option value="">
+                  {postAs === "expense"
+                    ? "— select account —"
+                    : someLinesHaveAccounts
+                      ? "— fills lines without their own account —"
+                      : "— vendor rule / review —"}
                 </option>
-              ))}
-            </select>
+                {accountOptions.map((a) => (
+                  <option key={a.zoho_id} value={a.zoho_id}>
+                    {a.name}
+                  </option>
+                ))}
+              </select>
+            )}
           </label>
           {postAs === "expense" && (
             <label>

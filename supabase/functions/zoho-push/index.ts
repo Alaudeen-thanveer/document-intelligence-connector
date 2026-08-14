@@ -215,6 +215,28 @@ function toZohoBillBody(
   };
 }
 
+/** Find an existing bill by number + vendor (for idempotent creates). */
+async function findBillByNumber(
+  accessToken: string,
+  billNumber: string,
+  vendorId: string,
+): Promise<ZohoCallResult> {
+  const url = `${apiBase()}/bills?organization_id=${
+    encodeURIComponent(orgId())
+  }&bill_number=${encodeURIComponent(billNumber)}&vendor_id=${
+    encodeURIComponent(vendorId)
+  }`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+  });
+  const raw = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, status: res.status, raw };
+  const bill = (raw as { bills?: Array<{ bill_id?: unknown }> })?.bills?.[0];
+  return bill?.bill_id
+    ? { ok: true, status: 200, raw: String(bill.bill_id) }
+    : { ok: false, status: 404, raw: null };
+}
+
 /** Exchange refresh token for a new access token (OAuth2). */
 async function refreshAccessToken(): Promise<string> {
   const clientId = requireEnv("ZOHO_CLIENT_ID");
@@ -242,12 +264,57 @@ async function refreshAccessToken(): Promise<string> {
       `Zoho token refresh failed (${res.status}): ${JSON.stringify(payload)}`,
     );
   }
-  return String(payload.access_token);
+  const token = String(payload.access_token);
+  await cacheAccessToken(token);
+  return token;
+}
+
+/** Best-effort write-through of the token cache (service-role only table). */
+async function cacheAccessToken(token: string): Promise<void> {
+  try {
+    const supabase = getSupabase();
+    await supabase.from("zoho_oauth_tokens").upsert({
+      id: 1,
+      access_token: token,
+      // Zoho tokens last ~1h; refresh a little early.
+      expires_at: new Date(Date.now() + 55 * 60_000).toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.warn(
+      "zoho_oauth_tokens cache write failed:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
+/** Cached token when still valid — Zoho throttles the refresh endpoint
+ * hard, and a refresh per function call locks the connection out. */
+async function readCachedAccessToken(): Promise<string | null> {
+  try {
+    const supabase = getSupabase();
+    const { data } = await supabase
+      .from("zoho_oauth_tokens")
+      .select("access_token, expires_at")
+      .eq("id", 1)
+      .maybeSingle();
+    if (
+      data?.access_token &&
+      new Date(String(data.expires_at)).getTime() > Date.now() + 120_000
+    ) {
+      return String(data.access_token);
+    }
+  } catch {
+    // Cache is an optimization only.
+  }
+  return null;
 }
 
 async function getAccessToken(): Promise<string> {
   const existing = Deno.env.get("ZOHO_ACCESS_TOKEN")?.trim();
   if (existing) return existing;
+  const cached = await readCachedAccessToken();
+  if (cached) return cached;
   return await refreshAccessToken();
 }
 
@@ -473,10 +540,30 @@ async function fetchAccountsFromZoho(
 async function ensureVendorInZoho(
   accessToken: string,
   vendorName: string,
+  opts?: { vatOnDocument?: boolean },
 ): Promise<ZohoVendor> {
+  // Search first — Zoho allows duplicate contact names, so relying on the
+  // create call to reject duplicates silently multiplies vendors.
+  try {
+    const existing = await fetchVendorsFromZoho(accessToken);
+    const hit = existing.find((v) =>
+      v.vendor_name.trim().toLowerCase() === vendorName.trim().toLowerCase()
+    );
+    if (hit) return hit;
+  } catch (err) {
+    console.warn(
+      "vendor pre-search failed; proceeding to create:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+
   const body = {
     contact_name: vendorName,
     contact_type: "vendor",
+    // A vendor that charged VAT on this document must be VAT-registered.
+    // Zoho otherwise defaults to vat_not_registered and then rejects the
+    // bill's VAT lines with code 71538.
+    ...(opts?.vatOnDocument ? { tax_treatment: "vat_registered" } : {}),
   };
   const url =
     `${apiBase()}/contacts?organization_id=${encodeURIComponent(orgId())}`;
@@ -1118,7 +1205,9 @@ Deno.serve(async (req) => {
       const { result, accessToken: tok, retried: vendorRetried } =
         await withZohoRetry(async (t) => {
           try {
-            const created = await ensureVendorInZoho(t, mapped.vendor_name!);
+            const created = await ensureVendorInZoho(t, mapped.vendor_name!, {
+              vatOnDocument: (mapped.tax_amount ?? 0) > 0,
+            });
             vendors = [...vendors, created];
             return { ok: true, status: 200, raw: created };
           } catch (e) {
@@ -1280,39 +1369,90 @@ Deno.serve(async (req) => {
     } = await withZohoRetry((tok) => createZohoBill(tok, billBody));
     accessToken = tokenAfterCreate;
 
-    if (!createResult.ok || !("externalDocId" in createResult) ||
-      !createResult.externalDocId) {
-      throw new Error(
-        `Zoho bill create failed (${createResult.status}): ${
-          JSON.stringify(createResult.raw)
-        }`,
+    let externalDocId: string;
+    let recoveredExisting = false;
+    if (
+      createResult.ok && "externalDocId" in createResult &&
+      createResult.externalDocId
+    ) {
+      externalDocId = createResult.externalDocId;
+    } else {
+      // Zoho commits bills even when our call sees a transient failure, so
+      // the single retry can hit "duplicate bill number" (code 13011) for a
+      // bill that actually exists. Recover it instead of failing — creates
+      // stay idempotent per vendor + bill_number.
+      const rawStr = JSON.stringify(createResult.raw ?? {});
+      let recovered: string | null = null;
+      if (rawStr.includes("13011")) {
+        const { result: lookup } = await withZohoRetry((tok) =>
+          findBillByNumber(
+            tok,
+            String((billBody as { bill_number: string }).bill_number),
+            String(matched.bill.vendor_id),
+          )
+        );
+        if (lookup.ok && typeof lookup.raw === "string") {
+          recovered = lookup.raw;
+        }
+      }
+      if (!recovered) {
+        throw new Error(
+          `Zoho bill create failed (${createResult.status}): ${
+            JSON.stringify(createResult.raw)
+          }`,
+        );
+      }
+      console.log(
+        `Bill number already existed in Zoho; recovered bill ${recovered}`,
       );
+      externalDocId = recovered;
+      recoveredExisting = true;
     }
 
-    const externalDocId = createResult.externalDocId;
     const file = await loadDocumentBytes(supabase, doc.file_url as string);
 
-    const {
-      result: attachResult,
-      accessToken: tokenAfterAttach,
-      retried: attachRetried,
-    } = await withZohoRetry((tok) =>
-      attachBillDocument(
-        tok,
-        externalDocId,
-        file.bytes,
-        file.contentType,
-        file.filename,
-      )
-    );
-    accessToken = tokenAfterAttach;
-
-    if (!attachResult.ok) {
-      throw new Error(
-        `Zoho bill ${externalDocId} created but attachment failed (${attachResult.status}): ${
-          JSON.stringify(attachResult.raw)
-        }`,
+    // On recovery the attachment may already be on the bill — don't duplicate.
+    let skipAttach = false;
+    if (recoveredExisting) {
+      const { result: preGet } = await withZohoRetry((tok) =>
+        getZohoBill(tok, externalDocId)
       );
+      if (preGet.ok && attachmentPresent(preGet.raw).present) {
+        skipAttach = true;
+      }
+    }
+
+    let attachResult: ZohoCallResult = {
+      ok: true,
+      status: 200,
+      raw: { skipped: "attachment already present on recovered bill" },
+    };
+    let attachRetried = false;
+    if (!skipAttach) {
+      const {
+        result,
+        accessToken: tokenAfterAttach,
+        retried,
+      } = await withZohoRetry((tok) =>
+        attachBillDocument(
+          tok,
+          externalDocId,
+          file.bytes,
+          file.contentType,
+          file.filename,
+        )
+      );
+      accessToken = tokenAfterAttach;
+      attachResult = result;
+      attachRetried = retried;
+
+      if (!attachResult.ok) {
+        throw new Error(
+          `Zoho bill ${externalDocId} created but attachment failed (${attachResult.status}): ${
+            JSON.stringify(attachResult.raw)
+          }`,
+        );
+      }
     }
 
     const { result: getResult } = await withZohoRetry((tok) =>
