@@ -18,7 +18,24 @@ export default function App() {
   const [tick, setTick] = useState(0);
   const [rulesOpen, setRulesOpen] = useState(false);
   const [rulesVersion, setRulesVersion] = useState(0);
-  const [view, setView] = useState<"documents" | "connections">("documents");
+  // Hash-routed page: #connections is its own page; anything else = documents.
+  const [view, setView] = useState<"documents" | "connections">(() =>
+    window.location.hash === "#connections" ? "connections" : "documents",
+  );
+
+  useEffect(() => {
+    function onHashChange() {
+      setView(
+        window.location.hash === "#connections" ? "connections" : "documents",
+      );
+    }
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  function navigate(next: "documents" | "connections") {
+    window.location.hash = next === "connections" ? "#connections" : "#";
+  }
 
   const selected = useMemo(
     () => documents.find((d) => d.id === selectedId) ?? null,
@@ -73,14 +90,14 @@ export default function App() {
             <button
               type="button"
               className={`tab-btn${view === "documents" ? " active" : ""}`}
-              onClick={() => setView("documents")}
+              onClick={() => navigate("documents")}
             >
               Documents
             </button>
             <button
               type="button"
               className={`tab-btn${view === "connections" ? " active" : ""}`}
-              onClick={() => setView("connections")}
+              onClick={() => navigate("connections")}
             >
               Connections
             </button>
@@ -109,9 +126,10 @@ export default function App() {
         onChanged={() => setRulesVersion((n) => n + 1)}
       />
 
-      {view === "connections" && <ConnectionsPage />}
-
-      <main className="layout" hidden={view !== "documents"}>
+      {view === "connections" ? (
+        <ConnectionsPage />
+      ) : (
+      <main className="layout">
         <section className="list-pane">
           <div className="pane-heading">
             <h2>Documents</h2>
@@ -172,6 +190,7 @@ export default function App() {
           }}
         />
       </main>
+      )}
     </div>
   );
 }
