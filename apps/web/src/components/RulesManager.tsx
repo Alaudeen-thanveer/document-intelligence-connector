@@ -3,6 +3,7 @@ import { useZohoEntities } from "../hooks/useZohoEntities";
 import { isIncomeAccount, isPostingAccount } from "../lib/zoho";
 import { supabase } from "../lib/supabase";
 import type { EntityAccountRuleRow, ZohoEntityRow } from "../types";
+import { SuggestedChecks } from "./SuggestedChecks";
 import { SuggestedRules } from "./SuggestedRules";
 
 interface Props {
@@ -282,6 +283,8 @@ export function RulesManager({
             onChanged();
           }}
         />
+
+        <SuggestedChecks kind={kind} reviewerName={reviewerName} />
 
         <div className="section">
           <h3>Add rule</h3>

@@ -15,6 +15,7 @@ import {
   type HistoryDoc,
   isProposable,
 } from "./analyze.ts";
+import { classifyRhythm, proposeChecks } from "./recurrence.ts";
 
 interface LearnInput {
   company_id?: string;
@@ -324,6 +325,65 @@ Deno.serve(async (req) => {
       if (!error) written++;
     }
 
+    // Layer 2: recurrence per party → bk_rhythms + proposed checks.
+    // Checks are proposals: the judgment engine never reads them until a
+    // human sets status = 'enabled'. Recompute preserves human decisions.
+    const byParty = new Map<string, HistoryDoc[]>();
+    for (const d of docs) {
+      const kind = d.doc_kind === "bill" ? "vendor" : "customer";
+      const key = `${kind}:${d.party_zoho_id}`;
+      const list = byParty.get(key) ?? [];
+      list.push(d);
+      byParty.set(key, list);
+    }
+    let rhythmsWritten = 0;
+    let checksProposed = 0;
+    const cadenceSummary: Record<string, number> = {};
+    for (const [key, list] of byParty) {
+      const party_kind = key.startsWith("vendor:") ? "vendor" : "customer";
+      const rhythm = classifyRhythm(
+        list.map((d) => ({ date: d.date, total: d.total })),
+      );
+      cadenceSummary[rhythm.cadence] = (cadenceSummary[rhythm.cadence] ?? 0) + 1;
+      const partyName = list[0].party_name;
+      const { error: rErr } = await supabase.from("bk_rhythms").upsert({
+        company_id: companyId,
+        party_kind,
+        party_zoho_id: list[0].party_zoho_id,
+        party_name: partyName,
+        ...rhythm,
+        computed_at: new Date().toISOString(),
+      }, { onConflict: "company_id,party_kind,party_zoho_id" });
+      if (!rErr) rhythmsWritten++;
+
+      for (const c of proposeChecks(rhythm)) {
+        const { data: existing } = await supabase
+          .from("bk_check_proposals")
+          .select("status")
+          .eq("company_id", companyId)
+          .eq("party_kind", party_kind)
+          .eq("party_zoho_id", list[0].party_zoho_id)
+          .eq("check_kind", c.check_kind)
+          .maybeSingle();
+        const keep = existing?.status && existing.status !== "proposed"
+          ? existing.status
+          : "proposed";
+        const { error: cErr } = await supabase.from("bk_check_proposals")
+          .upsert({
+            company_id: companyId,
+            party_kind,
+            party_zoho_id: list[0].party_zoho_id,
+            party_name: partyName,
+            check_kind: c.check_kind,
+            rationale: c.rationale,
+            params: c.params,
+            status: keep,
+            computed_at: new Date().toISOString(),
+          }, { onConflict: "company_id,party_kind,party_zoho_id,check_kind" });
+        if (!cErr) checksProposed++;
+      }
+    }
+
     if (runId) {
       await supabase.from("bk_learn_runs").update({
         status: "completed",
@@ -344,6 +404,9 @@ Deno.serve(async (req) => {
       documents_analyzed: docs.length,
       profiles_written: written,
       proposable: profiles.filter(isProposable).length,
+      rhythms_written: rhythmsWritten,
+      cadences: cadenceSummary,
+      checks_proposed: checksProposed,
       profiles: profiles.map((p) => ({
         party_kind: p.party_kind,
         party_name: p.party_name,

@@ -676,6 +676,16 @@ a {
   font-size: 0.85rem;
 }
 
+.suggested-check-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 0 4px 12px;
+  border-left: 2px solid var(--line);
+  font-size: 0.9rem;
+}
+
 .suggested-evidence table { border-collapse: collapse; }
 .suggested-evidence td { padding: 2px 14px 2px 0; }
 .suggested-evidence td.num {
