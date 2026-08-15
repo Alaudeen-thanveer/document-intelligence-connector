@@ -1,6 +1,6 @@
 # Bookkeeping Patterns — Onboarding Knowledge Base
 
-**Status:** Proposed — not yet built. Companion to [`BUILD_PLAN.md`](./BUILD_PLAN.md) and [`rules-registry.md`](./rules-registry.md).
+**Status:** Layers 1–3 built (party→account profiles, recurrence, attachment conventions) as propose-only — see `supabase/functions/bookkeeping-learn/` and `scripts/bk-layer*-accuracy.mjs`. Enabled checks are **not yet wired into the judgment engine**; that is the next deliberate step. Layers 4–6 (items, journals, timing) remain proposed. Companion to [`BUILD_PLAN.md`](./BUILD_PLAN.md) and [`rules-registry.md`](./rules-registry.md).
 
 ## 1. What this is
 
