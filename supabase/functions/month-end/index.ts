@@ -8,12 +8,31 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import {
   type EnabledExpectedMissing,
+  type EnabledJournalPattern,
+  type EnabledLaterThanUsual,
   expectedBillNudges,
+  journalPatternNudges,
+  laterThanUsualNudges,
+  type OpenDoc,
   type PostedJournal,
+  type PostedJournalWithFingerprint,
   type RecurringJournalDef,
   recurringJournalNudges,
   type SeenBill,
 } from "./nudges.ts";
+
+/** Same fingerprint as bookkeeping-learn/journal_patterns.ts. */
+function fingerprintLines(
+  lines: Array<{ account_id: string; debit: number; credit: number }>,
+): string {
+  const parts = new Set<string>();
+  for (const l of lines) {
+    if (!l.account_id) continue;
+    if (l.debit > 0) parts.add(`${l.account_id}:D`);
+    if (l.credit > 0) parts.add(`${l.account_id}:C`);
+  }
+  return [...parts].sort().join("+");
+}
 
 const DEFAULT_COMPANY = "00000000-0000-4000-8000-000000000001";
 const CORS_HEADERS: Record<string, string> = {
@@ -127,9 +146,11 @@ Deno.serve(async (req) => {
       last_journal_date: r.last_journal_date ? String(r.last_journal_date).slice(0, 10) : null,
     })).filter((d) => d.recurring_journal_id);
 
+    // Zoho's journals list ignores journal_date_start/end but honours
+    // date_start/end (verified on the .ae DC).
     const jRaw = await zohoGet(token, "journals", {
-      journal_date_start: start,
-      journal_date_end: end,
+      date_start: start,
+      date_end: end,
       per_page: "200",
     });
     const posted: PostedJournal[] = ((jRaw.journals ?? []) as Array<Record<string, unknown>>)
@@ -188,9 +209,86 @@ Deno.serve(async (req) => {
       }
     }
 
+    // --- Layer 5: ENABLED undeclared recurring journals, matched by
+    // fingerprint against journals posted this month (detail fetch needed
+    // for line items; only for the month's journals, so cheap).
+    const { data: jpRows } = await supabase
+      .from("bk_journal_patterns")
+      .select("fingerprint, label, cadence, amount_median, expected_day_min, expected_day_max")
+      .eq("company_id", companyId)
+      .eq("status", "enabled");
+    const enabledPatterns = (jpRows ?? []) as EnabledJournalPattern[];
+    let postedWithFp: PostedJournalWithFingerprint[] = [];
+    if (enabledPatterns.length > 0 && posted.length > 0) {
+      for (const p of posted) {
+        try {
+          const det = await zohoGet(token, `journals/${p.journal_id}`);
+          const j = (det.journal ?? det) as Record<string, unknown>;
+          const lines = ((j.line_items as Array<Record<string, unknown>>) ?? []).map((li) => {
+            const side = String(li.debit_or_credit ?? "").toLowerCase();
+            const amt = Number(li.amount ?? 0) || 0;
+            return {
+              account_id: String(li.account_id ?? ""),
+              debit: Number(li.debit_amount ?? 0) || (side === "debit" ? amt : 0),
+              credit: Number(li.credit_amount ?? 0) || (side === "credit" ? amt : 0),
+            };
+          });
+          postedWithFp.push({ ...p, fingerprint: fingerprintLines(lines) });
+        } catch {
+          postedWithFp.push({ ...p, fingerprint: "" });
+        }
+      }
+    }
+
+    // --- Layer 6: ENABLED later-than-usual — open bills/invoices for those
+    // parties, from Zoho (the books are the truth for balances).
+    const { data: ltuRows } = await supabase
+      .from("bk_check_proposals")
+      .select("party_kind, party_zoho_id, party_name, params")
+      .eq("company_id", companyId)
+      .eq("check_kind", "later_than_usual")
+      .eq("status", "enabled");
+    const enabledLtu: EnabledLaterThanUsual[] = (ltuRows ?? [])
+      .map((r) => {
+        const p = (r.params ?? {}) as Record<string, unknown>;
+        return {
+          party_kind: r.party_kind as "vendor" | "customer",
+          party_zoho_id: String(r.party_zoho_id),
+          party_name: String(r.party_name),
+          pay_lag_p90: Number(p.pay_lag_p90),
+          pay_lag_median: p.pay_lag_median != null ? Number(p.pay_lag_median) : null,
+        };
+      })
+      .filter((e) => Number.isFinite(e.pay_lag_p90));
+    const openDocs: OpenDoc[] = [];
+    if (enabledLtu.length > 0) {
+      const wantBills = enabledLtu.some((e) => e.party_kind === "vendor");
+      const wantInvoices = enabledLtu.some((e) => e.party_kind === "customer");
+      if (wantBills) {
+        const b = await zohoGet(token, "bills", { status: "unpaid", per_page: "200" });
+        for (const x of (b.bills ?? []) as Array<Record<string, unknown>>) {
+          openDocs.push({
+            doc_kind: "bill", zoho_id: String(x.bill_id ?? ""), number: x.bill_number != null ? String(x.bill_number) : null,
+            party_zoho_id: String(x.vendor_id ?? ""), date: String(x.date ?? "").slice(0, 10), balance: Number(x.balance ?? 0) || 0,
+          });
+        }
+      }
+      if (wantInvoices) {
+        const i = await zohoGet(token, "invoices", { status: "unpaid", per_page: "200" });
+        for (const x of (i.invoices ?? []) as Array<Record<string, unknown>>) {
+          openDocs.push({
+            doc_kind: "invoice", zoho_id: String(x.invoice_id ?? ""), number: x.invoice_number != null ? String(x.invoice_number) : null,
+            party_zoho_id: String(x.customer_id ?? ""), date: String(x.date ?? "").slice(0, 10), balance: Number(x.balance ?? 0) || 0,
+          });
+        }
+      }
+    }
+
     const nudges = [
       ...recurringJournalNudges(defs, posted, month),
+      ...journalPatternNudges(enabledPatterns, postedWithFp, month),
       ...expectedBillNudges(enabled, seen, month, today),
+      ...laterThanUsualNudges(enabledLtu, openDocs, today),
     ];
     const attention = nudges.filter((n) => n.severity === "attention");
 
@@ -202,6 +300,8 @@ Deno.serve(async (req) => {
         recurring_journal_definitions: defs.length,
         journals_posted_this_month: posted.length,
         expected_bill_checks_enabled: enabled.length,
+        journal_patterns_enabled: enabledPatterns.length,
+        later_than_usual_enabled: enabledLtu.length,
         needs_attention: attention.length,
       },
       nudges,

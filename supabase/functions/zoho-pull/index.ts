@@ -231,25 +231,51 @@ async function fetchKind(
     // Note: the older `settings/tags` endpoint is retired (400 "no longer
     // available", verified on the .in DC); `reportingtags` returns { tags: [] }.
     const tags = await fetchAllPages(accessToken, "reportingtags", "tags");
-    return tags
-      .map((t) => ({
-        kind: "reporting_tag" as const,
-        zoho_id: String(t.tag_id ?? ""),
-        name: String(t.tag_name ?? ""),
+    // The list view carries no options; they live on the detail endpoint.
+    // Options are what a bill/invoice line actually gets tagged with, so
+    // fetch each tag's detail (tags are few — a handful per org).
+    const rows: EntityRow[] = [];
+    for (const t of tags) {
+      const id = String(t.tag_id ?? "");
+      const name = String(t.tag_name ?? "");
+      if (!id || !name) continue;
+      let options: Array<{ id: string | null; name: string | null }> = [];
+      try {
+        const detailUrl = `${apiBase()}/reportingtags/${id}?organization_id=${
+          encodeURIComponent(orgId())
+        }`;
+        const res = await fetch(detailUrl, {
+          headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+        });
+        const raw = await res.json();
+        const tag = (raw as { tag?: Record<string, unknown> })?.tag ?? {};
+        const opts = (tag.tag_options ?? t.tag_options) as
+          | Array<Record<string, unknown>>
+          | undefined;
+        options = Array.isArray(opts)
+          ? opts.map((o) => ({
+            id: o.tag_option_id != null ? String(o.tag_option_id) : null,
+            name: o.tag_option_name != null ? String(o.tag_option_name) : null,
+          }))
+          : [];
+      } catch (err) {
+        console.warn(
+          `reporting tag ${id} detail failed:`,
+          err instanceof Error ? err.message : String(err),
+        );
+      }
+      rows.push({
+        kind: "reporting_tag",
+        zoho_id: id,
+        name,
         extra: {
           is_active: t.is_active ?? null,
-          // Tag options are what a bill/invoice line actually gets tagged with.
-          options: Array.isArray(t.tag_options)
-            ? (t.tag_options as Array<Record<string, unknown>>).map((o) => ({
-                id: o.tag_option_id != null ? String(o.tag_option_id) : null,
-                name: o.tag_option_name != null
-                  ? String(o.tag_option_name)
-                  : null,
-              }))
-            : [],
+          is_draft: t.is_draft ?? null,
+          options,
         },
-      }))
-      .filter((r) => r.zoho_id && r.name);
+      });
+    }
+    return rows;
   }
 
   if (kind === "currency") {

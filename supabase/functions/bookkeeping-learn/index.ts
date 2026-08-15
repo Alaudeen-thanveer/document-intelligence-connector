@@ -23,8 +23,25 @@ import {
   learnPartyTagProfiles,
   parseZohoLineTags,
 } from "./tags_projects.ts";
+import {
+  buildTimingProfiles,
+  isTimingProposable,
+  type PaymentDoc,
+  type TimingDoc,
+} from "./timing.ts";
+import {
+  findJournalPatterns,
+  isJournalPatternProposable,
+  type JournalForPattern,
+} from "./journal_patterns.ts";
 
-type DocKind = "bill" | "invoice" | "expense" | "journal";
+type DocKind =
+  | "bill"
+  | "invoice"
+  | "expense"
+  | "journal"
+  | "vendorpayment"
+  | "customerpayment";
 const KIND_META: Record<
   DocKind,
   { path: string; listKey: string; idKey: string; rootKey: string }
@@ -48,6 +65,18 @@ const KIND_META: Record<
     idKey: "journal_id",
     rootKey: "journal",
   },
+  vendorpayment: {
+    path: "vendorpayments",
+    listKey: "vendorpayments",
+    idKey: "payment_id",
+    rootKey: "vendorpayment",
+  },
+  customerpayment: {
+    path: "customerpayments",
+    listKey: "customerpayments",
+    idKey: "payment_id",
+    rootKey: "payment",
+  },
 };
 
 interface LearnInput {
@@ -58,6 +87,12 @@ interface LearnInput {
   max_docs_per_kind?: number;
   /** Re-analyse from bk_history_raw without touching Zoho. */
   reanalyze_only?: boolean;
+  /**
+   * Re-fetch already-cached bills and invoices so status / balance reflect
+   * payments made since they were first cached. Timing (layer 6) depends
+   * on this; cheap for small orgs, so it defaults ON for full runs.
+   */
+  refresh_documents?: boolean;
 }
 
 const DEFAULT_COMPANY = "00000000-0000-4000-8000-000000000001";
@@ -216,6 +251,7 @@ function toHistoryDoc(
   kind: DocKind,
   raw: Record<string, unknown>,
 ): HistoryDoc | null {
+  if (kind === "vendorpayment" || kind === "customerpayment") return null;
   const doc = (raw[KIND_META[kind].rootKey] ?? raw) as Record<string, unknown>;
 
   // Journals have no party; expenses and bills have a vendor; invoices a customer.
@@ -249,7 +285,14 @@ function toHistoryDoc(
     account_name: li.account_name != null ? String(li.account_name) : null,
     // Journals: signed by debit/credit so both sides are visible.
     amount: kind === "journal"
-      ? (Number(li.debit_amount ?? 0) || 0) - (Number(li.credit_amount ?? 0) || 0)
+      ? ((Number(li.debit_amount ?? 0) ||
+          (String(li.debit_or_credit ?? "").toLowerCase() === "debit"
+            ? Number(li.amount ?? 0) || 0
+            : 0)) -
+        (Number(li.credit_amount ?? 0) ||
+          (String(li.debit_or_credit ?? "").toLowerCase() === "credit"
+            ? Number(li.amount ?? 0) || 0
+            : 0)))
       : Number(li.item_total ?? li.amount ?? 0) || 0,
     tags: parseZohoLineTags(li.tags),
     project_id: li.project_id != null && String(li.project_id) !== ""
@@ -321,6 +364,7 @@ Deno.serve(async (req) => {
     let invoicesFetched = 0;
     let expensesFetched = 0;
     let journalsFetched = 0;
+    let paymentsFetched = 0;
 
     if (!input.reanalyze_only) {
       const token = await getAccessToken(supabase);
@@ -328,7 +372,16 @@ Deno.serve(async (req) => {
       from.setMonth(from.getMonth() - monthsBack);
       const fromDate = from.toISOString().slice(0, 10);
 
-      for (const kind of ["bill", "invoice", "expense", "journal"] as const) {
+      for (
+        const kind of [
+          "bill",
+          "invoice",
+          "expense",
+          "journal",
+          "vendorpayment",
+          "customerpayment",
+        ] as const
+      ) {
         const ids = await listIds(token, kind, fromDate, cap);
         const path = KIND_META[kind].path;
         // Skip ids we already have raw payloads for.
@@ -339,9 +392,14 @@ Deno.serve(async (req) => {
           .eq("doc_kind", kind)
           .in("zoho_id", ids.length ? ids : ["-"]);
         const haveSet = new Set((have ?? []).map((r) => String(r.zoho_id)));
+        // Bills/invoices change after caching (payments alter status and
+        // balance), so re-fetch them unless the caller opted out. Payments,
+        // expenses and journals are immutable enough to keep.
+        const refresh = (input.refresh_documents ?? true) &&
+          (kind === "bill" || kind === "invoice");
 
         for (const id of ids) {
-          if (haveSet.has(id)) continue;
+          if (haveSet.has(id) && !refresh) continue;
           const detail = await zohoGet(token, `${path}/${id}`);
           await supabase.from("bk_history_raw").upsert({
             company_id: companyId,
@@ -352,7 +410,8 @@ Deno.serve(async (req) => {
           if (kind === "bill") billsFetched++;
           else if (kind === "invoice") invoicesFetched++;
           else if (kind === "expense") expensesFetched++;
-          else journalsFetched++;
+          else if (kind === "journal") journalsFetched++;
+          else paymentsFetched++;
         }
       }
     }
@@ -597,6 +656,167 @@ Deno.serve(async (req) => {
       if (!error) accountTagProfilesWritten++;
     }
 
+    // ------------------------------------------------------------------
+    // Layer 6: timing / payment behaviour. Needs the raw bill/invoice
+    // payloads (created_time, balance, status, due_date, payment terms) and
+    // the payment payloads (dates + which documents each settled).
+    // ------------------------------------------------------------------
+    const timingDocs: TimingDoc[] = [];
+    const paymentDocs: PaymentDoc[] = [];
+    const journalsForPatterns: JournalForPattern[] = [];
+    for (const r of rawRows ?? []) {
+      const kind = r.doc_kind as DocKind;
+      const root = KIND_META[kind]?.rootKey;
+      const doc = ((r.payload as Record<string, unknown>)[root] ??
+        r.payload) as Record<string, unknown>;
+
+      if (kind === "bill" || kind === "invoice") {
+        const partyId = kind === "bill" ? doc.vendor_id : doc.customer_id;
+        if (partyId == null) continue;
+        const termsRaw = doc.payment_terms;
+        const created = String(doc.created_time ?? "").slice(0, 10);
+        timingDocs.push({
+          doc_kind: kind,
+          zoho_id: String(doc[KIND_META[kind].idKey] ?? ""),
+          party_zoho_id: String(partyId),
+          party_name: String((kind === "bill" ? doc.vendor_name : doc.customer_name) ?? ""),
+          date: String(doc.date ?? "").slice(0, 10),
+          entered_date: /^\d{4}-\d{2}-\d{2}$/.test(created) ? created : null,
+          due_date: doc.due_date ? String(doc.due_date).slice(0, 10) : null,
+          terms_days: termsRaw != null && Number.isFinite(Number(termsRaw))
+            ? Number(termsRaw)
+            : null,
+          total: Number(doc.total ?? 0) || 0,
+          balance: Number(doc.balance ?? 0) || 0,
+          status: String(doc.status ?? ""),
+        });
+      } else if (kind === "vendorpayment" || kind === "customerpayment") {
+        const partyId = kind === "vendorpayment" ? doc.vendor_id : doc.customer_id;
+        const applied = ((kind === "vendorpayment" ? doc.bills : doc.invoices) as
+          | Array<Record<string, unknown>>
+          | undefined) ?? [];
+        paymentDocs.push({
+          payment_id: String(doc.payment_id ?? ""),
+          party_zoho_id: String(partyId ?? ""),
+          date: String(doc.date ?? "").slice(0, 10),
+          amount: Number(doc.amount ?? 0) || 0,
+          payment_mode: doc.payment_mode != null ? String(doc.payment_mode) : null,
+          // Vendor payments: paid_through_account_*; customer payments:
+          // account_* (the deposit-to account).
+          account_id: (doc.paid_through_account_id ?? doc.account_id) != null
+            ? String(doc.paid_through_account_id ?? doc.account_id)
+            : null,
+          account_name: (doc.paid_through_account_name ?? doc.account_name) != null
+            ? String(doc.paid_through_account_name ?? doc.account_name)
+            : null,
+          applied: applied.map((a) => ({
+            doc_zoho_id: String(
+              (kind === "vendorpayment" ? a.bill_id : a.invoice_id) ?? "",
+            ),
+            amount: Number(a.amount_applied ?? a.amount ?? 0) || 0,
+          })).filter((a) => a.doc_zoho_id),
+        });
+      } else if (kind === "journal") {
+        // Zoho journal lines carry `amount` + `debit_or_credit`; some
+        // payloads use debit_amount / credit_amount. Handle both.
+        const lines = ((doc.line_items as Array<Record<string, unknown>>) ?? [])
+          .map((li) => {
+            const side = String(li.debit_or_credit ?? "").toLowerCase();
+            const amt = Number(li.amount ?? 0) || 0;
+            return {
+              account_id: String(li.account_id ?? ""),
+              account_name: li.account_name != null ? String(li.account_name) : null,
+              debit: Number(li.debit_amount ?? 0) || (side === "debit" ? amt : 0),
+              credit: Number(li.credit_amount ?? 0) || (side === "credit" ? amt : 0),
+            };
+          });
+        journalsForPatterns.push({
+          journal_id: String(doc.journal_id ?? ""),
+          date: String(doc.journal_date ?? doc.date ?? "").slice(0, 10),
+          reference_number: doc.reference_number != null ? String(doc.reference_number) : null,
+          notes: doc.notes != null ? String(doc.notes) : null,
+          total: Number(doc.total ?? 0) || 0,
+          // Zoho marks journals generated from a recurring definition.
+          from_recurring: Boolean(doc.recurring_journal_id) ||
+            String(doc.journal_type ?? "").toLowerCase().includes("recurring"),
+          lines,
+        });
+      }
+    }
+
+    let timingWritten = 0;
+    let laterThanUsualProposed = 0;
+    for (const t of buildTimingProfiles(timingDocs, paymentDocs)) {
+      const { error } = await supabase.from("bk_timing_profiles").upsert({
+        company_id: companyId,
+        ...t,
+        computed_at: new Date().toISOString(),
+      }, { onConflict: "company_id,party_kind,party_zoho_id" });
+      if (!error) timingWritten++;
+      // Propose a month-end "later than usual" watch for parties with
+      // enough paid history to know what usual is.
+      if (isTimingProposable(t) && t.pay_lag_p90 != null) {
+        const { data: existing } = await supabase
+          .from("bk_check_proposals")
+          .select("status")
+          .eq("company_id", companyId)
+          .eq("party_kind", t.party_kind)
+          .eq("party_zoho_id", t.party_zoho_id)
+          .eq("check_kind", "later_than_usual")
+          .maybeSingle();
+        const keep = existing?.status && existing.status !== "proposed"
+          ? existing.status
+          : "proposed";
+        const vsTerms = t.pays_vs_terms_days;
+        const { error: cErr } = await supabase.from("bk_check_proposals").upsert({
+          company_id: companyId,
+          party_kind: t.party_kind,
+          party_zoho_id: t.party_zoho_id,
+          party_name: t.party_name,
+          check_kind: "later_than_usual",
+          rationale:
+            `usually settled in ~${t.pay_lag_median} days (p90 ${t.pay_lag_p90})` +
+            (vsTerms != null
+              ? `, i.e. ${Math.abs(vsTerms)} days ${vsTerms > 0 ? "after" : "before"} the ${t.terms_days_mode}-day terms`
+              : "") +
+            `; nudge at month-end when an open document is older than that.`,
+          params: {
+            pay_lag_median: t.pay_lag_median,
+            pay_lag_p90: t.pay_lag_p90,
+            terms_days: t.terms_days_mode,
+          },
+          status: keep,
+          computed_at: new Date().toISOString(),
+        }, { onConflict: "company_id,party_kind,party_zoho_id,check_kind" });
+        if (!cErr) laterThanUsualProposed++;
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Layer 5: repeating MANUAL journals (undeclared recurring journals).
+    // ------------------------------------------------------------------
+    let journalPatternsWritten = 0;
+    let journalPatternsProposable = 0;
+    for (const jp of findJournalPatterns(journalsForPatterns)) {
+      const { data: existing } = await supabase
+        .from("bk_journal_patterns")
+        .select("status")
+        .eq("company_id", companyId)
+        .eq("fingerprint", jp.fingerprint)
+        .maybeSingle();
+      const keep = existing?.status && existing.status !== "proposed"
+        ? existing.status
+        : "proposed";
+      const { error } = await supabase.from("bk_journal_patterns").upsert({
+        company_id: companyId,
+        ...jp,
+        status: keep,
+        computed_at: new Date().toISOString(),
+      }, { onConflict: "company_id,fingerprint" });
+      if (!error) journalPatternsWritten++;
+      if (isJournalPatternProposable(jp)) journalPatternsProposable++;
+    }
+
     if (runId) {
       await supabase.from("bk_learn_runs").update({
         status: "completed",
@@ -604,6 +824,7 @@ Deno.serve(async (req) => {
         invoices_fetched: invoicesFetched,
         expenses_fetched: expensesFetched,
         journals_fetched: journalsFetched,
+        payments_fetched: paymentsFetched,
         profiles_written: written,
         finished_at: new Date().toISOString(),
       }).eq("id", runId);
@@ -622,6 +843,11 @@ Deno.serve(async (req) => {
       tag_profiles_written: tagProfilesWritten,
       project_profiles_written: projectProfilesWritten,
       account_tag_profiles_written: accountTagProfilesWritten,
+      payments_fetched: paymentsFetched,
+      timing_profiles_written: timingWritten,
+      later_than_usual_proposed: laterThanUsualProposed,
+      journal_patterns_written: journalPatternsWritten,
+      journal_patterns_proposable: journalPatternsProposable,
       profiles_written: written,
       proposable: profiles.filter(isProposable).length,
       rhythms_written: rhythmsWritten,

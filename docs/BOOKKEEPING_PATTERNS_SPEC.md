@@ -1,6 +1,6 @@
 # Bookkeeping Patterns — Onboarding Knowledge Base
 
-**Status:** Layers 1–4 built (party→account, recurrence, attachments, reporting tags + projects incl. expenses and journals) as propose-only, with enabled checks wired into the judgment engine, and month-end nudges (recurring journals due vs posted; expected-but-missing bills for enabled checks) on a Month-end page. Layers 5–6 as originally scoped (journal *patterns* beyond recurring definitions; timing/payment behaviour) remain proposed. Companion to [`BUILD_PLAN.md`](./BUILD_PLAN.md) and [`rules-registry.md`](./rules-registry.md).
+**Status:** All six layers built as propose-only — party→account, recurrence, attachments, reporting tags + projects (bills/invoices/expenses/journals), manual journal patterns (undeclared recurring journals, by account fingerprint), timing / payment behaviour (entry lag, actual DPO/DSO vs terms, mode/account) — with enabled checks wired into the judgment engine and month-end nudges (recurring journals declared *and* learned, expected-but-missing bills, open-longer-than-usual). Companion to [`BUILD_PLAN.md`](./BUILD_PLAN.md) and [`rules-registry.md`](./rules-registry.md).
 
 ## 1. What this is
 

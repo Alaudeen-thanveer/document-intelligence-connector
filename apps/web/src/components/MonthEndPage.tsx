@@ -13,7 +13,8 @@ interface Nudge {
     | "recurring_journal_due"
     | "recurring_journal_posted"
     | "expected_bill_missing"
-    | "expected_bill_arrived";
+    | "expected_bill_arrived"
+    | "later_than_usual";
   severity: "info" | "attention";
   title: string;
   detail: string;
@@ -28,6 +29,8 @@ interface MonthEndResult {
     recurring_journal_definitions: number;
     journals_posted_this_month: number;
     expected_bill_checks_enabled: number;
+    journal_patterns_enabled?: number;
+    later_than_usual_enabled?: number;
     needs_attention: number;
   };
   nudges: Nudge[];
@@ -155,7 +158,11 @@ export function MonthEndPage() {
                     <div className="muted">{n.detail}</div>
                   </div>
                   <span className="status-pill status-needs_review">
-                    {n.kind === "recurring_journal_due" ? "journal due" : "bill missing"}
+                    {n.kind === "recurring_journal_due"
+                      ? "journal due"
+                      : n.kind === "later_than_usual"
+                        ? "open too long"
+                        : "bill missing"}
                   </span>
                 </li>
               ))}

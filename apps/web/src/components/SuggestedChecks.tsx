@@ -19,7 +19,8 @@ interface ProposalRow {
     | "recurring_twice_in_period"
     | "amount_anomaly"
     | "expected_missing"
-    | "supporting_document_strictness";
+    | "supporting_document_strictness"
+    | "later_than_usual";
   rationale: string;
   params: Record<string, unknown>;
   status: "proposed" | "enabled" | "dismissed" | "stale";
@@ -43,6 +44,7 @@ const KIND_LABEL: Record<ProposalRow["check_kind"], string> = {
   amount_anomaly: "Amount out of range",
   expected_missing: "Expected but missing",
   supporting_document_strictness: "Supporting document strictness",
+  later_than_usual: "Open longer than usual (month-end)",
 };
 
 const CADENCE_LABEL: Record<string, string> = {

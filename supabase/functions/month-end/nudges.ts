@@ -47,7 +47,8 @@ export type NudgeKind =
   | "recurring_journal_due"
   | "recurring_journal_posted"
   | "expected_bill_missing"
-  | "expected_bill_arrived";
+  | "expected_bill_arrived"
+  | "later_than_usual";
 
 export interface Nudge {
   kind: NudgeKind;
@@ -189,6 +190,115 @@ export function expectedBillNudges(
       key: `eb:${e.party_zoho_id}:${month}`,
       ref: { party_zoho_id: e.party_zoho_id, next_expected: e.next_expected },
     });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Layer 5: ENABLED undeclared recurring journals — due vs posted, matched by
+// account fingerprint (not by name, since manual journals rarely carry one).
+// ---------------------------------------------------------------------------
+export interface EnabledJournalPattern {
+  fingerprint: string;
+  label: string;
+  cadence: string;
+  amount_median: number | null;
+  expected_day_min: number | null;
+  expected_day_max: number | null;
+}
+
+export interface PostedJournalWithFingerprint extends PostedJournal {
+  fingerprint: string;
+}
+
+export function journalPatternNudges(
+  enabled: EnabledJournalPattern[],
+  posted: PostedJournalWithFingerprint[],
+  month: string,
+): Nudge[] {
+  const out: Nudge[] = [];
+  const thisMonth = posted.filter((p) => monthKey(p.journal_date) === month);
+  for (const e of enabled) {
+    const hit = thisMonth.find((p) => p.fingerprint === e.fingerprint);
+    if (hit) {
+      out.push({
+        kind: "recurring_journal_posted",
+        severity: "info",
+        title: `${e.label} — posted`,
+        detail: `Journal ${hit.journal_id} on ${hit.journal_date}${hit.total != null ? ` for ${hit.total}` : ""} (learned pattern).`,
+        key: `jp:${e.fingerprint}:${month}`,
+        ref: { fingerprint: e.fingerprint, journal_id: hit.journal_id },
+      });
+    } else {
+      out.push({
+        kind: "recurring_journal_due",
+        severity: "attention",
+        title: `${e.label} — not yet posted for ${month}`,
+        detail:
+          `Posted by hand every month${e.amount_median != null ? `, usually ~${e.amount_median}` : ""}` +
+          `${e.expected_day_min != null ? ` around day ${e.expected_day_min}–${e.expected_day_max}` : ""}` +
+          ` (learned pattern, enabled by reviewer). Not set up as a Zoho recurring journal.`,
+        key: `jp:${e.fingerprint}:${month}`,
+        ref: { fingerprint: e.fingerprint },
+      });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Layer 6: ENABLED "later than usual" — open documents older than the party's
+// usual settlement (p90 payment lag).
+// ---------------------------------------------------------------------------
+export interface EnabledLaterThanUsual {
+  party_kind: "vendor" | "customer";
+  party_zoho_id: string;
+  party_name: string;
+  pay_lag_p90: number;
+  pay_lag_median: number | null;
+}
+
+export interface OpenDoc {
+  doc_kind: "bill" | "invoice";
+  zoho_id: string;
+  number: string | null;
+  party_zoho_id: string;
+  date: string; // yyyy-mm-dd
+  balance: number;
+}
+
+function daysBetween(a: string, b: string): number {
+  return Math.round(
+    (Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86_400_000,
+  );
+}
+
+export function laterThanUsualNudges(
+  enabled: EnabledLaterThanUsual[],
+  open: OpenDoc[],
+  today: string,
+): Nudge[] {
+  const out: Nudge[] = [];
+  for (const e of enabled) {
+    const wantKind = e.party_kind === "vendor" ? "bill" : "invoice";
+    for (const d of open) {
+      if (d.doc_kind !== wantKind || d.party_zoho_id !== e.party_zoho_id) continue;
+      if (!(d.balance > 0) || !/^\d{4}-\d{2}-\d{2}$/.test(d.date)) continue;
+      const age = daysBetween(d.date, today);
+      if (age <= e.pay_lag_p90) continue;
+      const label = wantKind === "bill" ? "Bill" : "Invoice";
+      out.push({
+        kind: "later_than_usual",
+        severity: "attention",
+        title: `${e.party_name} — ${label.toLowerCase()} ${d.number ?? d.zoho_id} open ${age} days`,
+        detail:
+          `${label} dated ${d.date}, balance ${d.balance}. This party is usually settled within ` +
+          `${e.pay_lag_p90} days${e.pay_lag_median != null ? ` (typically ~${e.pay_lag_median})` : ""}. ` +
+          (wantKind === "bill" ? "Check whether payment is overdue." : "Consider chasing the customer."),
+        key: `ltu:${d.doc_kind}:${d.zoho_id}`,
+        ref: { party_zoho_id: e.party_zoho_id, doc_zoho_id: d.zoho_id, days_open: age },
+      });
+    }
   }
   return out;
 }
