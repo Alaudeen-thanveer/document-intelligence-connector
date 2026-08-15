@@ -757,6 +757,66 @@ Deno.serve(async (req) => {
     const lineRows = (lineRowsData ?? []) as ExtractedLineItemRow[];
     const hasRealLines = lineRows.length > 0;
 
+    // Reporting-tag consistency guard. A tag Zoho applies PER TRANSACTION
+    // must carry ONE value across every line; the review UI cannot produce
+    // a conflict, but data can arrive other ways, so refuse here rather
+    // than send Zoho something it will either reject or silently reduce.
+    if (hasRealLines) {
+      const { data: tagRows } = await supabase
+        .from("zoho_entities")
+        .select("zoho_id, name, extra")
+        .eq("kind", "reporting_tag");
+      const txnLevel = new Map<string, string>();
+      for (const t of tagRows ?? []) {
+        if ((t.extra as { preference?: unknown } | null)?.preference === "transaction") {
+          txnLevel.set(String(t.zoho_id), String(t.name));
+        }
+      }
+      if (txnLevel.size > 0) {
+        const seen = new Map<string, Set<string>>();
+        for (const li of lineRows) {
+          for (const tg of li.reporting_tags ?? []) {
+            if (!tg?.tag_id || !tg?.tag_option_id || !txnLevel.has(tg.tag_id)) continue;
+            const set = seen.get(tg.tag_id) ?? new Set<string>();
+            set.add(tg.tag_option_id);
+            seen.set(tg.tag_id, set);
+          }
+        }
+        const conflicts = [...seen.entries()].filter(([, opts]) => opts.size > 1);
+        if (conflicts.length > 0) {
+          return jsonResponse(
+            {
+              ok: false,
+              skipped: true,
+              reason: "reporting_tag_conflict",
+              error:
+                `Reporting tag(s) ${conflicts.map(([id]) => `"${txnLevel.get(id)}"`).join(", ")} ` +
+                `are set per transaction in Zoho Books, but the line items carry different values. ` +
+                `Choose one value for the whole document.`,
+              conflicts: conflicts.map(([id, opts]) => ({
+                tag_id: id,
+                tag_name: txnLevel.get(id),
+                option_ids: [...opts],
+              })),
+              document_id: input.document_id,
+            },
+            400,
+          );
+        }
+        // Consistent: make sure the single value is present on EVERY line
+        // (a line without it would otherwise be un-tagged in Zoho).
+        for (const [tagId, opts] of seen) {
+          const only = [...opts][0];
+          for (const li of lineRows) {
+            const tags = (li.reporting_tags ?? []) as Array<{ tag_id: string; tag_option_id: string }>;
+            if (!tags.some((t) => t.tag_id === tagId)) {
+              li.reporting_tags = [...tags, { tag_id: tagId, tag_option_id: only }];
+            }
+          }
+        }
+      }
+    }
+
     const mapped = mapExtractedFieldsToZohoBill(
       extracted as ExtractedFieldsRow,
       lineRows,

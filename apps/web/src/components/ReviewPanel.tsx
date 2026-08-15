@@ -30,6 +30,51 @@ function nextLineKey(): string {
   return `line-${lineKeyCounter}`;
 }
 
+/**
+ * A reporting tag in Zoho is applied either per LINE ITEM or once per
+ * TRANSACTION (Zoho: multi_preference_entities.preference). We mirror that
+ * exactly: line-level tags get a selector on every line; transaction-level
+ * tags get ONE selector in the header and are applied uniformly to every
+ * line on push — so two lines can never carry different values for a
+ * transaction-level tag. Draft / inactive tags, or tags with no options,
+ * cannot be applied in Zoho and are not offered.
+ */
+interface TagMeta {
+  zoho_id: string;
+  name: string;
+  preference: "line_item" | "transaction";
+  options: Array<{ id: string; name: string }>;
+}
+function tagMeta(
+  rows: Array<{ zoho_id: string; name: string; extra: Record<string, unknown> | null }>,
+): TagMeta[] {
+  return rows
+    .map((t) => {
+      const extra = (t.extra ?? {}) as {
+        preference?: unknown;
+        is_active?: unknown;
+        is_draft?: unknown;
+        options?: Array<{ id: string | null; name: string | null }>;
+      };
+      const options = (extra.options ?? [])
+        .filter((o): o is { id: string; name: string | null } => !!o.id)
+        .map((o) => ({ id: o.id, name: o.name ?? o.id }));
+      const usable = extra.is_active !== false && extra.is_draft !== true &&
+        options.length > 0;
+      return usable
+        ? {
+          zoho_id: t.zoho_id,
+          name: t.name,
+          preference: extra.preference === "transaction"
+            ? "transaction" as const
+            : "line_item" as const,
+          options,
+        }
+        : null;
+    })
+    .filter((t): t is TagMeta => t !== null);
+}
+
 /** UAE-edition VAT treatments (transaction-level; Zoho validates). */
 const TAX_TREATMENTS: Array<{ value: string; label: string }> = [
   { value: "vat_registered", label: "VAT registered" },
@@ -69,6 +114,8 @@ export function ReviewPanel({
   const [currency, setCurrency] = useState("");
   const [taxAmount, setTaxAmount] = useState("");
   const [taxTreatment, setTaxTreatment] = useState("");
+  /** Transaction-level reporting tags: tag_id → tag_option_id (one per doc). */
+  const [txnTags, setTxnTags] = useState<Record<string, string>>({});
   const [invoiceNumber, setInvoiceNumber] = useState("");
   const [dueDate, setDueDate] = useState("");
   const [lineItems, setLineItems] = useState<EditableLine[]>([]);
@@ -100,6 +147,7 @@ export function ReviewPanel({
       extracted?.tax_amount != null ? String(extracted.tax_amount) : "",
     );
     setTaxTreatment("");
+    setTxnTags({});
     setInvoiceNumber(extracted?.invoice_number ?? "");
     setDueDate(extracted?.due_date ?? "");
     setActionMsg(null);
@@ -248,6 +296,22 @@ export function ReviewPanel({
       .order("line_no")
       .then(({ data }) => {
         if (cancelled) return;
+        // Transaction-level tags live on every line in storage; surface the
+        // shared value in the header control.
+        const txnIds = new Set(
+          tagMeta(zoho.reportingTags)
+            .filter((t) => t.preference === "transaction")
+            .map((t) => t.zoho_id),
+        );
+        const hoisted: Record<string, string> = {};
+        for (const row of data ?? []) {
+          for (const t of (Array.isArray(row.reporting_tags) ? row.reporting_tags : []) as Array<{ tag_id?: string; tag_option_id?: string }>) {
+            if (t?.tag_id && t?.tag_option_id && txnIds.has(t.tag_id) && !hoisted[t.tag_id]) {
+              hoisted[t.tag_id] = t.tag_option_id;
+            }
+          }
+        }
+        if (Object.keys(hoisted).length) setTxnTags((prev) => ({ ...hoisted, ...prev }));
         setLineItems(
           (data ?? []).map((row) => {
             const qty = row.quantity != null ? Number(row.quantity) : 1;
@@ -321,6 +385,10 @@ export function ReviewPanel({
     return t.includes("bank") || t.includes("cash") || t === "credit_card";
   });
 
+  const tagMetas = tagMeta(zoho.reportingTags);
+  const lineTags = tagMetas.filter((t) => t.preference === "line_item");
+  const transactionTags = tagMetas.filter((t) => t.preference === "transaction");
+
   // When every line item carries its own account, the transaction-level
   // account selector is moot for bills/invoices (expenses post as a single
   // amount and still need one): show "as per line items" instead.
@@ -392,9 +460,20 @@ export function ReviewPanel({
             (li.quantity.trim() === "" ? 1 : Number(li.quantity)),
         account_zoho_id: li.accountId || null,
         project_zoho_id: li.projectId || null,
-        reporting_tags: Object.entries(li.tags)
-          .filter(([, opt]) => opt)
-          .map(([tag_id, tag_option_id]) => ({ tag_id, tag_option_id })),
+        // Line-level tags come from the line; transaction-level tags are the
+        // single header value, applied to every line so Zoho sees them
+        // consistently. A per-line value for a transaction-level tag can
+        // never be entered, and is dropped here as a second guard.
+        reporting_tags: [
+          ...Object.entries(li.tags)
+            .filter(([tag_id, opt]) =>
+              opt && !transactionTags.some((t) => t.zoho_id === tag_id)
+            )
+            .map(([tag_id, tag_option_id]) => ({ tag_id, tag_option_id })),
+          ...Object.entries(txnTags)
+            .filter(([, opt]) => opt)
+            .map(([tag_id, tag_option_id]) => ({ tag_id, tag_option_id })),
+        ],
         source: "manual" as const,
       }));
     if (rows.length > 0) {
@@ -923,7 +1002,7 @@ export function ReviewPanel({
                   </option>
                 ))}
               </select>
-              {(zoho.projects.length > 0 || zoho.reportingTags.length > 0) && (
+              {(zoho.projects.length > 0 || lineTags.length > 0) && (
                 <div className="li-dims">
                   {zoho.projects.length > 0 && (
                     <select
@@ -948,11 +1027,8 @@ export function ReviewPanel({
                       ))}
                     </select>
                   )}
-                  {zoho.reportingTags.map((tag) => {
-                    const options = ((tag.extra as {
-                      options?: Array<{ id: string | null; name: string | null }>;
-                    } | null)?.options ?? []).filter((o) => o.id);
-                    if (options.length === 0) return null;
+                  {lineTags.map((tag) => {
+                    const options = tag.options;
                     return (
                       <select
                         key={tag.zoho_id}
@@ -974,7 +1050,7 @@ export function ReviewPanel({
                       >
                         <option value="">— {tag.name} —</option>
                         {options.map((o) => (
-                          <option key={o.id!} value={o.id!}>
+                          <option key={o.id} value={o.id}>
                             {o.name}
                           </option>
                         ))}
@@ -1208,7 +1284,33 @@ export function ReviewPanel({
               ))}
             </select>
           </label>
+          {transactionTags.map((tag) => (
+            <label key={tag.zoho_id}>
+              {tag.name}
+              <select
+                value={txnTags[tag.zoho_id] ?? ""}
+                onChange={(e) =>
+                  setTxnTags((prev) => ({ ...prev, [tag.zoho_id]: e.target.value }))
+                }
+                title="Applied to the whole transaction (Zoho: per-transaction tag)"
+              >
+                <option value="">— {tag.name} (whole transaction) —</option>
+                {tag.options.map((o) => (
+                  <option key={o.id} value={o.id}>
+                    {o.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ))}
         </div>
+        {transactionTags.length > 0 && (
+          <p className="muted">
+            {transactionTags.map((t) => t.name).join(", ")}{" "}
+            {transactionTags.length === 1 ? "is" : "are"} set once per
+            transaction in Zoho Books, so one value applies to every line.
+          </p>
+        )}
         {taxTreatment && partyTreatment && taxTreatment !== partyTreatment && (
           <p className="muted">
             Overriding this party's default treatment for this transaction

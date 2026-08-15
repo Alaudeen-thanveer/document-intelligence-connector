@@ -240,6 +240,10 @@ async function fetchKind(
       const name = String(t.tag_name ?? "");
       if (!id || !name) continue;
       let options: Array<{ id: string | null; name: string | null }> = [];
+      // Zoho: a tag is applied per line item or once per transaction.
+      // Default to line_item; the detail endpoint says which.
+      let preference: "line_item" | "transaction" = "line_item";
+      let isDraft: unknown = t.is_draft ?? null;
       try {
         const detailUrl = `${apiBase()}/reportingtags/${id}?organization_id=${
           encodeURIComponent(orgId())
@@ -249,6 +253,11 @@ async function fetchKind(
         });
         const raw = await res.json();
         const tag = (raw as { tag?: Record<string, unknown> })?.tag ?? {};
+        const pref = (tag.multi_preference_entities as
+          | { preference?: unknown }
+          | undefined)?.preference;
+        if (pref === "transaction") preference = "transaction";
+        if (tag.is_draft != null) isDraft = tag.is_draft;
         const opts = (tag.tag_options ?? t.tag_options) as
           | Array<Record<string, unknown>>
           | undefined;
@@ -270,7 +279,10 @@ async function fetchKind(
         name,
         extra: {
           is_active: t.is_active ?? null,
-          is_draft: t.is_draft ?? null,
+          is_draft: isDraft,
+          // "line_item" → one value per line; "transaction" → one value for
+          // the whole document, applied uniformly to every line on push.
+          preference,
           options,
         },
       });
