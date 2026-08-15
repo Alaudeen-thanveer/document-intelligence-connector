@@ -1,6 +1,6 @@
 # Bookkeeping Patterns — Onboarding Knowledge Base
 
-**Status:** Layers 1–3 built (party→account profiles, recurrence, attachment conventions) as propose-only — see `supabase/functions/bookkeeping-learn/` and `scripts/bk-layer*-accuracy.mjs`. Enabled checks are **not yet wired into the judgment engine**; that is the next deliberate step. Layers 4–6 (items, journals, timing) remain proposed. Companion to [`BUILD_PLAN.md`](./BUILD_PLAN.md) and [`rules-registry.md`](./rules-registry.md).
+**Status:** Layers 1–4 built (party→account, recurrence, attachments, reporting tags + projects incl. expenses and journals) as propose-only, with enabled checks wired into the judgment engine, and month-end nudges (recurring journals due vs posted; expected-but-missing bills for enabled checks) on a Month-end page. Layers 5–6 as originally scoped (journal *patterns* beyond recurring definitions; timing/payment behaviour) remain proposed. Companion to [`BUILD_PLAN.md`](./BUILD_PLAN.md) and [`rules-registry.md`](./rules-registry.md).
 
 ## 1. What this is
 

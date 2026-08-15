@@ -15,7 +15,8 @@ export async function callEdgeFunction(
     | "judgment"
     | "zoho-push"
     | "zoho-pull"
-    | "bookkeeping-learn",
+    | "bookkeeping-learn"
+    | "month-end",
   body: Record<string, unknown>,
 ): Promise<{ ok: boolean; status: number; body: Record<string, unknown> }> {
   const res = await fetch(`${functionsUrl}/${name}`, {

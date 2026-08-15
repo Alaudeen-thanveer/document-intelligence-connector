@@ -741,6 +741,13 @@ a {
   }
 }
 
+/* Month-end page */
+.month-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 /* Connections page */
 .view-nav {
   display: flex;
