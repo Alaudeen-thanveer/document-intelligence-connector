@@ -19,6 +19,8 @@ export interface ExtractedFieldsRow {
   tax_amount: number | string | null;
   invoice_number: string | null;
   due_date: string | null;
+  /** Bill-to / customer name as printed (sales invoices). */
+  customer_raw: string | null;
   confidence_scores: Record<string, unknown> | null;
   ai_fallback_used: boolean;
 }

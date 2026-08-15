@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { ConnectionsPage } from "./components/ConnectionsPage";
+import { MonthEndPage } from "./components/MonthEndPage";
 import { DocumentList } from "./components/DocumentList";
 import { ReviewPanel } from "./components/ReviewPanel";
 import { RulesManager } from "./components/RulesManager";
@@ -18,23 +19,27 @@ export default function App() {
   const [tick, setTick] = useState(0);
   const [rulesOpen, setRulesOpen] = useState(false);
   const [rulesVersion, setRulesVersion] = useState(0);
-  // Hash-routed page: #connections is its own page; anything else = documents.
-  const [view, setView] = useState<"documents" | "connections">(() =>
-    window.location.hash === "#connections" ? "connections" : "documents",
-  );
+  // Hash-routed pages: #connections and #month-end are their own pages;
+  // anything else = documents.
+  type View = "documents" | "connections" | "month-end";
+  const viewFromHash = (): View =>
+    window.location.hash === "#connections"
+      ? "connections"
+      : window.location.hash === "#month-end"
+        ? "month-end"
+        : "documents";
+  const [view, setView] = useState<View>(viewFromHash);
 
   useEffect(() => {
     function onHashChange() {
-      setView(
-        window.location.hash === "#connections" ? "connections" : "documents",
-      );
+      setView(viewFromHash());
     }
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
 
-  function navigate(next: "documents" | "connections") {
-    window.location.hash = next === "connections" ? "#connections" : "#";
+  function navigate(next: View) {
+    window.location.hash = next === "documents" ? "#" : `#${next}`;
   }
 
   const selected = useMemo(
@@ -83,7 +88,13 @@ export default function App() {
       <header className="topbar">
         <div>
           <p className="brand">Document Intelligence Connector</p>
-          <h1>{view === "connections" ? "Connections" : "Document review"}</h1>
+          <h1>
+            {view === "connections"
+              ? "Connections"
+              : view === "month-end"
+                ? "Month-end"
+                : "Document review"}
+          </h1>
         </div>
         <div className="topbar-actions">
           <nav className="view-nav" aria-label="Pages">
@@ -100,6 +111,13 @@ export default function App() {
               onClick={() => navigate("connections")}
             >
               Connections
+            </button>
+            <button
+              type="button"
+              className={`tab-btn${view === "month-end" ? " active" : ""}`}
+              onClick={() => navigate("month-end")}
+            >
+              Month-end
             </button>
           </nav>
           <button
@@ -124,10 +142,13 @@ export default function App() {
         open={rulesOpen}
         onClose={() => setRulesOpen(false)}
         onChanged={() => setRulesVersion((n) => n + 1)}
+        reviewerName={reviewerName}
       />
 
       {view === "connections" ? (
         <ConnectionsPage />
+      ) : view === "month-end" ? (
+        <MonthEndPage />
       ) : (
       <main className="layout">
         <section className="list-pane">

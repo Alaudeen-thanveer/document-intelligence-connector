@@ -1,6 +1,11 @@
 /**
- * Run the three hardcoded judgment checks for a document and store each
- * result in judgment_results. Not a pluggable rules engine.
+ * Run the three hardcoded judgment checks for a document — plus any
+ * per-vendor checks a human has ENABLED in bk_check_proposals — and store
+ * each result in judgment_results. Not a pluggable rules engine.
+ *
+ * Learned checks: only rows with status = 'enabled' are ever consulted.
+ * Proposed / dismissed / stale rows have no effect. The vendor is matched
+ * from extracted vendor_raw to a synced Zoho vendor by normalized name.
  *
  * Input: { document_id: string }
  */
@@ -14,6 +19,14 @@ import {
   type CheckResult,
   type JudgmentCheckContext,
 } from "./checks.ts";
+import {
+  applySupportingDocumentStrictness,
+  checkAmountAnomaly,
+  checkRecurringTwiceInPeriod,
+  type EnabledCheck,
+  LEARNED_RULE_NAMES,
+  type PeerDoc,
+} from "./learned_checks.ts";
 
 const DEFAULT_COMPANY_ID = "00000000-0000-4000-8000-000000000001";
 const DEFAULT_DUPLICATE_DAYS = 3;
@@ -113,18 +126,118 @@ async function loadContext(
   };
 }
 
+/** Same normalization the review UI uses to match vendor names (lib/zoho.ts). */
+function normName(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Resolve the document's vendor to a synced Zoho vendor id (exact
+ * normalized match only — no fuzzy containment here, since a wrong match
+ * would apply another vendor's learned checks).
+ */
+async function resolveVendorZohoId(
+  supabase: SupabaseClient,
+  vendorRaw: string | null,
+): Promise<{ zoho_id: string; name: string } | null> {
+  const q = vendorRaw ? normName(vendorRaw) : "";
+  if (!q) return null;
+  const { data } = await supabase
+    .from("zoho_entities")
+    .select("zoho_id, name")
+    .eq("kind", "vendor");
+  for (const v of data ?? []) {
+    if (normName(String(v.name)) === q) {
+      return { zoho_id: String(v.zoho_id), name: String(v.name) };
+    }
+  }
+  // Fall back to the learned party profiles: the vendor cache can lag the
+  // history the learner read (a vendor seen in bills but not yet synced),
+  // and a stale cache must never silently switch off a check the reviewer
+  // enabled. Still an exact normalized match.
+  const { data: profiles } = await supabase
+    .from("bk_party_profiles")
+    .select("party_zoho_id, party_name")
+    .eq("party_kind", "vendor");
+  for (const p of profiles ?? []) {
+    if (normName(String(p.party_name)) === q) {
+      return { zoho_id: String(p.party_zoho_id), name: String(p.party_name) };
+    }
+  }
+  return null;
+}
+
+/** ONLY enabled checks. Proposed / dismissed / stale never reach the engine. */
+async function loadEnabledChecks(
+  supabase: SupabaseClient,
+  companyId: string,
+  vendorZohoId: string,
+): Promise<EnabledCheck[]> {
+  const { data } = await supabase
+    .from("bk_check_proposals")
+    .select("check_kind, params")
+    .eq("company_id", companyId)
+    .eq("party_kind", "vendor")
+    .eq("party_zoho_id", vendorZohoId)
+    .eq("status", "enabled");
+  return (data ?? []) as EnabledCheck[];
+}
+
+/** Other documents from the same vendor (by normalized name), for the
+ * recurring-period check. Excludes the document under judgment. */
+async function loadVendorPeers(
+  supabase: SupabaseClient,
+  companyId: string,
+  documentId: string,
+  vendorRaw: string,
+): Promise<PeerDoc[]> {
+  const q = normName(vendorRaw);
+  const { data: docs } = await supabase
+    .from("documents")
+    .select("id")
+    .eq("company_id", companyId)
+    .neq("id", documentId);
+  const ids = (docs ?? []).map((d) => d.id as string);
+  if (ids.length === 0) return [];
+  const { data: peers } = await supabase
+    .from("extracted_fields")
+    .select("document_id, vendor_raw, invoice_date, total_amount")
+    .in("document_id", ids);
+  return (peers ?? [])
+    .filter((p) => p.vendor_raw && normName(String(p.vendor_raw)) === q)
+    .map((p) => ({
+      document_id: String(p.document_id),
+      invoice_date: toDateOnly(p.invoice_date),
+      total_amount: parseAmount(p.total_amount),
+    }));
+}
+
 async function persistResults(
   supabase: SupabaseClient,
   documentId: string,
   results: Array<{ rule_name: string; result: CheckResult }>,
 ): Promise<Array<{ id: string; rule_name: string; passed: boolean; notes: string }>> {
-  // Replace prior rows for these three hardcoded checks on re-run.
+  // Replace prior rows for these checks on re-run. Also clear any
+  // learned_* rows from a previous run whose check has since been
+  // disabled — otherwise a stale failure would linger on the document.
   const ruleNames = results.map((r) => r.rule_name);
   await supabase
     .from("judgment_results")
     .delete()
     .eq("document_id", documentId)
     .in("rule_name", ruleNames);
+  await supabase
+    .from("judgment_results")
+    .delete()
+    .eq("document_id", documentId)
+    .like("rule_name", "learned_%")
+    .not("rule_name", "in", `(${ruleNames.map((n) => `"${n}"`).join(",")})`);
 
   const rows = results.map((r) => ({
     document_id: documentId,
@@ -174,15 +287,59 @@ Deno.serve(async (req) => {
     const supabase = getSupabase();
     const ctx = await loadContext(supabase, input.document_id);
 
+    // Learned per-vendor checks: only those a human ENABLED, only for the
+    // vendor this document matches. Absent a match or any enabled check,
+    // the engine behaves exactly as before.
+    const vendor = await resolveVendorZohoId(supabase, ctx.vendor_raw);
+    const enabled = vendor
+      ? await loadEnabledChecks(supabase, ctx.company_id, vendor.zoho_id)
+      : [];
+
     const duplicate = await checkDuplicate(supabase, ctx);
-    const supporting = checkMissingSupportingDocument(ctx);
+    let supporting = checkMissingSupportingDocument(ctx);
     const amountPo = checkAmountAboveThresholdNoPo(ctx);
+
+    // Strictness override replaces the base supporting-document verdict.
+    const strictness = enabled.find(
+      (e) => e.check_kind === "supporting_document_strictness",
+    );
+    if (strictness) {
+      const overridden = applySupportingDocumentStrictness(
+        ctx.has_supporting_document,
+        strictness.params,
+      );
+      if (overridden) supporting = overridden;
+    }
 
     const packaged = [
       { rule_name: JUDGMENT_CHECK_NAMES.duplicate, result: duplicate },
       { rule_name: JUDGMENT_CHECK_NAMES.supporting, result: supporting },
       { rule_name: JUDGMENT_CHECK_NAMES.amountPo, result: amountPo },
     ];
+
+    const learnedApplied: string[] = [];
+    if (enabled.some((e) => e.check_kind === "recurring_twice_in_period")) {
+      const peers = await loadVendorPeers(
+        supabase,
+        ctx.company_id,
+        input.document_id,
+        ctx.vendor_raw ?? "",
+      );
+      packaged.push({
+        rule_name: LEARNED_RULE_NAMES.recurring_twice_in_period,
+        result: checkRecurringTwiceInPeriod(ctx.invoice_date, peers),
+      });
+      learnedApplied.push("recurring_twice_in_period");
+    }
+    const anomaly = enabled.find((e) => e.check_kind === "amount_anomaly");
+    if (anomaly) {
+      packaged.push({
+        rule_name: LEARNED_RULE_NAMES.amount_anomaly,
+        result: checkAmountAnomaly(ctx.total_amount, anomaly.params),
+      });
+      learnedApplied.push("amount_anomaly");
+    }
+    if (strictness) learnedApplied.push("supporting_document_strictness");
 
     const stored = await persistResults(supabase, input.document_id, packaged);
 
@@ -200,6 +357,10 @@ Deno.serve(async (req) => {
       config: {
         duplicate_check_days: ctx.duplicate_check_days,
         amount_requires_po_threshold: ctx.amount_requires_po_threshold,
+      },
+      learned: {
+        vendor_matched: vendor,
+        enabled_checks_applied: learnedApplied,
       },
       checks: packaged.map((p) => ({
         rule_name: p.rule_name,

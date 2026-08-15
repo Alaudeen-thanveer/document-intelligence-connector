@@ -638,13 +638,81 @@ a {
   font-size: 0.85rem;
 }
 
+/* Suggested rules (learned from history) */
+.suggested-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.suggested-head h3 { margin-bottom: 2px; }
+
+.suggested-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.suggested-item:last-child { border-bottom: none; }
+
+.suggested-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(0, 2fr) auto;
+  gap: 12px;
+  align-items: center;
+}
+
+.suggested-claim { min-width: 0; }
+
+.suggested-split { margin: 0; font-size: 0.85rem; }
+
+.suggested-evidence {
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: calc(var(--radius) - 8px);
+  font-size: 0.85rem;
+}
+
+.suggested-check-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 0 4px 12px;
+  border-left: 2px solid var(--line);
+  font-size: 0.9rem;
+}
+
+.suggested-evidence table { border-collapse: collapse; }
+.suggested-evidence td { padding: 2px 14px 2px 0; }
+.suggested-evidence td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
 /* Review line items */
 .line-item-row {
   display: grid;
-  grid-template-columns: 1fr 64px 96px 180px 80px 32px;
+  grid-template-columns: 1fr 64px 96px 180px auto 80px 32px;
   gap: 8px;
   align-items: center;
   margin-bottom: 8px;
+}
+
+/* Project + reporting-tag selectors on a line (only when the org has any). */
+.li-dims {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.li-dims select {
+  max-width: 150px;
+  font-size: 0.85rem;
 }
 
 .line-item-row input,
@@ -671,6 +739,13 @@ a {
     grid-template-columns: 1fr 56px 80px;
     grid-auto-rows: auto;
   }
+}
+
+/* Month-end page */
+.month-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 /* Connections page */

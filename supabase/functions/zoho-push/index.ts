@@ -211,6 +211,8 @@ function toZohoBillBody(
       quantity: item.quantity,
       account_id: item.account_id,
       ...(item.tax_id ? { tax_id: item.tax_id } : {}),
+      ...(item.project_id ? { project_id: item.project_id } : {}),
+      ...(item.tags && item.tags.length > 0 ? { tags: item.tags } : {}),
     })),
   };
 }
@@ -748,12 +750,72 @@ Deno.serve(async (req) => {
     const { data: lineRowsData } = await supabase
       .from("extracted_line_items")
       .select(
-        "line_no, description, quantity, rate, amount, account_zoho_id, tax_zoho_id",
+        "line_no, description, quantity, rate, amount, account_zoho_id, tax_zoho_id, project_zoho_id, reporting_tags",
       )
       .eq("extracted_fields_id", (extracted as { id: string }).id)
       .order("line_no");
     const lineRows = (lineRowsData ?? []) as ExtractedLineItemRow[];
     const hasRealLines = lineRows.length > 0;
+
+    // Reporting-tag consistency guard. A tag Zoho applies PER TRANSACTION
+    // must carry ONE value across every line; the review UI cannot produce
+    // a conflict, but data can arrive other ways, so refuse here rather
+    // than send Zoho something it will either reject or silently reduce.
+    if (hasRealLines) {
+      const { data: tagRows } = await supabase
+        .from("zoho_entities")
+        .select("zoho_id, name, extra")
+        .eq("kind", "reporting_tag");
+      const txnLevel = new Map<string, string>();
+      for (const t of tagRows ?? []) {
+        if ((t.extra as { preference?: unknown } | null)?.preference === "transaction") {
+          txnLevel.set(String(t.zoho_id), String(t.name));
+        }
+      }
+      if (txnLevel.size > 0) {
+        const seen = new Map<string, Set<string>>();
+        for (const li of lineRows) {
+          for (const tg of li.reporting_tags ?? []) {
+            if (!tg?.tag_id || !tg?.tag_option_id || !txnLevel.has(tg.tag_id)) continue;
+            const set = seen.get(tg.tag_id) ?? new Set<string>();
+            set.add(tg.tag_option_id);
+            seen.set(tg.tag_id, set);
+          }
+        }
+        const conflicts = [...seen.entries()].filter(([, opts]) => opts.size > 1);
+        if (conflicts.length > 0) {
+          return jsonResponse(
+            {
+              ok: false,
+              skipped: true,
+              reason: "reporting_tag_conflict",
+              error:
+                `Reporting tag(s) ${conflicts.map(([id]) => `"${txnLevel.get(id)}"`).join(", ")} ` +
+                `are set per transaction in Zoho Books, but the line items carry different values. ` +
+                `Choose one value for the whole document.`,
+              conflicts: conflicts.map(([id, opts]) => ({
+                tag_id: id,
+                tag_name: txnLevel.get(id),
+                option_ids: [...opts],
+              })),
+              document_id: input.document_id,
+            },
+            400,
+          );
+        }
+        // Consistent: make sure the single value is present on EVERY line
+        // (a line without it would otherwise be un-tagged in Zoho).
+        for (const [tagId, opts] of seen) {
+          const only = [...opts][0];
+          for (const li of lineRows) {
+            const tags = (li.reporting_tags ?? []) as Array<{ tag_id: string; tag_option_id: string }>;
+            if (!tags.some((t) => t.tag_id === tagId)) {
+              li.reporting_tags = [...tags, { tag_id: tagId, tag_option_id: only }];
+            }
+          }
+        }
+      }
+    }
 
     const mapped = mapExtractedFieldsToZohoBill(
       extracted as ExtractedFieldsRow,
@@ -813,7 +875,10 @@ Deno.serve(async (req) => {
         createBody = {
           customer_id: input.customer_id.trim(),
           date: mapped.date,
-          reference_number: referenceNumber,
+          // Zoho owns the sales-invoice numbering sequence, so the
+          // document's own number goes to reference_number (kept
+          // searchable) rather than fighting invoice_number.
+          reference_number: mapped.invoice_number || referenceNumber,
           ...(mapped.due_date ? { due_date: mapped.due_date } : {}),
           ...(input.tax_treatment?.trim()
             ? { tax_treatment: input.tax_treatment.trim() }
@@ -835,6 +900,8 @@ Deno.serve(async (req) => {
               ...(li.account_id ?? invoiceAccountId
                 ? { account_id: li.account_id ?? invoiceAccountId }
                 : {}),
+              ...(li.project_id ? { project_id: li.project_id } : {}),
+              ...(li.tags?.length ? { tags: li.tags } : {}),
             }))
             : [
               {
@@ -1090,6 +1157,12 @@ Deno.serve(async (req) => {
             : {}),
           ...(mapped.line_items[i]?.tax_id
             ? { tax_id: mapped.line_items[i].tax_id }
+            : {}),
+          ...(mapped.line_items[i]?.project_id
+            ? { project_id: mapped.line_items[i].project_id }
+            : {}),
+          ...(mapped.line_items[i]?.tags?.length
+            ? { tags: mapped.line_items[i].tags }
             : {}),
         })),
       },

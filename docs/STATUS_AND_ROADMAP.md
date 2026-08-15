@@ -140,3 +140,4 @@ That validates the **review + database** path. Extraction and Zoho push need API
 
 - [`BUILD_PLAN.md`](./BUILD_PLAN.md) — product definition and strict build order
 - [`rules-registry.md`](./rules-registry.md) — judgment rules (fill as each rule is written)
+- [`BOOKKEEPING_PATTERNS_SPEC.md`](./BOOKKEEPING_PATTERNS_SPEC.md) — proposed: learn a customer's bookkeeping conventions from Zoho history at onboarding (party→account, recurrence, attachments, numbering) and surface them as suggestions

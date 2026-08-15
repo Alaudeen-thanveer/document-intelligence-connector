@@ -231,25 +231,63 @@ async function fetchKind(
     // Note: the older `settings/tags` endpoint is retired (400 "no longer
     // available", verified on the .in DC); `reportingtags` returns { tags: [] }.
     const tags = await fetchAllPages(accessToken, "reportingtags", "tags");
-    return tags
-      .map((t) => ({
-        kind: "reporting_tag" as const,
-        zoho_id: String(t.tag_id ?? ""),
-        name: String(t.tag_name ?? ""),
+    // The list view carries no options; they live on the detail endpoint.
+    // Options are what a bill/invoice line actually gets tagged with, so
+    // fetch each tag's detail (tags are few — a handful per org).
+    const rows: EntityRow[] = [];
+    for (const t of tags) {
+      const id = String(t.tag_id ?? "");
+      const name = String(t.tag_name ?? "");
+      if (!id || !name) continue;
+      let options: Array<{ id: string | null; name: string | null }> = [];
+      // Zoho: a tag is applied per line item or once per transaction.
+      // Default to line_item; the detail endpoint says which.
+      let preference: "line_item" | "transaction" = "line_item";
+      let isDraft: unknown = t.is_draft ?? null;
+      try {
+        const detailUrl = `${apiBase()}/reportingtags/${id}?organization_id=${
+          encodeURIComponent(orgId())
+        }`;
+        const res = await fetch(detailUrl, {
+          headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+        });
+        const raw = await res.json();
+        const tag = (raw as { tag?: Record<string, unknown> })?.tag ?? {};
+        const pref = (tag.multi_preference_entities as
+          | { preference?: unknown }
+          | undefined)?.preference;
+        if (pref === "transaction") preference = "transaction";
+        if (tag.is_draft != null) isDraft = tag.is_draft;
+        const opts = (tag.tag_options ?? t.tag_options) as
+          | Array<Record<string, unknown>>
+          | undefined;
+        options = Array.isArray(opts)
+          ? opts.map((o) => ({
+            id: o.tag_option_id != null ? String(o.tag_option_id) : null,
+            name: o.tag_option_name != null ? String(o.tag_option_name) : null,
+          }))
+          : [];
+      } catch (err) {
+        console.warn(
+          `reporting tag ${id} detail failed:`,
+          err instanceof Error ? err.message : String(err),
+        );
+      }
+      rows.push({
+        kind: "reporting_tag",
+        zoho_id: id,
+        name,
         extra: {
           is_active: t.is_active ?? null,
-          // Tag options are what a bill/invoice line actually gets tagged with.
-          options: Array.isArray(t.tag_options)
-            ? (t.tag_options as Array<Record<string, unknown>>).map((o) => ({
-                id: o.tag_option_id != null ? String(o.tag_option_id) : null,
-                name: o.tag_option_name != null
-                  ? String(o.tag_option_name)
-                  : null,
-              }))
-            : [],
+          is_draft: isDraft,
+          // "line_item" → one value per line; "transaction" → one value for
+          // the whole document, applied uniformly to every line on push.
+          preference,
+          options,
         },
-      }))
-      .filter((r) => r.zoho_id && r.name);
+      });
+    }
+    return rows;
   }
 
   if (kind === "currency") {

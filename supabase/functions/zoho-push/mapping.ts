@@ -36,6 +36,10 @@ export interface ExtractedLineItemRow {
   amount: number | string | null;
   account_zoho_id?: string | null;
   tax_zoho_id?: string | null;
+  /** Zoho project this line is booked to. */
+  project_zoho_id?: string | null;
+  /** Reporting tags: [{tag_id, tag_option_id}]. */
+  reporting_tags?: Array<{ tag_id: string; tag_option_id: string }> | null;
 }
 
 /** Zoho Books Bill line item (create bill). */
@@ -47,6 +51,10 @@ export interface ZohoBillLineItem {
   account_id?: string;
   /** Per-line tax; resolved at push time. */
   tax_id?: string;
+  /** Zoho project_id for this line. */
+  project_id?: string;
+  /** Zoho reporting tags for this line. */
+  tags?: Array<{ tag_id: string; tag_option_id: string }>;
 }
 
 /**
@@ -161,6 +169,14 @@ export function mapExtractedFieldsToZohoBill(
         quantity: qty,
         ...(li.account_zoho_id ? { account_id: li.account_zoho_id } : {}),
         ...(li.tax_zoho_id ? { tax_id: li.tax_zoho_id } : {}),
+        ...(li.project_zoho_id ? { project_id: li.project_zoho_id } : {}),
+        ...(Array.isArray(li.reporting_tags) && li.reporting_tags.length > 0
+          ? {
+            tags: li.reporting_tags
+              .filter((t) => t && t.tag_id && t.tag_option_id)
+              .map((t) => ({ tag_id: t.tag_id, tag_option_id: t.tag_option_id })),
+          }
+          : {}),
       };
     })
     .filter((li): li is ZohoBillLineItem => li !== null);

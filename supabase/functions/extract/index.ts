@@ -19,7 +19,7 @@ const MINDEE_V2_JOB_URL = "https://api-v2.mindee.net/v2/jobs";
 type ExtractableField = "vendor_raw" | "total_amount" | "invoice_date";
 /** Fields that fall back to Gemini only when OCR found no value at all —
  * they skip the confidence threshold so they add no cost when OCR reads them. */
-type PresenceField = "currency" | "tax_amount" | "invoice_number" | "due_date";
+type PresenceField = "currency" | "tax_amount" | "invoice_number" | "due_date" | "customer_raw";
 
 interface ExtractedLine {
   description: string | null;
@@ -53,6 +53,7 @@ interface ExtractionResult {
   tax_amount: FieldValue;
   invoice_number: FieldValue;
   due_date: FieldValue;
+  customer_raw: FieldValue;
   line_items: ExtractedLine[];
   raw_ocr_json: unknown;
   ai_fallback_used: boolean;
@@ -404,6 +405,7 @@ function mapMindeeToFields(
   | "tax_amount"
   | "invoice_number"
   | "due_date"
+  | "customer_raw"
   | "line_items"
 > {
   const supplier = pickField(prediction, [
@@ -471,6 +473,11 @@ function mapMindeeToFields(
         source: "mindee" as const,
       };
     })(),
+    customer_raw: (() => {
+      const v = pickField(prediction, ["customer_name", "bill_to", "customer"]);
+      const sv = v.value != null ? String(v.value).trim() : null;
+      return { value: sv || null, confidence: sv ? 1 : 0, source: "mindee" as const };
+    })(),
     line_items: mindeeLineItems(prediction),
   };
 }
@@ -515,6 +522,7 @@ async function applyFieldFallbacks(
     | "tax_amount"
     | "invoice_number"
     | "due_date"
+    | "customer_raw"
     | "line_items"
   >,
   threshold: number,
@@ -575,6 +583,7 @@ async function applyFieldFallbacks(
     "tax_amount",
     "invoice_number",
     "due_date",
+    "customer_raw",
   ];
   for (const field of presenceTargets) {
     const current = result[field];
@@ -671,6 +680,9 @@ async function persistExtraction(
       ? String(extraction.invoice_number.value)
       : null,
     due_date: asDateString(extraction.due_date.value),
+    customer_raw: extraction.customer_raw.value != null
+      ? String(extraction.customer_raw.value)
+      : null,
     confidence_scores: confidenceScores,
     raw_ocr_json: extraction.raw_ocr_json,
     ai_fallback_used: extraction.ai_fallback_used,
@@ -867,6 +879,7 @@ Deno.serve(async (req) => {
           tax_amount: extraction.tax_amount.value,
           invoice_number: extraction.invoice_number.value,
           due_date: extraction.due_date.value,
+          customer_raw: extraction.customer_raw.value,
           line_items: extraction.line_items,
         },
         warnings,
