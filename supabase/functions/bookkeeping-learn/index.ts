@@ -16,6 +16,7 @@ import {
   isProposable,
 } from "./analyze.ts";
 import { classifyRhythm, proposeChecks } from "./recurrence.ts";
+import { learnAttachmentConvention } from "./attachments.ts";
 
 interface LearnInput {
   company_id?: string;
@@ -215,6 +216,12 @@ function toHistoryDoc(
       : null,
     has_po: hasPo,
     line_items: lines,
+    documents: ((doc.documents as Array<Record<string, unknown>>) ?? []).map(
+      (d) => ({
+        file_name: d.file_name != null ? String(d.file_name) : null,
+        file_type: d.file_type != null ? String(d.file_type) : null,
+      }),
+    ),
   };
 }
 
@@ -338,6 +345,7 @@ Deno.serve(async (req) => {
     }
     let rhythmsWritten = 0;
     let checksProposed = 0;
+    let attachmentsWritten = 0;
     const cadenceSummary: Record<string, number> = {};
     for (const [key, list] of byParty) {
       const party_kind = key.startsWith("vendor:") ? "vendor" : "customer";
@@ -355,6 +363,55 @@ Deno.serve(async (req) => {
         computed_at: new Date().toISOString(),
       }, { onConflict: "company_id,party_kind,party_zoho_id" });
       if (!rErr) rhythmsWritten++;
+
+      // Layer 3: attachment convention (bills only — invoices are outbound).
+      if (party_kind === "vendor") {
+        const conv = learnAttachmentConvention(
+          list.map((d) => ({ documents: d.documents ?? [] })),
+        );
+        await supabase.from("bk_attachment_conventions").upsert({
+          company_id: companyId,
+          party_kind,
+          party_zoho_id: list[0].party_zoho_id,
+          party_name: partyName,
+          ...conv,
+          computed_at: new Date().toISOString(),
+        }, { onConflict: "company_id,party_kind,party_zoho_id" });
+        attachmentsWritten++;
+        // Only propose when there is enough history to say something.
+        if (conv.sample_size >= 3 && conv.proposed_strictness !== "standard") {
+          const { data: existing } = await supabase
+            .from("bk_check_proposals")
+            .select("status")
+            .eq("company_id", companyId)
+            .eq("party_kind", party_kind)
+            .eq("party_zoho_id", list[0].party_zoho_id)
+            .eq("check_kind", "supporting_document_strictness")
+            .maybeSingle();
+          const keep = existing?.status && existing.status !== "proposed"
+            ? existing.status
+            : "proposed";
+          const { error: aErr } = await supabase.from("bk_check_proposals")
+            .upsert({
+              company_id: companyId,
+              party_kind,
+              party_zoho_id: list[0].party_zoho_id,
+              party_name: partyName,
+              check_kind: "supporting_document_strictness",
+              rationale: conv.rationale,
+              params: {
+                strictness: conv.proposed_strictness,
+                count_mode: conv.count_mode,
+                recurring_name_tokens: conv.recurring_name_tokens,
+              },
+              status: keep,
+              computed_at: new Date().toISOString(),
+            }, {
+              onConflict: "company_id,party_kind,party_zoho_id,check_kind",
+            });
+          if (!aErr) checksProposed++;
+        }
+      }
 
       for (const c of proposeChecks(rhythm)) {
         const { data: existing } = await supabase
@@ -406,6 +463,7 @@ Deno.serve(async (req) => {
       proposable: profiles.filter(isProposable).length,
       rhythms_written: rhythmsWritten,
       cadences: cadenceSummary,
+      attachment_conventions_written: attachmentsWritten,
       checks_proposed: checksProposed,
       profiles: profiles.map((p) => ({
         party_kind: p.party_kind,

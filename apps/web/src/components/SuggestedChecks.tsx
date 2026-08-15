@@ -15,7 +15,11 @@ interface ProposalRow {
   party_kind: "vendor" | "customer";
   party_zoho_id: string;
   party_name: string;
-  check_kind: "recurring_twice_in_period" | "amount_anomaly" | "expected_missing";
+  check_kind:
+    | "recurring_twice_in_period"
+    | "amount_anomaly"
+    | "expected_missing"
+    | "supporting_document_strictness";
   rationale: string;
   params: Record<string, unknown>;
   status: "proposed" | "enabled" | "dismissed" | "stale";
@@ -38,6 +42,7 @@ const KIND_LABEL: Record<ProposalRow["check_kind"], string> = {
   recurring_twice_in_period: "Twice in one month",
   amount_anomaly: "Amount out of range",
   expected_missing: "Expected but missing",
+  supporting_document_strictness: "Supporting document strictness",
 };
 
 const CADENCE_LABEL: Record<string, string> = {
@@ -154,7 +159,13 @@ export function SuggestedChecks({ kind, reviewerName }: Props) {
                 {list.map((p) => (
                   <div key={p.id} className="suggested-check-row">
                     <div>
-                      <strong>{KIND_LABEL[p.check_kind]}</strong>
+                      <strong>
+                        {KIND_LABEL[p.check_kind]}
+                        {p.check_kind === "supporting_document_strictness" &&
+                          typeof p.params.strictness === "string" && (
+                          <> → {p.params.strictness}</>
+                        )}
+                      </strong>
                       <span className="muted"> — {p.rationale}</span>
                     </div>
                     <span className="rule-actions">

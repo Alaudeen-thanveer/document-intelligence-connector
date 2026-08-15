@@ -24,6 +24,8 @@ export interface HistoryDoc {
     account_name: string | null;
     amount: number;
   }>;
+  /** Files attached to the document in Zoho (layer 3). */
+  documents?: Array<{ file_name: string | null; file_type: string | null }>;
 }
 
 export interface AccountSplitEntry {
