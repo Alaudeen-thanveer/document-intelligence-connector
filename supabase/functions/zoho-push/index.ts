@@ -815,7 +815,10 @@ Deno.serve(async (req) => {
         createBody = {
           customer_id: input.customer_id.trim(),
           date: mapped.date,
-          reference_number: referenceNumber,
+          // Zoho owns the sales-invoice numbering sequence, so the
+          // document's own number goes to reference_number (kept
+          // searchable) rather than fighting invoice_number.
+          reference_number: mapped.invoice_number || referenceNumber,
           ...(mapped.due_date ? { due_date: mapped.due_date } : {}),
           ...(input.tax_treatment?.trim()
             ? { tax_treatment: input.tax_treatment.trim() }

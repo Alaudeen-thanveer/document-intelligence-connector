@@ -11,7 +11,8 @@ export type ExtractableField =
   | "currency"
   | "tax_amount"
   | "invoice_number"
-  | "due_date";
+  | "due_date"
+  | "customer_raw";
 
 /** One invoice line as Gemini reports it (all fields nullable). */
 export interface GeminiLineItem {
@@ -133,6 +134,8 @@ const FIELD_INSTRUCTIONS: Record<ExtractableField, string> = {
     'Extract only the invoice/bill number as printed on the document (e.g. INV-2210). Return JSON only: {"value": string|null, "confidence": number between 0 and 1}',
   due_date:
     'Extract only the payment due date as YYYY-MM-DD. If no due date is printed, return null. Return JSON only: {"value": string|null, "confidence": number between 0 and 1}',
+  customer_raw:
+    'Extract only the BILL-TO / customer name — the party this invoice is addressed to, NOT the issuer. If there is no bill-to party, return null. Return JSON only: {"value": string|null, "confidence": number between 0 and 1}',
 };
 
 export async function reExtractFieldWithGemini(

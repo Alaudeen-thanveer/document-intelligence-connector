@@ -149,14 +149,27 @@ export function ReviewPanel({
   // customer match → Invoice.
   useEffect(() => {
     const name = vendorRaw.trim();
-    if (!name) {
+    // Sales invoices name two parties: the issuer (vendor_raw — us) and the
+    // bill-to (customer_raw). Match the customer from the bill-to first.
+    const billTo = (extracted?.customer_raw ?? "").trim();
+    if (!name && !billTo) {
       setMatchHint(null);
       return;
     }
-    const vendorHit = findByName(name, zoho.vendors, (v) => v.name);
-    const customerHit = findByName(name, zoho.customers, (c) => c.name);
+    const vendorHit = name ? findByName(name, zoho.vendors, (v) => v.name) : null;
+    const customerHit =
+      (billTo ? findByName(billTo, zoho.customers, (c) => c.name) : null) ??
+      (name ? findByName(name, zoho.customers, (c) => c.name) : null);
 
-    if (vendorHit) {
+    // A bill-to that matches a customer outranks the issuer matching a vendor:
+    // that combination means this is OUR sales invoice, not a purchase bill.
+    if (customerHit && billTo) {
+      setCustomerId((prev) => prev || customerHit.zoho_id);
+      if (!postAsTouched) setPostAs("invoice");
+      setMatchHint(
+        `Bill-to matched Zoho customer "${customerHit.name}" — auto-selected Invoice.`,
+      );
+    } else if (vendorHit) {
       setVendorId((prev) => prev || vendorHit.zoho_id);
       if (!postAsTouched) setPostAs("bill");
       setMatchHint(
@@ -175,7 +188,7 @@ export function ReviewPanel({
     } else {
       setMatchHint(null);
     }
-  }, [vendorRaw, zoho.vendors, zoho.customers, postAsTouched, document?.id]);
+  }, [vendorRaw, extracted?.customer_raw, zoho.vendors, zoho.customers, postAsTouched, document?.id]);
 
   // Prefill each line's project and tags from the chosen party's ACCEPTED
   // learned profiles (bk_party_project_profiles / bk_party_tag_profiles).
