@@ -5,6 +5,7 @@ import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import {
   mapExtractedFieldsToZohoBill,
   type ExtractedFieldsRow,
+  type ExtractedLineItemRow,
   type ZohoBillMapped,
 } from "./mapping.ts";
 import {
@@ -21,6 +22,23 @@ interface PushInput {
   vendors?: ZohoVendor[];
   /** Cached chart of accounts; falls back to ZOHO_ACCOUNTS_JSON env or live API. */
   accounts?: ZohoAccount[];
+  /** How to post into Zoho Books; defaults to "bill". */
+  post_as?: "bill" | "invoice" | "expense";
+  /** Explicit Zoho vendor contact id chosen in the review UI (bill/expense). */
+  vendor_id?: string | null;
+  /** Explicit Zoho customer contact id chosen in the review UI (invoice). */
+  customer_id?: string | null;
+  /** Explicit GL account id chosen in the review UI. */
+  account_id?: string | null;
+  /** Bank/cash account the expense was paid through (expense only). */
+  paid_through_account_id?: string | null;
+  /**
+   * VAT treatment for THIS transaction (e.g. vat_registered, out_of_scope).
+   * Treatment is transactional, not just party-level — a VAT-registered
+   * vendor can still have an out-of-scope bill. When omitted, Zoho applies
+   * the contact's own default treatment.
+   */
+  tax_treatment?: string | null;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -45,6 +63,99 @@ function getSupabase(): SupabaseClient {
   return createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
+}
+
+interface DefaultAccountRule {
+  account_zoho_id: string;
+  account_name: string;
+}
+
+/**
+ * Per-party default account rule ("if vendor/customer is X, post to
+ * account Y"). Returns null when no rule exists — there is deliberately
+ * no global default account.
+ */
+async function lookupDefaultAccountRule(
+  supabase: SupabaseClient,
+  table: "vendor_account_rules" | "customer_account_rules",
+  idColumn: "vendor_zoho_id" | "customer_zoho_id",
+  entityZohoId: string,
+): Promise<DefaultAccountRule | null> {
+  const { data, error } = await supabase
+    .from(table)
+    .select("account_zoho_id, account_name")
+    .eq(idColumn, entityZohoId)
+    .maybeSingle();
+  if (error) {
+    console.log(`${table} lookup failed: ${error.message}`);
+    return null;
+  }
+  return (data as DefaultAccountRule | null) ?? null;
+}
+
+/**
+ * Resolve the document's currency code and VAT amount against the synced
+ * zoho_entities cache. VAT sits in Zoho's tax field, never inside the line
+ * amount: when a tax rate matches, the line becomes the NET amount plus a
+ * tax_id, so Zoho recomputes the same gross total the invoice shows.
+ */
+async function resolveCurrencyAndTax(
+  supabase: SupabaseClient,
+  currencyCode: string | null | undefined,
+  grossAmount: number,
+  taxAmount: number | null | undefined,
+): Promise<{
+  currencyId: string | null;
+  taxId: string | null;
+  taxName: string | null;
+  netRate: number | null;
+  notes: string[];
+}> {
+  const notes: string[] = [];
+  let currencyId: string | null = null;
+  let taxId: string | null = null;
+  let taxName: string | null = null;
+  let netRate: number | null = null;
+
+  if (currencyCode) {
+    const { data } = await supabase
+      .from("zoho_entities")
+      .select("zoho_id")
+      .eq("kind", "currency")
+      .eq("name", currencyCode)
+      .maybeSingle();
+    if (data?.zoho_id) {
+      currencyId = String(data.zoho_id);
+    } else {
+      notes.push(
+        `currency ${currencyCode} not in synced Zoho currencies — Zoho default applies`,
+      );
+    }
+  }
+
+  if (taxAmount != null && taxAmount >= 0 && grossAmount > taxAmount) {
+    const net = grossAmount - taxAmount;
+    const pct = (taxAmount / net) * 100;
+    const { data: taxes } = await supabase
+      .from("zoho_entities")
+      .select("zoho_id, name, extra")
+      .eq("kind", "tax");
+    const match = (taxes ?? []).find((t) => {
+      const p = Number((t.extra as { percentage?: unknown })?.percentage);
+      return Number.isFinite(p) && Math.abs(p - pct) <= 0.5;
+    });
+    if (match) {
+      taxId = String(match.zoho_id);
+      taxName = String(match.name);
+      netRate = Math.round(net * 100) / 100;
+    } else {
+      notes.push(
+        `VAT ${taxAmount} on ${grossAmount} (~${pct.toFixed(1)}%) matches no synced Zoho tax rate — posted gross without tax_id`,
+      );
+    }
+  }
+
+  return { currencyId, taxId, taxName, netRate, notes };
 }
 
 function parseJsonEnv<T>(name: string): T | null {
@@ -90,6 +201,7 @@ function toZohoBillBody(
     vendor_id: bill.vendor_id,
     bill_number: billNumber,
     date: bill.date,
+    ...(bill.due_date ? { due_date: bill.due_date } : {}),
     ...(bill.reference_number
       ? { reference_number: bill.reference_number }
       : {}),
@@ -98,8 +210,31 @@ function toZohoBillBody(
       rate: item.rate,
       quantity: item.quantity,
       account_id: item.account_id,
+      ...(item.tax_id ? { tax_id: item.tax_id } : {}),
     })),
   };
+}
+
+/** Find an existing bill by number + vendor (for idempotent creates). */
+async function findBillByNumber(
+  accessToken: string,
+  billNumber: string,
+  vendorId: string,
+): Promise<ZohoCallResult> {
+  const url = `${apiBase()}/bills?organization_id=${
+    encodeURIComponent(orgId())
+  }&bill_number=${encodeURIComponent(billNumber)}&vendor_id=${
+    encodeURIComponent(vendorId)
+  }`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+  });
+  const raw = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, status: res.status, raw };
+  const bill = (raw as { bills?: Array<{ bill_id?: unknown }> })?.bills?.[0];
+  return bill?.bill_id
+    ? { ok: true, status: 200, raw: String(bill.bill_id) }
+    : { ok: false, status: 404, raw: null };
 }
 
 /** Exchange refresh token for a new access token (OAuth2). */
@@ -129,12 +264,57 @@ async function refreshAccessToken(): Promise<string> {
       `Zoho token refresh failed (${res.status}): ${JSON.stringify(payload)}`,
     );
   }
-  return String(payload.access_token);
+  const token = String(payload.access_token);
+  await cacheAccessToken(token);
+  return token;
+}
+
+/** Best-effort write-through of the token cache (service-role only table). */
+async function cacheAccessToken(token: string): Promise<void> {
+  try {
+    const supabase = getSupabase();
+    await supabase.from("zoho_oauth_tokens").upsert({
+      id: 1,
+      access_token: token,
+      // Zoho tokens last ~1h; refresh a little early.
+      expires_at: new Date(Date.now() + 55 * 60_000).toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.warn(
+      "zoho_oauth_tokens cache write failed:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
+/** Cached token when still valid — Zoho throttles the refresh endpoint
+ * hard, and a refresh per function call locks the connection out. */
+async function readCachedAccessToken(): Promise<string | null> {
+  try {
+    const supabase = getSupabase();
+    const { data } = await supabase
+      .from("zoho_oauth_tokens")
+      .select("access_token, expires_at")
+      .eq("id", 1)
+      .maybeSingle();
+    if (
+      data?.access_token &&
+      new Date(String(data.expires_at)).getTime() > Date.now() + 120_000
+    ) {
+      return String(data.access_token);
+    }
+  } catch {
+    // Cache is an optimization only.
+  }
+  return null;
 }
 
 async function getAccessToken(): Promise<string> {
   const existing = Deno.env.get("ZOHO_ACCESS_TOKEN")?.trim();
   if (existing) return existing;
+  const cached = await readCachedAccessToken();
+  if (cached) return cached;
   return await refreshAccessToken();
 }
 
@@ -248,6 +428,70 @@ async function getZohoBill(
   return { ok: res.ok, status: res.status, raw };
 }
 
+/** Create an invoice or expense in Zoho Books; extracts the created doc id. */
+async function createZohoDoc(
+  accessToken: string,
+  path: "invoices" | "expenses",
+  body: Record<string, unknown>,
+  rootKey: "invoice" | "expense",
+  idKey: "invoice_id" | "expense_id",
+): Promise<ZohoCallResult & { externalDocId?: string }> {
+  const url = `${apiBase()}/${path}?organization_id=${
+    encodeURIComponent(orgId())
+  }`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Zoho-oauthtoken ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const raw = await res.json().catch(async () => await res.text());
+  if (!res.ok) {
+    return { ok: false, status: res.status, raw };
+  }
+
+  const root = (raw as Record<string, unknown>)?.[rootKey] as
+    | Record<string, unknown>
+    | undefined;
+  const id = root?.[idKey];
+  return {
+    ok: true,
+    status: res.status,
+    externalDocId: id != null ? String(id) : undefined,
+    raw,
+  };
+}
+
+/** Attach the source file to an invoice (attachment) or expense (receipt). */
+async function attachToZohoDoc(
+  accessToken: string,
+  urlPath: string,
+  fieldName: "attachment" | "receipt",
+  bytes: Uint8Array,
+  contentType: string,
+  filename: string,
+): Promise<ZohoCallResult> {
+  const form = new FormData();
+  form.append(
+    fieldName,
+    new Blob([bytes], { type: contentType || "application/pdf" }),
+    filename || "document.pdf",
+  );
+  const url = `${apiBase()}/${urlPath}?organization_id=${
+    encodeURIComponent(orgId())
+  }`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    body: form,
+  });
+  const raw = await res.json().catch(async () => await res.text());
+  return { ok: res.ok, status: res.status, raw };
+}
+
 async function fetchVendorsFromZoho(
   accessToken: string,
 ): Promise<ZohoVendor[]> {
@@ -293,42 +537,6 @@ async function fetchAccountsFromZoho(
   })).filter((a) => a.account_id && a.account_name);
 }
 
-async function ensureVendorInZoho(
-  accessToken: string,
-  vendorName: string,
-): Promise<ZohoVendor> {
-  const body = {
-    contact_name: vendorName,
-    contact_type: "vendor",
-  };
-  const url =
-    `${apiBase()}/contacts?organization_id=${encodeURIComponent(orgId())}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Zoho-oauthtoken ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  const raw = await res.json();
-  if (!res.ok) {
-    // Duplicate name — re-fetch list and match.
-    const vendors = await fetchVendorsFromZoho(accessToken);
-    const hit = vendors.find((v) =>
-      v.vendor_name.trim().toLowerCase() === vendorName.trim().toLowerCase()
-    );
-    if (hit) return hit;
-    throw new Error(
-      `Zoho vendor create failed (${res.status}): ${JSON.stringify(raw)}`,
-    );
-  }
-  const contact = (raw as { contact?: Record<string, unknown> })?.contact;
-  return {
-    vendor_id: String(contact?.contact_id ?? ""),
-    vendor_name: String(contact?.contact_name ?? vendorName),
-  };
-}
 
 async function loadDocumentBytes(
   supabase: SupabaseClient,
@@ -495,7 +703,7 @@ Deno.serve(async (req) => {
     const { data: extracted, error: extractedError } = await supabase
       .from("extracted_fields")
       .select(
-        "id, document_id, doc_type, vendor_raw, total_amount, invoice_date, confidence_scores, raw_ocr_json, ai_fallback_used",
+        "id, document_id, doc_type, vendor_raw, total_amount, invoice_date, currency, tax_amount, invoice_number, due_date, confidence_scores, raw_ocr_json, ai_fallback_used",
       )
       .eq("document_id", input.document_id)
       .order("id", { ascending: false })
@@ -535,6 +743,266 @@ Deno.serve(async (req) => {
       );
     }
 
+    const postAs: "bill" | "invoice" | "expense" = input.post_as ?? "bill";
+    // Reviewer-curated line items (with per-line accounts) when present.
+    const { data: lineRowsData } = await supabase
+      .from("extracted_line_items")
+      .select(
+        "line_no, description, quantity, rate, amount, account_zoho_id, tax_zoho_id",
+      )
+      .eq("extracted_fields_id", (extracted as { id: string }).id)
+      .order("line_no");
+    const lineRows = (lineRowsData ?? []) as ExtractedLineItemRow[];
+    const hasRealLines = lineRows.length > 0;
+
+    const mapped = mapExtractedFieldsToZohoBill(
+      extracted as ExtractedFieldsRow,
+      lineRows,
+    );
+    const grossTotal = Number(
+      String((extracted as ExtractedFieldsRow).total_amount).replace(/,/g, ""),
+    );
+    const referenceNumber = `DIC-${
+      input.document_id.replace(/-/g, "").slice(0, 12)
+    }`;
+
+    // ------------------------------------------------------------------
+    // Invoice / expense paths: entity ids come from the review UI, so no
+    // fuzzy matching or cache loading is needed.
+    // ------------------------------------------------------------------
+    if (postAs === "invoice" || postAs === "expense") {
+      let createBody: Record<string, unknown>;
+      let path: "invoices" | "expenses";
+      let rootKey: "invoice" | "expense";
+      let idKey: "invoice_id" | "expense_id";
+
+      if (postAs === "invoice") {
+        if (!input.customer_id?.trim()) {
+          return jsonResponse(
+            {
+              ok: false,
+              skipped: true,
+              reason: "customer_required",
+              error: "Select the Zoho customer this invoice belongs to.",
+              document_id: input.document_id,
+            },
+            400,
+          );
+        }
+        // Income account: explicit UI choice, else this customer's default
+        // rule; otherwise Zoho's own income account default applies.
+        let invoiceAccountId = input.account_id?.trim() || null;
+        if (!invoiceAccountId) {
+          const rule = await lookupDefaultAccountRule(
+            supabase,
+            "customer_account_rules",
+            "customer_zoho_id",
+            input.customer_id.trim(),
+          );
+          if (rule) invoiceAccountId = rule.account_zoho_id;
+        }
+        path = "invoices";
+        rootKey = "invoice";
+        idKey = "invoice_id";
+        const invoiceMoney = await resolveCurrencyAndTax(
+          supabase,
+          mapped.currency,
+          grossTotal,
+          mapped.tax_amount,
+        );
+        createBody = {
+          customer_id: input.customer_id.trim(),
+          date: mapped.date,
+          reference_number: referenceNumber,
+          ...(mapped.due_date ? { due_date: mapped.due_date } : {}),
+          ...(input.tax_treatment?.trim()
+            ? { tax_treatment: input.tax_treatment.trim() }
+            : {}),
+          ...(invoiceMoney.currencyId
+            ? { currency_id: invoiceMoney.currencyId }
+            : {}),
+          // Real extracted lines when present (each with its own account /
+          // tax, falling back to the transaction-level choices); else one
+          // implicit line — net + tax_id when VAT matched, else the gross.
+          line_items: hasRealLines
+            ? mapped.line_items.map((li) => ({
+              description: li.description,
+              rate: li.rate,
+              quantity: li.quantity,
+              ...(li.tax_id ?? invoiceMoney.taxId
+                ? { tax_id: li.tax_id ?? invoiceMoney.taxId }
+                : {}),
+              ...(li.account_id ?? invoiceAccountId
+                ? { account_id: li.account_id ?? invoiceAccountId }
+                : {}),
+            }))
+            : [
+              {
+                description: mapped.vendor_name
+                  ? `Invoice — ${mapped.vendor_name}`
+                  : "Imported invoice",
+                rate: invoiceMoney.taxId && invoiceMoney.netRate != null
+                  ? invoiceMoney.netRate
+                  : mapped.line_items[0].rate,
+                quantity: 1,
+                ...(invoiceMoney.taxId ? { tax_id: invoiceMoney.taxId } : {}),
+                ...(invoiceAccountId ? { account_id: invoiceAccountId } : {}),
+              },
+            ],
+        };
+      } else {
+        // Account: explicit UI choice, else this vendor's default rule.
+        // No global default account.
+        let expenseAccountId = input.account_id?.trim() || null;
+        if (!expenseAccountId && input.vendor_id?.trim()) {
+          const rule = await lookupDefaultAccountRule(
+            supabase,
+            "vendor_account_rules",
+            "vendor_zoho_id",
+            input.vendor_id.trim(),
+          );
+          if (rule) expenseAccountId = rule.account_zoho_id;
+        }
+        if (!expenseAccountId) {
+          return jsonResponse(
+            {
+              ok: false,
+              skipped: true,
+              reason: "account_required",
+              error:
+                "Select the expense account, or save a default account rule for this vendor.",
+              document_id: input.document_id,
+            },
+            400,
+          );
+        }
+        const paidThrough = input.paid_through_account_id?.trim() ||
+          Deno.env.get("ZOHO_PAID_THROUGH_ACCOUNT_ID")?.trim();
+        if (!paidThrough) {
+          return jsonResponse(
+            {
+              ok: false,
+              skipped: true,
+              reason: "paid_through_required",
+              error:
+                "Select the bank/cash account this expense was paid through.",
+              document_id: input.document_id,
+            },
+            400,
+          );
+        }
+        path = "expenses";
+        rootKey = "expense";
+        idKey = "expense_id";
+        createBody = {
+          account_id: expenseAccountId,
+          paid_through_account_id: paidThrough,
+          date: mapped.date,
+          amount: mapped.line_items[0].rate,
+          reference_number: referenceNumber,
+          ...(input.tax_treatment?.trim()
+            ? { tax_treatment: input.tax_treatment.trim() }
+            : {}),
+          description: mapped.vendor_name
+            ? `Expense — ${mapped.vendor_name}`
+            : "Imported expense",
+          ...(input.vendor_id?.trim()
+            ? { vendor_id: input.vendor_id.trim() }
+            : {}),
+        };
+      }
+
+      const { result: createResult, retried: createRetried } =
+        await withZohoRetry((tok) =>
+          createZohoDoc(tok, path, createBody, rootKey, idKey)
+        );
+
+      if (
+        !createResult.ok || !("externalDocId" in createResult) ||
+        !createResult.externalDocId
+      ) {
+        throw new Error(
+          `Zoho ${rootKey} create failed (${createResult.status}): ${
+            JSON.stringify(createResult.raw)
+          }`,
+        );
+      }
+      const externalDocId =
+        (createResult as { externalDocId: string }).externalDocId;
+
+      // Record the sync before the attachment upload so a failed upload
+      // cannot lead to a duplicate document on re-push.
+      const { data: syncRow, error: syncError } = await supabase
+        .from("erp_sync_log")
+        .insert({
+          document_id: input.document_id,
+          source_type: "push",
+          erp_name: "zoho_books",
+          external_doc_id: externalDocId,
+          judgment_result_id: judgmentResultId,
+        })
+        .select("id")
+        .single();
+      if (syncError) {
+        throw new Error(`erp_sync_log insert failed: ${syncError.message}`);
+      }
+
+      await supabase
+        .from("documents")
+        .update({ status: "synced" })
+        .eq("id", input.document_id);
+
+      // Best-effort attachment; the Zoho document already exists either way.
+      let attachOk = false;
+      let attachRaw: unknown = null;
+      let filename = "";
+      try {
+        const file = await loadDocumentBytes(supabase, doc.file_url as string);
+        filename = file.filename;
+        const attachPath = postAs === "invoice"
+          ? `invoices/${encodeURIComponent(externalDocId)}/attachment`
+          : `expenses/${encodeURIComponent(externalDocId)}/receipt`;
+        const { result: attachResult } = await withZohoRetry((tok) =>
+          attachToZohoDoc(
+            tok,
+            attachPath,
+            postAs === "invoice" ? "attachment" : "receipt",
+            file.bytes,
+            file.contentType,
+            file.filename,
+          )
+        );
+        attachOk = attachResult.ok;
+        attachRaw = attachResult.raw;
+      } catch (attachErr) {
+        attachRaw = {
+          error: attachErr instanceof Error
+            ? attachErr.message
+            : String(attachErr),
+        };
+      }
+
+      return jsonResponse({
+        ok: true,
+        post_as: postAs,
+        document_id: input.document_id,
+        external_doc_id: externalDocId,
+        erp_sync_log_id: syncRow.id,
+        sandbox_organization_id: orgId(),
+        retried: createRetried,
+        attachment: {
+          uploaded: attachOk,
+          filename,
+          attach_response: attachRaw,
+        },
+        [postAs === "invoice" ? "zoho_invoice" : "zoho_expense"]:
+          createResult.raw,
+      });
+    }
+
+    // ------------------------------------------------------------------
+    // Bill path (default) — fuzzy matching with optional UI overrides.
+    // ------------------------------------------------------------------
     let accessToken = await getAccessToken();
     let vendors =
       input.vendors ??
@@ -545,19 +1013,15 @@ Deno.serve(async (req) => {
       parseJsonEnv<ZohoAccount[]>("ZOHO_ACCOUNTS_JSON") ??
       [];
 
-    const expenseCategory = input.expense_category ??
-      Deno.env.get("ZOHO_EXPENSE_CATEGORY")?.trim() ??
-      null;
+    // Account defaults come from per-vendor rules (vendor_account_rules) or
+    // the caller's explicit choice — never from a global env default.
+    // input.expense_category stays supported as a per-request matching hint.
+    const expenseCategory = input.expense_category ?? null;
     const defaultVendorId = Deno.env.get("ZOHO_DEFAULT_VENDOR_ID")?.trim();
-    const defaultAccountId = Deno.env.get("ZOHO_DEFAULT_ACCOUNT_ID")?.trim();
-    const autoCreateVendor =
-      (Deno.env.get("ZOHO_AUTO_CREATE_VENDOR")?.trim() || "true")
-        .toLowerCase() !== "false";
 
-    // Fast path: with DEFAULT_ACCOUNT_ID we can skip chart-of-accounts fetch.
-    const needAccounts = accounts.length === 0 && !defaultAccountId;
-    const needVendors = vendors.length === 0 && !defaultVendorId &&
-      !autoCreateVendor;
+    // Fast path: with an explicit account we can skip chart-of-accounts fetch.
+    const needAccounts = accounts.length === 0 && !input.account_id?.trim();
+    const needVendors = vendors.length === 0 && !defaultVendorId;
 
     if (needVendors || needAccounts) {
       const { result: tokenProbe, accessToken: token, retried } =
@@ -596,7 +1060,7 @@ Deno.serve(async (req) => {
             skipped: true,
             reason: "missing_entity_cache",
             error:
-              "Could not load Zoho vendors/accounts. Set ZOHO_DEFAULT_ACCOUNT_ID / fix OAuth, or provide ZOHO_VENDORS_JSON / ZOHO_ACCOUNTS_JSON.",
+              "Could not load Zoho vendors/accounts. Fix OAuth, pick an account in the review UI, or provide ZOHO_VENDORS_JSON / ZOHO_ACCOUNTS_JSON.",
             detail: tokenProbe.raw,
             retried,
             document_id: input.document_id,
@@ -606,7 +1070,6 @@ Deno.serve(async (req) => {
       }
     }
 
-    const mapped = mapExtractedFieldsToZohoBill(extracted as ExtractedFieldsRow);
     let matched = matchEntities({
       bill: mapped,
       vendors,
@@ -614,8 +1077,43 @@ Deno.serve(async (req) => {
       expense_category: expenseCategory,
     });
 
-    // Prefer configured default expense account when classification is missing.
-    if (defaultAccountId) {
+    // Per-line account/tax choices from review outrank fuzzy matching —
+    // matchEntities overwrites or strips account_id uniformly, so restore.
+    matched = {
+      ...matched,
+      bill: {
+        ...matched.bill,
+        line_items: matched.bill.line_items.map((item, i) => ({
+          ...item,
+          ...(mapped.line_items[i]?.account_id
+            ? { account_id: mapped.line_items[i].account_id }
+            : {}),
+          ...(mapped.line_items[i]?.tax_id
+            ? { tax_id: mapped.line_items[i].tax_id }
+            : {}),
+        })),
+      },
+    };
+
+    // Explicit UI selections take precedence over fuzzy matching.
+    if (input.vendor_id?.trim()) {
+      const chosenVendor = input.vendor_id.trim();
+      matched = {
+        ...matched,
+        unresolved_fields: matched.unresolved_fields.filter((f) =>
+          f !== "vendor"
+        ),
+        bill: { ...matched.bill, vendor_id: chosenVendor },
+        vendor_match: {
+          vendor_id: chosenVendor,
+          vendor_name: mapped.vendor_name ?? "selected",
+          confidence: 1,
+        },
+      };
+      matched.unresolved = matched.unresolved_fields.length > 0;
+    }
+    if (input.account_id?.trim()) {
+      const chosenAccount = input.account_id.trim();
       matched = {
         ...matched,
         unresolved_fields: matched.unresolved_fields.filter((f) =>
@@ -623,57 +1121,25 @@ Deno.serve(async (req) => {
         ),
         bill: {
           ...matched.bill,
-          line_items: matched.bill.line_items.map((item, i) =>
-            i === 0 ? { ...item, account_id: defaultAccountId } : item
+          // The transaction-level choice fills every line that has no
+          // per-line account of its own.
+          line_items: matched.bill.line_items.map((item) =>
+            item.account_id ? item : { ...item, account_id: chosenAccount }
           ),
         },
         account_match: {
-          account_id: defaultAccountId,
-          account_name: expenseCategory ?? "default",
+          account_id: chosenAccount,
+          account_name: "selected",
           confidence: 1,
         },
       };
       matched.unresolved = matched.unresolved_fields.length > 0;
     }
 
-    // New vendor → create in sandbox org rather than failing.
-    if (
-      matched.unresolved_fields.includes("vendor") &&
-      mapped.vendor_name &&
-      autoCreateVendor
-    ) {
-      const { result, accessToken: tok, retried: vendorRetried } =
-        await withZohoRetry(async (t) => {
-          try {
-            const created = await ensureVendorInZoho(t, mapped.vendor_name!);
-            vendors = [...vendors, created];
-            return { ok: true, status: 200, raw: created };
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            return { ok: false, status: 500, raw: { error: msg } };
-          }
-        });
-      accessToken = tok;
-      if (result.ok) {
-        const created = result.raw as ZohoVendor;
-        matched = {
-          ...matched,
-          unresolved_fields: matched.unresolved_fields.filter((f) =>
-            f !== "vendor"
-          ),
-          bill: { ...matched.bill, vendor_id: created.vendor_id },
-          vendor_match: {
-            vendor_id: created.vendor_id,
-            vendor_name: created.vendor_name,
-            confidence: 1,
-          },
-        };
-        matched.unresolved = matched.unresolved_fields.length > 0;
-        console.log(
-          `Ensured sandbox vendor for push (retried=${vendorRetried})`,
-        );
-      }
-    }
+    // Vendors are NEVER created from here — masters flow from Zoho Books
+    // into this app, not the other way around. An unmatched vendor routes
+    // the document to review, where the reviewer picks a synced vendor
+    // (creating it in Zoho Books first if it is genuinely new).
 
     if (matched.unresolved_fields.includes("vendor") && defaultVendorId) {
       matched = {
@@ -691,6 +1157,55 @@ Deno.serve(async (req) => {
       matched.unresolved = matched.unresolved_fields.length > 0;
     }
 
+    // Per-vendor default account rule. Overrides the generic category match
+    // (priority: explicit UI choice > vendor rule > category match) but never
+    // an account the caller chose for this transaction.
+    if (!input.account_id?.trim() && matched.bill.vendor_id) {
+      const rule = await lookupDefaultAccountRule(
+        supabase,
+        "vendor_account_rules",
+        "vendor_zoho_id",
+        matched.bill.vendor_id,
+      );
+      if (rule) {
+        matched = {
+          ...matched,
+          unresolved_fields: matched.unresolved_fields.filter((f) =>
+            f !== "account"
+          ),
+          bill: {
+            ...matched.bill,
+            // Vendor default rule fills every line without its own account.
+            line_items: matched.bill.line_items.map((item) =>
+              item.account_id
+                ? item
+                : { ...item, account_id: rule.account_zoho_id }
+            ),
+          },
+          account_match: {
+            account_id: rule.account_zoho_id,
+            account_name: rule.account_name,
+            confidence: 1,
+          },
+        };
+        matched.unresolved = matched.unresolved_fields.length > 0;
+      }
+    }
+
+    // Account resolution is per line now: unresolved iff any line lacks one.
+    {
+      const missingAccount = matched.bill.line_items.some(
+        (li) => !li.account_id,
+      );
+      const withoutAccount = matched.unresolved_fields.filter(
+        (f) => f !== "account",
+      );
+      matched.unresolved_fields = missingAccount
+        ? [...withoutAccount, "account"]
+        : withoutAccount;
+      matched.unresolved = matched.unresolved_fields.length > 0;
+    }
+
     if (matched.unresolved) {
       await supabase
         .from("documents")
@@ -705,15 +1220,52 @@ Deno.serve(async (req) => {
           unresolved_fields: matched.unresolved_fields,
           document_id: input.document_id,
           hint:
-            "Set ZOHO_EXPENSE_CATEGORY / ZOHO_DEFAULT_ACCOUNT_ID for sandbox, or correct vendor to match a Zoho vendor.",
+            "Pick the vendor and account in the review UI. Vendors are never created from here — if this vendor is new, create it in Zoho Books, sync, then approve again.",
         },
         409,
       );
     }
 
-    const billBody = toZohoBillBody(matched.bill, {
-      billNumber: `DIC-${input.document_id.replace(/-/g, "").slice(0, 12)}-${Date.now().toString(36)}`,
-    });
+    const money = await resolveCurrencyAndTax(
+      supabase,
+      mapped.currency,
+      grossTotal,
+      mapped.tax_amount,
+    );
+
+    const billBody = {
+      ...toZohoBillBody(matched.bill, {
+        // The document's own number is the bill number (Zoho flags true
+        // duplicates per vendor); the DIC ref stays as reference_number.
+        billNumber: mapped.invoice_number ||
+          `DIC-${input.document_id.replace(/-/g, "").slice(0, 12)}-${Date.now().toString(36)}`,
+      }),
+      ...(input.tax_treatment?.trim()
+        ? { tax_treatment: input.tax_treatment.trim() }
+        : {}),
+      ...(money.currencyId ? { currency_id: money.currencyId } : {}),
+      // From the extracted row, not matched.bill — match-entities rebuilds
+      // the bill object and drops passthrough header fields like due_date.
+      ...(mapped.due_date ? { due_date: mapped.due_date } : {}),
+    };
+
+    // VAT belongs in the tax field, never inside the line amount.
+    if (money.taxId) {
+      billBody.line_items = (billBody.line_items as Array<
+        Record<string, unknown>
+      >).map((item, i) => {
+        if (hasRealLines) {
+          // Extracted lines are the printed (net) amounts: attach the
+          // matched rate to lines without their own tax; keep rates as-is.
+          return item.tax_id ? item : { ...item, tax_id: money.taxId };
+        }
+        // Implicit single line holds the gross: post net + tax_id so Zoho
+        // recomputes the same gross the document shows.
+        return i === 0 && money.netRate != null
+          ? { ...item, rate: money.netRate, tax_id: money.taxId }
+          : item;
+      });
+    }
     const {
       result: createResult,
       accessToken: tokenAfterCreate,
@@ -721,39 +1273,90 @@ Deno.serve(async (req) => {
     } = await withZohoRetry((tok) => createZohoBill(tok, billBody));
     accessToken = tokenAfterCreate;
 
-    if (!createResult.ok || !("externalDocId" in createResult) ||
-      !createResult.externalDocId) {
-      throw new Error(
-        `Zoho bill create failed (${createResult.status}): ${
-          JSON.stringify(createResult.raw)
-        }`,
+    let externalDocId: string;
+    let recoveredExisting = false;
+    if (
+      createResult.ok && "externalDocId" in createResult &&
+      createResult.externalDocId
+    ) {
+      externalDocId = createResult.externalDocId;
+    } else {
+      // Zoho commits bills even when our call sees a transient failure, so
+      // the single retry can hit "duplicate bill number" (code 13011) for a
+      // bill that actually exists. Recover it instead of failing — creates
+      // stay idempotent per vendor + bill_number.
+      const rawStr = JSON.stringify(createResult.raw ?? {});
+      let recovered: string | null = null;
+      if (rawStr.includes("13011")) {
+        const { result: lookup } = await withZohoRetry((tok) =>
+          findBillByNumber(
+            tok,
+            String((billBody as { bill_number: string }).bill_number),
+            String(matched.bill.vendor_id),
+          )
+        );
+        if (lookup.ok && typeof lookup.raw === "string") {
+          recovered = lookup.raw;
+        }
+      }
+      if (!recovered) {
+        throw new Error(
+          `Zoho bill create failed (${createResult.status}): ${
+            JSON.stringify(createResult.raw)
+          }`,
+        );
+      }
+      console.log(
+        `Bill number already existed in Zoho; recovered bill ${recovered}`,
       );
+      externalDocId = recovered;
+      recoveredExisting = true;
     }
 
-    const externalDocId = createResult.externalDocId;
     const file = await loadDocumentBytes(supabase, doc.file_url as string);
 
-    const {
-      result: attachResult,
-      accessToken: tokenAfterAttach,
-      retried: attachRetried,
-    } = await withZohoRetry((tok) =>
-      attachBillDocument(
-        tok,
-        externalDocId,
-        file.bytes,
-        file.contentType,
-        file.filename,
-      )
-    );
-    accessToken = tokenAfterAttach;
-
-    if (!attachResult.ok) {
-      throw new Error(
-        `Zoho bill ${externalDocId} created but attachment failed (${attachResult.status}): ${
-          JSON.stringify(attachResult.raw)
-        }`,
+    // On recovery the attachment may already be on the bill — don't duplicate.
+    let skipAttach = false;
+    if (recoveredExisting) {
+      const { result: preGet } = await withZohoRetry((tok) =>
+        getZohoBill(tok, externalDocId)
       );
+      if (preGet.ok && attachmentPresent(preGet.raw).present) {
+        skipAttach = true;
+      }
+    }
+
+    let attachResult: ZohoCallResult = {
+      ok: true,
+      status: 200,
+      raw: { skipped: "attachment already present on recovered bill" },
+    };
+    let attachRetried = false;
+    if (!skipAttach) {
+      const {
+        result,
+        accessToken: tokenAfterAttach,
+        retried,
+      } = await withZohoRetry((tok) =>
+        attachBillDocument(
+          tok,
+          externalDocId,
+          file.bytes,
+          file.contentType,
+          file.filename,
+        )
+      );
+      accessToken = tokenAfterAttach;
+      attachResult = result;
+      attachRetried = retried;
+
+      if (!attachResult.ok) {
+        throw new Error(
+          `Zoho bill ${externalDocId} created but attachment failed (${attachResult.status}): ${
+            JSON.stringify(attachResult.raw)
+          }`,
+        );
+      }
     }
 
     const { result: getResult } = await withZohoRetry((tok) =>
@@ -784,10 +1387,20 @@ Deno.serve(async (req) => {
 
     return jsonResponse({
       ok: true,
+      post_as: "bill",
       document_id: input.document_id,
       external_doc_id: externalDocId,
       erp_sync_log_id: syncRow.id,
       sandbox_organization_id: orgId(),
+      money_mapping: {
+        currency: mapped.currency ?? null,
+        currency_id: money.currencyId,
+        tax_id: money.taxId,
+        tax_name: money.taxName,
+        net_rate: money.netRate,
+        tax_amount: mapped.tax_amount ?? null,
+        notes: money.notes,
+      },
       retried: createRetried || attachRetried,
       attachment: {
         uploaded: attachResult.ok,

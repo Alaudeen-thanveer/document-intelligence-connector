@@ -1,6 +1,6 @@
 // Triage inbound documents: cheap heuristics first, LLM only when ambiguous.
 // Classifies into: invoice | purchase_order | tax_notice | irrelevant
-import "@supabase/functions-js/edge-runtime.d.ts";
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
 type DocType = "invoice" | "purchase_order" | "tax_notice" | "irrelevant";

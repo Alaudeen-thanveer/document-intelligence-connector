@@ -4,7 +4,22 @@
  */
 import { GoogleGenerativeAI } from "npm:@google/generative-ai@0.24.1";
 
-export type ExtractableField = "vendor_raw" | "total_amount" | "invoice_date";
+export type ExtractableField =
+  | "vendor_raw"
+  | "total_amount"
+  | "invoice_date"
+  | "currency"
+  | "tax_amount"
+  | "invoice_number"
+  | "due_date";
+
+/** One invoice line as Gemini reports it (all fields nullable). */
+export interface GeminiLineItem {
+  description: string | null;
+  quantity: number | null;
+  unit_price: number | null;
+  amount: number | null;
+}
 
 export interface GeminiFieldValue {
   value: string | number | null;
@@ -110,6 +125,14 @@ const FIELD_INSTRUCTIONS: Record<ExtractableField, string> = {
     'Extract only the invoice total amount as a number. Return JSON only: {"value": number|null, "confidence": number between 0 and 1}',
   invoice_date:
     'Extract only the invoice date as YYYY-MM-DD. Return JSON only: {"value": string|null, "confidence": number between 0 and 1}',
+  currency:
+    'Extract only the invoice currency as a 3-letter ISO code (e.g. AED, USD, EUR). Infer from the currency symbol or text if no code is printed. Return JSON only: {"value": string|null, "confidence": number between 0 and 1}',
+  tax_amount:
+    'Extract only the total VAT/tax amount as a number in the invoice currency. If the invoice shows no VAT/tax line, return null. Return JSON only: {"value": number|null, "confidence": number between 0 and 1}',
+  invoice_number:
+    'Extract only the invoice/bill number as printed on the document (e.g. INV-2210). Return JSON only: {"value": string|null, "confidence": number between 0 and 1}',
+  due_date:
+    'Extract only the payment due date as YYYY-MM-DD. If no due date is printed, return null. Return JSON only: {"value": string|null, "confidence": number between 0 and 1}',
 };
 
 export async function reExtractFieldWithGemini(
@@ -187,7 +210,7 @@ export async function reExtractFieldWithGemini(
   }
   const confidence = Math.max(0, Math.min(1, confidenceNum));
 
-  if (field === "total_amount") {
+  if (field === "total_amount" || field === "tax_amount") {
     return {
       value: asNumber(parsed.value),
       confidence,
@@ -195,7 +218,18 @@ export async function reExtractFieldWithGemini(
       raw_text: rawText,
     };
   }
-  if (field === "invoice_date") {
+  if (field === "currency") {
+    const code = parsed.value != null
+      ? String(parsed.value).trim().toUpperCase()
+      : null;
+    return {
+      value: code && /^[A-Z]{3}$/.test(code) ? code : null,
+      confidence,
+      source: "gemini",
+      raw_text: rawText,
+    };
+  }
+  if (field === "invoice_date" || field === "due_date") {
     return {
       value: asDateString(parsed.value),
       confidence,
@@ -207,6 +241,60 @@ export async function reExtractFieldWithGemini(
     value: parsed.value != null ? String(parsed.value) : null,
     confidence,
     source: "gemini",
+    raw_text: rawText,
+  };
+}
+
+/**
+ * Extract ALL invoice line items in one Gemini call. Used only when OCR
+ * returned no line items at all (presence-based, like currency/tax).
+ */
+export async function extractLineItemsWithGemini(
+  imageDataUrl: string,
+): Promise<{ items: GeminiLineItem[]; raw_text: string }> {
+  const apiKey = Deno.env.get("GEMINI_API_KEY");
+  if (!apiKey) throw new Error("GEMINI_API_KEY is not set");
+
+  const modelName = Deno.env.get("GEMINI_MODEL")?.trim() || DEFAULT_MODEL;
+  const { mimeType, base64 } = parseDataUrl(imageDataUrl);
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({
+    model: modelName,
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: "application/json",
+    },
+  });
+
+  const prompt = [
+    "Extract every line item from the attached invoice table.",
+    "Do NOT include subtotal, VAT/tax, discount, or total rows — only real goods/services lines.",
+    'Respond with parseable JSON only, shape: {"items": [{"description": string|null, "quantity": number|null, "unit_price": number|null, "amount": number|null}]}.',
+    "amount is the printed line total. If the invoice has a single implicit line, return that one line. No markdown.",
+  ].join(" ");
+
+  const { result: response } = await withRetryOn429(async () => {
+    const result = await model.generateContent([
+      { text: prompt },
+      { inlineData: { mimeType, data: base64 } },
+    ]);
+    return result.response;
+  });
+
+  const rawText = response.text();
+  const parsed = extractJsonObject(rawText) as { items?: unknown };
+  const items = Array.isArray(parsed?.items) ? parsed.items : [];
+
+  return {
+    items: items.map((it) => {
+      const o = it as Record<string, unknown>;
+      return {
+        description: o.description != null ? String(o.description) : null,
+        quantity: asNumber(o.quantity),
+        unit_price: asNumber(o.unit_price),
+        amount: asNumber(o.amount),
+      };
+    }).filter((li) => li.description || li.amount != null || li.unit_price != null),
     raw_text: rawText,
   };
 }

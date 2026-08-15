@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
+import { ConnectionsPage } from "./components/ConnectionsPage";
 import { DocumentList } from "./components/DocumentList";
 import { ReviewPanel } from "./components/ReviewPanel";
+import { RulesManager } from "./components/RulesManager";
 import { UploadInvoice } from "./components/UploadInvoice";
 import { useDocumentDetail } from "./hooks/useDocumentDetail";
 import { useDocuments } from "./hooks/useDocuments";
@@ -14,6 +16,26 @@ export default function App() {
     () => new Set(),
   );
   const [tick, setTick] = useState(0);
+  const [rulesOpen, setRulesOpen] = useState(false);
+  const [rulesVersion, setRulesVersion] = useState(0);
+  // Hash-routed page: #connections is its own page; anything else = documents.
+  const [view, setView] = useState<"documents" | "connections">(() =>
+    window.location.hash === "#connections" ? "connections" : "documents",
+  );
+
+  useEffect(() => {
+    function onHashChange() {
+      setView(
+        window.location.hash === "#connections" ? "connections" : "documents",
+      );
+    }
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  function navigate(next: "documents" | "connections") {
+    window.location.hash = next === "connections" ? "#connections" : "#";
+  }
 
   const selected = useMemo(
     () => documents.find((d) => d.id === selectedId) ?? null,
@@ -61,18 +83,52 @@ export default function App() {
       <header className="topbar">
         <div>
           <p className="brand">Document Intelligence Connector</p>
-          <h1>Document review</h1>
+          <h1>{view === "connections" ? "Connections" : "Document review"}</h1>
         </div>
-        <label className="reviewer-field">
-          Reviewer
-          <input
-            value={reviewerName}
-            onChange={(e) => setReviewerName(e.target.value)}
-            placeholder="Your name"
-          />
-        </label>
+        <div className="topbar-actions">
+          <nav className="view-nav" aria-label="Pages">
+            <button
+              type="button"
+              className={`tab-btn${view === "documents" ? " active" : ""}`}
+              onClick={() => navigate("documents")}
+            >
+              Documents
+            </button>
+            <button
+              type="button"
+              className={`tab-btn${view === "connections" ? " active" : ""}`}
+              onClick={() => navigate("connections")}
+            >
+              Connections
+            </button>
+          </nav>
+          <button
+            type="button"
+            className="btn ghost"
+            onClick={() => setRulesOpen(true)}
+          >
+            Rules
+          </button>
+          <label className="reviewer-field">
+            Reviewer
+            <input
+              value={reviewerName}
+              onChange={(e) => setReviewerName(e.target.value)}
+              placeholder="Your name"
+            />
+          </label>
+        </div>
       </header>
 
+      <RulesManager
+        open={rulesOpen}
+        onClose={() => setRulesOpen(false)}
+        onChanged={() => setRulesVersion((n) => n + 1)}
+      />
+
+      {view === "connections" ? (
+        <ConnectionsPage />
+      ) : (
       <main className="layout">
         <section className="list-pane">
           <div className="pane-heading">
@@ -118,6 +174,7 @@ export default function App() {
           loading={detail.loading}
           error={detail.error}
           reviewerName={reviewerName}
+          rulesVersion={rulesVersion}
           onChanged={() => {
             // Reload list from source of truth after mutations.
             void supabase
@@ -133,6 +190,7 @@ export default function App() {
           }}
         />
       </main>
+      )}
     </div>
   );
 }
