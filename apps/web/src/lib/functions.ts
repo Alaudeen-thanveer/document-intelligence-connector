@@ -10,7 +10,12 @@ function authHeaders(): HeadersInit {
 }
 
 export async function callEdgeFunction(
-  name: "extract" | "judgment" | "zoho-push" | "zoho-pull",
+  name:
+    | "extract"
+    | "judgment"
+    | "zoho-push"
+    | "zoho-pull"
+    | "bookkeeping-learn",
   body: Record<string, unknown>,
 ): Promise<{ ok: boolean; status: number; body: Record<string, unknown> }> {
   const res = await fetch(`${functionsUrl}/${name}`, {

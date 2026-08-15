@@ -3,12 +3,15 @@ import { useZohoEntities } from "../hooks/useZohoEntities";
 import { isIncomeAccount, isPostingAccount } from "../lib/zoho";
 import { supabase } from "../lib/supabase";
 import type { EntityAccountRuleRow, ZohoEntityRow } from "../types";
+import { SuggestedRules } from "./SuggestedRules";
 
 interface Props {
   open: boolean;
   onClose: () => void;
   /** Called after any rule is added, changed, or removed. */
   onChanged: () => void;
+  /** Recorded as decided_by on accepted / dismissed suggestions. */
+  reviewerName?: string;
 }
 
 type RuleKind = "vendor" | "customer";
@@ -43,7 +46,12 @@ const KIND_CONFIG: Record<RuleKind, KindConfig> = {
  * Vendor — "bills/expenses from vendor X post to account Y";
  * Customer — "invoices for customer X post to income account Y".
  */
-export function RulesManager({ open, onClose, onChanged }: Props) {
+export function RulesManager({
+  open,
+  onClose,
+  onChanged,
+  reviewerName = "reviewer",
+}: Props) {
   const zoho = useZohoEntities();
   const [kind, setKind] = useState<RuleKind>("vendor");
   const [rules, setRules] = useState<EntityAccountRuleRow[]>([]);
@@ -264,6 +272,16 @@ export function RulesManager({ open, onClose, onChanged }: Props) {
             })}
           </ul>
         )}
+
+        <SuggestedRules
+          kind={kind}
+          reviewerName={reviewerName}
+          partyIdsWithRule={new Set(rules.map((r) => r.entity_zoho_id))}
+          onAccepted={() => {
+            void load(kind);
+            onChanged();
+          }}
+        />
 
         <div className="section">
           <h3>Add rule</h3>

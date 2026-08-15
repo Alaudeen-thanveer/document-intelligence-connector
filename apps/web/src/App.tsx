@@ -124,6 +124,7 @@ export default function App() {
         open={rulesOpen}
         onClose={() => setRulesOpen(false)}
         onChanged={() => setRulesVersion((n) => n + 1)}
+        reviewerName={reviewerName}
       />
 
       {view === "connections" ? (
