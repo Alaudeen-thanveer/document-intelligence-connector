@@ -697,10 +697,22 @@ a {
 /* Review line items */
 .line-item-row {
   display: grid;
-  grid-template-columns: 1fr 64px 96px 180px 80px 32px;
+  grid-template-columns: 1fr 64px 96px 180px auto 80px 32px;
   gap: 8px;
   align-items: center;
   margin-bottom: 8px;
+}
+
+/* Project + reporting-tag selectors on a line (only when the org has any). */
+.li-dims {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.li-dims select {
+  max-width: 150px;
+  font-size: 0.85rem;
 }
 
 .line-item-row input,

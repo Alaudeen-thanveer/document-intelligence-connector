@@ -14,9 +14,41 @@ import {
   buildPartyProfiles,
   type HistoryDoc,
   isProposable,
+  partyKindForDoc,
 } from "./analyze.ts";
 import { classifyRhythm, proposeChecks } from "./recurrence.ts";
 import { learnAttachmentConvention } from "./attachments.ts";
+import {
+  learnJournalTagUsage,
+  learnPartyTagProfiles,
+  parseZohoLineTags,
+} from "./tags_projects.ts";
+
+type DocKind = "bill" | "invoice" | "expense" | "journal";
+const KIND_META: Record<
+  DocKind,
+  { path: string; listKey: string; idKey: string; rootKey: string }
+> = {
+  bill: { path: "bills", listKey: "bills", idKey: "bill_id", rootKey: "bill" },
+  invoice: {
+    path: "invoices",
+    listKey: "invoices",
+    idKey: "invoice_id",
+    rootKey: "invoice",
+  },
+  expense: {
+    path: "expenses",
+    listKey: "expenses",
+    idKey: "expense_id",
+    rootKey: "expense",
+  },
+  journal: {
+    path: "journals",
+    listKey: "journals",
+    idKey: "journal_id",
+    rootKey: "journal",
+  },
+};
 
 interface LearnInput {
   company_id?: string;
@@ -145,21 +177,21 @@ async function zohoGet(
 
 async function listIds(
   accessToken: string,
-  kind: "bill" | "invoice",
+  kind: DocKind,
   fromDate: string,
   cap: number,
 ): Promise<string[]> {
-  const path = kind === "bill" ? "bills" : "invoices";
-  const listKey = kind === "bill" ? "bills" : "invoices";
-  const idKey = kind === "bill" ? "bill_id" : "invoice_id";
+  const { path, listKey, idKey } = KIND_META[kind];
   const ids: string[] = [];
   let page = 1;
   while (ids.length < cap && page <= 50) {
+    // Journals use journal_date for filtering/sorting; the others use date.
+    const dateField = kind === "journal" ? "journal_date" : "date";
     const raw = await zohoGet(accessToken, path, {
       per_page: "200",
       page: String(page),
-      date_start: fromDate,
-      sort_column: "date",
+      [`${dateField}_start`]: fromDate,
+      sort_column: dateField,
       sort_order: "D",
     });
     const items = (raw[listKey] as Array<Record<string, unknown>>) ?? [];
@@ -181,20 +213,50 @@ async function listIds(
 // Zoho payload → HistoryDoc.
 // ---------------------------------------------------------------------------
 function toHistoryDoc(
-  kind: "bill" | "invoice",
+  kind: DocKind,
   raw: Record<string, unknown>,
 ): HistoryDoc | null {
-  const doc = (raw[kind] ?? raw) as Record<string, unknown>;
-  const partyId = kind === "bill" ? doc.vendor_id : doc.customer_id;
-  const partyName = kind === "bill" ? doc.vendor_name : doc.customer_name;
-  if (partyId == null) return null;
+  const doc = (raw[KIND_META[kind].rootKey] ?? raw) as Record<string, unknown>;
 
-  const lines = ((doc.line_items as Array<Record<string, unknown>>) ?? [])
-    .map((li) => ({
-      account_id: li.account_id != null ? String(li.account_id) : null,
-      account_name: li.account_name != null ? String(li.account_name) : null,
-      amount: Number(li.item_total ?? li.amount ?? 0) || 0,
-    }));
+  // Journals have no party; expenses and bills have a vendor; invoices a customer.
+  const partyId = kind === "journal"
+    ? ""
+    : kind === "invoice"
+    ? doc.customer_id
+    : doc.vendor_id;
+  const partyName = kind === "journal"
+    ? ""
+    : kind === "invoice"
+    ? doc.customer_name
+    : doc.vendor_name;
+  if (kind !== "journal" && partyId == null) return null;
+
+  const rawLines = (doc.line_items as Array<Record<string, unknown>>) ?? [];
+  // Expenses are flat (one account, one amount) with header-level tags/project.
+  const lineSource = kind === "expense" && rawLines.length === 0
+    ? [{
+      account_id: doc.account_id,
+      account_name: doc.account_name,
+      amount: doc.total ?? doc.amount,
+      tags: doc.tags,
+      project_id: doc.project_id,
+      project_name: doc.project_name,
+    }]
+    : rawLines;
+
+  const lines = lineSource.map((li) => ({
+    account_id: li.account_id != null ? String(li.account_id) : null,
+    account_name: li.account_name != null ? String(li.account_name) : null,
+    // Journals: signed by debit/credit so both sides are visible.
+    amount: kind === "journal"
+      ? (Number(li.debit_amount ?? 0) || 0) - (Number(li.credit_amount ?? 0) || 0)
+      : Number(li.item_total ?? li.amount ?? 0) || 0,
+    tags: parseZohoLineTags(li.tags),
+    project_id: li.project_id != null && String(li.project_id) !== ""
+      ? String(li.project_id)
+      : null,
+    project_name: li.project_name != null ? String(li.project_name) : null,
+  }));
 
   const hasPo = Boolean(
     (kind === "bill" &&
@@ -204,11 +266,11 @@ function toHistoryDoc(
 
   return {
     doc_kind: kind,
-    zoho_id: String(doc[kind === "bill" ? "bill_id" : "invoice_id"] ?? ""),
-    party_zoho_id: String(partyId),
+    zoho_id: String(doc[KIND_META[kind].idKey] ?? ""),
+    party_zoho_id: String(partyId ?? ""),
     party_name: String(partyName ?? ""),
-    date: String(doc.date ?? "").slice(0, 10),
-    total: Number(doc.total ?? 0) || 0,
+    date: String(doc.date ?? doc.journal_date ?? "").slice(0, 10),
+    total: Number(doc.total ?? doc.amount ?? 0) || 0,
     currency: doc.currency_code != null ? String(doc.currency_code) : null,
     tax_treatment: doc.tax_treatment ? String(doc.tax_treatment) : null,
     payment_terms_id: doc.payment_terms_id != null
@@ -257,6 +319,8 @@ Deno.serve(async (req) => {
   try {
     let billsFetched = 0;
     let invoicesFetched = 0;
+    let expensesFetched = 0;
+    let journalsFetched = 0;
 
     if (!input.reanalyze_only) {
       const token = await getAccessToken(supabase);
@@ -264,9 +328,9 @@ Deno.serve(async (req) => {
       from.setMonth(from.getMonth() - monthsBack);
       const fromDate = from.toISOString().slice(0, 10);
 
-      for (const kind of ["bill", "invoice"] as const) {
+      for (const kind of ["bill", "invoice", "expense", "journal"] as const) {
         const ids = await listIds(token, kind, fromDate, cap);
-        const path = kind === "bill" ? "bills" : "invoices";
+        const path = KIND_META[kind].path;
         // Skip ids we already have raw payloads for.
         const { data: have } = await supabase
           .from("bk_history_raw")
@@ -286,7 +350,9 @@ Deno.serve(async (req) => {
             payload: detail,
           }, { onConflict: "company_id,doc_kind,zoho_id" });
           if (kind === "bill") billsFetched++;
-          else invoicesFetched++;
+          else if (kind === "invoice") invoicesFetched++;
+          else if (kind === "expense") expensesFetched++;
+          else journalsFetched++;
         }
       }
     }
@@ -299,7 +365,7 @@ Deno.serve(async (req) => {
     const docs: HistoryDoc[] = [];
     for (const r of rawRows ?? []) {
       const d = toHistoryDoc(
-        r.doc_kind as "bill" | "invoice",
+        r.doc_kind as DocKind,
         r.payload as Record<string, unknown>,
       );
       if (d) docs.push(d);
@@ -337,7 +403,8 @@ Deno.serve(async (req) => {
     // human sets status = 'enabled'. Recompute preserves human decisions.
     const byParty = new Map<string, HistoryDoc[]>();
     for (const d of docs) {
-      const kind = d.doc_kind === "bill" ? "vendor" : "customer";
+      const kind = partyKindForDoc(d.doc_kind);
+      if (!kind || !d.party_zoho_id) continue; // journals have no party
       const key = `${kind}:${d.party_zoho_id}`;
       const list = byParty.get(key) ?? [];
       list.push(d);
@@ -441,11 +508,102 @@ Deno.serve(async (req) => {
       }
     }
 
+    // Layer 4: reporting tags + projects per party (bills, invoices,
+    // expenses) and per account (journals). Proposals only; recompute
+    // preserves human decisions.
+    let tagProfilesWritten = 0;
+    let projectProfilesWritten = 0;
+    let accountTagProfilesWritten = 0;
+    const keepDecision = async (
+      table: string,
+      match: Record<string, string>,
+    ): Promise<string> => {
+      let q = supabase.from(table).select("suggestion_status").eq(
+        "company_id",
+        companyId,
+      );
+      for (const [k, v] of Object.entries(match)) q = q.eq(k, v);
+      const { data } = await q.maybeSingle();
+      return data?.suggestion_status && data.suggestion_status !== "proposed"
+        ? String(data.suggestion_status)
+        : "proposed";
+    };
+
+    for (const tp of learnPartyTagProfiles(docs)) {
+      for (const t of tp.tags) {
+        const status = await keepDecision("bk_party_tag_profiles", {
+          party_kind: tp.party_kind,
+          party_zoho_id: tp.party_zoho_id,
+          tag_id: t.tag_id,
+        });
+        const { error } = await supabase.from("bk_party_tag_profiles").upsert({
+          company_id: companyId,
+          party_kind: tp.party_kind,
+          party_zoho_id: tp.party_zoho_id,
+          party_name: tp.party_name,
+          tag_id: t.tag_id,
+          tag_name: t.tag_name,
+          option_id: t.option_id,
+          option_name: t.option_name,
+          share: t.share,
+          lines: t.lines,
+          confidence: t.confidence,
+          suggestion_status: status,
+          computed_at: new Date().toISOString(),
+        }, { onConflict: "company_id,party_kind,party_zoho_id,tag_id" });
+        if (!error) tagProfilesWritten++;
+      }
+      if (tp.project) {
+        const status = await keepDecision("bk_party_project_profiles", {
+          party_kind: tp.party_kind,
+          party_zoho_id: tp.party_zoho_id,
+        });
+        const { error } = await supabase.from("bk_party_project_profiles")
+          .upsert({
+            company_id: companyId,
+            party_kind: tp.party_kind,
+            party_zoho_id: tp.party_zoho_id,
+            party_name: tp.party_name,
+            project_id: tp.project.project_id,
+            project_name: tp.project.project_name,
+            share: tp.project.share,
+            lines: tp.project.lines,
+            confidence: tp.project.confidence,
+            suggestion_status: status,
+            computed_at: new Date().toISOString(),
+          }, { onConflict: "company_id,party_kind,party_zoho_id" });
+        if (!error) projectProfilesWritten++;
+      }
+    }
+    for (const u of learnJournalTagUsage(docs)) {
+      const status = await keepDecision("bk_account_tag_profiles", {
+        account_id: u.account_id,
+        tag_id: u.tag_id,
+      });
+      const { error } = await supabase.from("bk_account_tag_profiles").upsert({
+        company_id: companyId,
+        account_id: u.account_id,
+        account_name: u.account_name,
+        tag_id: u.tag_id,
+        tag_name: u.tag_name,
+        option_id: u.option_id,
+        option_name: u.option_name,
+        share: u.share,
+        lines: u.lines,
+        confidence: u.confidence,
+        suggestion_status: status,
+        computed_at: new Date().toISOString(),
+      }, { onConflict: "company_id,account_id,tag_id" });
+      if (!error) accountTagProfilesWritten++;
+    }
+
     if (runId) {
       await supabase.from("bk_learn_runs").update({
         status: "completed",
         bills_fetched: billsFetched,
         invoices_fetched: invoicesFetched,
+        expenses_fetched: expensesFetched,
+        journals_fetched: journalsFetched,
         profiles_written: written,
         finished_at: new Date().toISOString(),
       }).eq("id", runId);
@@ -458,7 +616,12 @@ Deno.serve(async (req) => {
       months_back: monthsBack,
       bills_fetched: billsFetched,
       invoices_fetched: invoicesFetched,
+      expenses_fetched: expensesFetched,
+      journals_fetched: journalsFetched,
       documents_analyzed: docs.length,
+      tag_profiles_written: tagProfilesWritten,
+      project_profiles_written: projectProfilesWritten,
+      account_tag_profiles_written: accountTagProfilesWritten,
       profiles_written: written,
       proposable: profiles.filter(isProposable).length,
       rhythms_written: rhythmsWritten,

@@ -211,6 +211,8 @@ function toZohoBillBody(
       quantity: item.quantity,
       account_id: item.account_id,
       ...(item.tax_id ? { tax_id: item.tax_id } : {}),
+      ...(item.project_id ? { project_id: item.project_id } : {}),
+      ...(item.tags && item.tags.length > 0 ? { tags: item.tags } : {}),
     })),
   };
 }
@@ -748,7 +750,7 @@ Deno.serve(async (req) => {
     const { data: lineRowsData } = await supabase
       .from("extracted_line_items")
       .select(
-        "line_no, description, quantity, rate, amount, account_zoho_id, tax_zoho_id",
+        "line_no, description, quantity, rate, amount, account_zoho_id, tax_zoho_id, project_zoho_id, reporting_tags",
       )
       .eq("extracted_fields_id", (extracted as { id: string }).id)
       .order("line_no");
@@ -835,6 +837,8 @@ Deno.serve(async (req) => {
               ...(li.account_id ?? invoiceAccountId
                 ? { account_id: li.account_id ?? invoiceAccountId }
                 : {}),
+              ...(li.project_id ? { project_id: li.project_id } : {}),
+              ...(li.tags?.length ? { tags: li.tags } : {}),
             }))
             : [
               {
@@ -1090,6 +1094,12 @@ Deno.serve(async (req) => {
             : {}),
           ...(mapped.line_items[i]?.tax_id
             ? { tax_id: mapped.line_items[i].tax_id }
+            : {}),
+          ...(mapped.line_items[i]?.project_id
+            ? { project_id: mapped.line_items[i].project_id }
+            : {}),
+          ...(mapped.line_items[i]?.tags?.length
+            ? { tags: mapped.line_items[i].tags }
             : {}),
         })),
       },

@@ -19,6 +19,9 @@ interface EditableLine {
   quantity: string;
   rate: string;
   accountId: string;
+  projectId: string;
+  /** tag_id → tag_option_id */
+  tags: Record<string, string>;
 }
 
 let lineKeyCounter = 0;
@@ -174,6 +177,50 @@ export function ReviewPanel({
     }
   }, [vendorRaw, zoho.vendors, zoho.customers, postAsTouched, document?.id]);
 
+  // Prefill each line's project and tags from the chosen party's ACCEPTED
+  // learned profiles (bk_party_project_profiles / bk_party_tag_profiles).
+  // Only accepted rows prefill; proposed rows never touch the form. Never
+  // overwrites a value the reviewer already set on a line.
+  const learnedPartyId = postAs === "invoice" ? customerId : vendorId;
+  useEffect(() => {
+    if (!learnedPartyId) return;
+    const kind = postAs === "invoice" ? "customer" : "vendor";
+    let cancelled = false;
+    void Promise.all([
+      supabase
+        .from("bk_party_project_profiles")
+        .select("project_id")
+        .eq("party_kind", kind)
+        .eq("party_zoho_id", learnedPartyId)
+        .eq("suggestion_status", "accepted")
+        .maybeSingle(),
+      supabase
+        .from("bk_party_tag_profiles")
+        .select("tag_id, option_id")
+        .eq("party_kind", kind)
+        .eq("party_zoho_id", learnedPartyId)
+        .eq("suggestion_status", "accepted"),
+    ]).then(([projRes, tagRes]) => {
+      if (cancelled) return;
+      const projectId = (projRes.data as { project_id?: string } | null)?.project_id ?? "";
+      const tagDefaults = Object.fromEntries(
+        ((tagRes.data ?? []) as Array<{ tag_id: string; option_id: string }>)
+          .map((t) => [t.tag_id, t.option_id]),
+      );
+      if (!projectId && Object.keys(tagDefaults).length === 0) return;
+      setLineItems((prev) =>
+        prev.map((li) => ({
+          ...li,
+          projectId: li.projectId || projectId,
+          tags: { ...tagDefaults, ...li.tags },
+        }))
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [learnedPartyId, postAs, rulesVersion]);
+
   // Load the extracted line items for this document's latest extraction.
   useEffect(() => {
     if (!extracted?.id) {
@@ -183,7 +230,7 @@ export function ReviewPanel({
     let cancelled = false;
     void supabase
       .from("extracted_line_items")
-      .select("line_no, description, quantity, rate, amount, account_zoho_id")
+      .select("line_no, description, quantity, rate, amount, account_zoho_id, project_zoho_id, reporting_tags")
       .eq("extracted_fields_id", extracted.id)
       .order("line_no")
       .then(({ data }) => {
@@ -202,6 +249,12 @@ export function ReviewPanel({
               quantity: String(qty),
               rate: rate != null ? String(Math.round(rate * 100) / 100) : "",
               accountId: row.account_zoho_id ?? "",
+              projectId: row.project_zoho_id ?? "",
+              tags: Object.fromEntries(
+                (Array.isArray(row.reporting_tags) ? row.reporting_tags : [])
+                  .filter((t: { tag_id?: string; tag_option_id?: string }) => t?.tag_id && t?.tag_option_id)
+                  .map((t: { tag_id: string; tag_option_id: string }) => [t.tag_id, t.tag_option_id]),
+              ),
             };
           }),
         );
@@ -325,6 +378,10 @@ export function ReviewPanel({
           : Number(li.rate) *
             (li.quantity.trim() === "" ? 1 : Number(li.quantity)),
         account_zoho_id: li.accountId || null,
+        project_zoho_id: li.projectId || null,
+        reporting_tags: Object.entries(li.tags)
+          .filter(([, opt]) => opt)
+          .map(([tag_id, tag_option_id]) => ({ tag_id, tag_option_id })),
         source: "manual" as const,
       }));
     if (rows.length > 0) {
@@ -853,6 +910,66 @@ export function ReviewPanel({
                   </option>
                 ))}
               </select>
+              {(zoho.projects.length > 0 || zoho.reportingTags.length > 0) && (
+                <div className="li-dims">
+                  {zoho.projects.length > 0 && (
+                    <select
+                      className="li-project"
+                      value={li.projectId}
+                      title="Project"
+                      onChange={(e) =>
+                        setLineItems((prev) =>
+                          prev.map((p) =>
+                            p.key === li.key
+                              ? { ...p, projectId: e.target.value }
+                              : p,
+                          ),
+                        )
+                      }
+                    >
+                      <option value="">— project —</option>
+                      {zoho.projects.map((pr) => (
+                        <option key={pr.zoho_id} value={pr.zoho_id}>
+                          {pr.name}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  {zoho.reportingTags.map((tag) => {
+                    const options = ((tag.extra as {
+                      options?: Array<{ id: string | null; name: string | null }>;
+                    } | null)?.options ?? []).filter((o) => o.id);
+                    if (options.length === 0) return null;
+                    return (
+                      <select
+                        key={tag.zoho_id}
+                        className="li-tag"
+                        value={li.tags[tag.zoho_id] ?? ""}
+                        title={tag.name}
+                        onChange={(e) =>
+                          setLineItems((prev) =>
+                            prev.map((p) =>
+                              p.key === li.key
+                                ? {
+                                  ...p,
+                                  tags: { ...p.tags, [tag.zoho_id]: e.target.value },
+                                }
+                                : p,
+                            ),
+                          )
+                        }
+                      >
+                        <option value="">— {tag.name} —</option>
+                        {options.map((o) => (
+                          <option key={o.id!} value={o.id!}>
+                            {o.name}
+                          </option>
+                        ))}
+                      </select>
+                    );
+                  })}
+                </div>
+              )}
               <span className="li-amount">
                 {(() => {
                   const q = Number(li.quantity) || 1;
@@ -886,6 +1003,8 @@ export function ReviewPanel({
                     quantity: "1",
                     rate: "",
                     accountId: "",
+                    projectId: "",
+                    tags: {},
                   },
                 ])
               }

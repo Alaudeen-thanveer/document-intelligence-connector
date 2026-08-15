@@ -6,9 +6,17 @@
  * See docs/BOOKKEEPING_PATTERNS_SPEC.md §3.1 and §4.
  */
 
-/** One historical document as the learner consumes it (bill or invoice). */
+/** A reporting-tag selection on a line: which tag, which option. */
+export interface LineTag {
+  tag_id: string;
+  tag_name: string | null;
+  tag_option_id: string;
+  tag_option_name: string | null;
+}
+
+/** One historical document as the learner consumes it. */
 export interface HistoryDoc {
-  doc_kind: "bill" | "invoice";
+  doc_kind: "bill" | "invoice" | "expense" | "journal";
   zoho_id: string;
   party_zoho_id: string;
   party_name: string;
@@ -23,6 +31,11 @@ export interface HistoryDoc {
     account_id: string | null;
     account_name: string | null;
     amount: number;
+    /** Reporting tags applied to this line (Zoho: line.tags[]). */
+    tags?: LineTag[];
+    /** Project this line is booked to (Zoho: line.project_id). */
+    project_id?: string | null;
+    project_name?: string | null;
   }>;
   /** Files attached to the document in Zoho (layer 3). */
   documents?: Array<{ file_name: string | null; file_type: string | null }>;
@@ -59,6 +72,16 @@ export interface PartyProfile {
 
 /** Below this many documents a profile is computed but not proposed. */
 export const MIN_SAMPLE_FOR_PROPOSAL = 3;
+
+/** Bills and expenses profile the vendor; invoices the customer;
+ * journals have no party. */
+export function partyKindForDoc(
+  kind: HistoryDoc["doc_kind"],
+): "vendor" | "customer" | null {
+  if (kind === "bill" || kind === "expense") return "vendor";
+  if (kind === "invoice") return "customer";
+  return null;
+}
 
 function percentile(sorted: number[], p: number): number | null {
   if (sorted.length === 0) return null;
@@ -105,8 +128,9 @@ export function profileConfidence(share: number, sampleSize: number): number {
 export function buildPartyProfiles(docs: HistoryDoc[]): PartyProfile[] {
   const groups = new Map<string, HistoryDoc[]>();
   for (const d of docs) {
-    if (!d.party_zoho_id) continue;
-    const kind = d.doc_kind === "bill" ? "vendor" : "customer";
+    if (!d.party_zoho_id) continue; // journals have no party
+    const kind = partyKindForDoc(d.doc_kind);
+    if (!kind) continue;
     const key = `${kind}:${d.party_zoho_id}`;
     const list = groups.get(key) ?? [];
     list.push(d);
