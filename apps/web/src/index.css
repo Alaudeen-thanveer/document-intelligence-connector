@@ -741,6 +741,33 @@ a {
   }
 }
 
+/* API usage page */
+.usage-meters { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 6px 0 10px; }
+.usage-meter { border: 1px solid var(--line); border-radius: calc(var(--radius) - 6px); padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+.usage-meter-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.usage-meter-head span:first-child { font-size: .72rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.usage-meter-head strong { font-size: 1.25rem; font-variant-numeric: tabular-nums; }
+.usage-bar { height: 8px; border-radius: 999px; background: rgba(147, 168, 157, 0.18); overflow: hidden; }
+.usage-bar i { display: block; height: 100%; background: var(--accent); border-radius: 999px; transition: width .3s ease; }
+.usage-meter.usage-warn .usage-bar i { background: var(--warn); }
+.usage-meter.usage-crit .usage-bar i { background: var(--danger); }
+.usage-table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+.usage-table th, .usage-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+.usage-table th { font-size: .72rem; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+.usage-table tr:last-child td { border-bottom: none; }
+.usage-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+.usage-two { display: grid; grid-template-columns: 1.3fr 1fr; gap: 12px; }
+.usage-days { display: flex; gap: 8px; align-items: flex-end; height: 140px; padding-top: 10px; }
+.usage-day { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 28px; }
+.usage-day-bar { position: relative; width: 100%; height: 100px; display: flex; align-items: flex-end; }
+.usage-day-bar i { display: block; width: 100%; background: var(--accent); border-radius: 4px 4px 0 0; min-height: 2px; }
+.usage-day-bar i.hit { background: var(--warn); }
+.usage-day-bar b { position: absolute; top: -14px; left: 0; right: 0; text-align: center; font-size: .6rem; color: var(--danger); }
+.usage-day span { font-size: .78rem; }
+.usage-day small { font-size: .66rem; color: var(--muted); }
+.active-chip { border-color: var(--accent) !important; color: var(--accent) !important; }
+@media (max-width: 900px) { .usage-two { grid-template-columns: 1fr; } }
+
 /* Month-end page */
 .month-nav {
   display: flex;

@@ -6,6 +6,10 @@
 // Credentials come only from environment variables — never hardcoded.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
+
+/** Set per request; every Zoho call goes through it so usage is metered. */
+let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
 
 type EntityKind =
   | "account"
@@ -175,7 +179,7 @@ async function fetchAllPages(
     const url = `${apiBase()}/${path}?organization_id=${
       encodeURIComponent(orgId())
     }&per_page=200&page=${page}${extraParams}`;
-    const res = await fetch(url, {
+    const res = await zohoFetch(url, {
       headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
     });
     const raw = await res.json();
@@ -248,7 +252,7 @@ async function fetchKind(
         const detailUrl = `${apiBase()}/reportingtags/${id}?organization_id=${
           encodeURIComponent(orgId())
         }`;
-        const res = await fetch(detailUrl, {
+        const res = await zohoFetch(detailUrl, {
           headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
         });
         const raw = await res.json();
@@ -459,6 +463,11 @@ Deno.serve(async (req) => {
 
   try {
     const supabase = getSupabase();
+    const meter = createZohoMeter(
+      supabase,
+      meterContextFromRequest(req, "sync", "zoho-pull"),
+    );
+    zohoFetch = meter.fetch;
     let accessToken = await getAccessToken();
     const counts: Record<string, number> = {};
 
@@ -499,7 +508,7 @@ Deno.serve(async (req) => {
       counts[kind] = rows.length;
     }
 
-    return jsonResponse({ ok: true, counts });
+    return jsonResponse({ ok: true, counts, usage: meter.summary() });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("zoho-pull failed:", message);

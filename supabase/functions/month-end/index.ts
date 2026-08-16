@@ -6,6 +6,10 @@
 // Input: { month?: "yyyy-mm" }  (default: current month)
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
+
+/** Set per request; every Zoho call goes through it so usage is metered. */
+let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
 import {
   type EnabledExpectedMissing,
   type EnabledJournalPattern,
@@ -95,7 +99,7 @@ async function getAccessToken(supabase: SupabaseClient): Promise<string> {
 
 async function zohoGet(token: string, path: string, params: Record<string, string> = {}) {
   const qs = new URLSearchParams({ organization_id: requireEnv("ZOHO_ORGANIZATION_ID"), ...params });
-  const res = await fetch(`${apiBase()}/${path}?${qs}`, {
+  const res = await zohoFetch(`${apiBase()}/${path}?${qs}`, {
     headers: { Authorization: `Zoho-oauthtoken ${token}` },
   });
   const raw = await res.json().catch(() => ({}));
@@ -127,6 +131,11 @@ Deno.serve(async (req) => {
 
   try {
     const supabase = getSupabase();
+    const meter = createZohoMeter(supabase, {
+      ...meterContextFromRequest(req, "month-end", "month-end"),
+      company_id: companyId,
+    });
+    zohoFetch = meter.fetch;
     const token = await getAccessToken(supabase);
 
     // --- Recurring journals: definitions + what was posted this month ---
@@ -305,6 +314,7 @@ Deno.serve(async (req) => {
         needs_attention: attention.length,
       },
       nudges,
+      usage: meter.summary(),
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
