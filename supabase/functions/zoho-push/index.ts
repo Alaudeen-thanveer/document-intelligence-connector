@@ -2,6 +2,10 @@
 // Uses existing OAuth refresh + single retry. Never hardcode credentials.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
+
+/** Set per request; every Zoho call goes through it so usage is metered. */
+let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
 import {
   mapExtractedFieldsToZohoBill,
   type ExtractedFieldsRow,
@@ -228,7 +232,7 @@ async function findBillByNumber(
   }&bill_number=${encodeURIComponent(billNumber)}&vendor_id=${
     encodeURIComponent(vendorId)
   }`;
-  const res = await fetch(url, {
+  const res = await zohoFetch(url, {
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
   });
   const raw = await res.json().catch(() => null);
@@ -360,7 +364,7 @@ async function createZohoBill(
 ): Promise<ZohoCallResult & { externalDocId?: string }> {
   const url =
     `${apiBase()}/bills?organization_id=${encodeURIComponent(orgId())}`;
-  const res = await fetch(url, {
+  const res = await zohoFetch(url, {
     method: "POST",
     headers: {
       Authorization: `Zoho-oauthtoken ${accessToken}`,
@@ -404,7 +408,7 @@ async function attachBillDocument(
     `${apiBase()}/bills/${encodeURIComponent(billId)}/attachment?organization_id=${
       encodeURIComponent(orgId())
     }`;
-  const res = await fetch(url, {
+  const res = await zohoFetch(url, {
     method: "POST",
     headers: {
       Authorization: `Zoho-oauthtoken ${accessToken}`,
@@ -423,7 +427,7 @@ async function getZohoBill(
     `${apiBase()}/bills/${encodeURIComponent(billId)}?organization_id=${
       encodeURIComponent(orgId())
     }`;
-  const res = await fetch(url, {
+  const res = await zohoFetch(url, {
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
   });
   const raw = await res.json().catch(async () => await res.text());
@@ -441,7 +445,7 @@ async function createZohoDoc(
   const url = `${apiBase()}/${path}?organization_id=${
     encodeURIComponent(orgId())
   }`;
-  const res = await fetch(url, {
+  const res = await zohoFetch(url, {
     method: "POST",
     headers: {
       Authorization: `Zoho-oauthtoken ${accessToken}`,
@@ -485,7 +489,7 @@ async function attachToZohoDoc(
   const url = `${apiBase()}/${urlPath}?organization_id=${
     encodeURIComponent(orgId())
   }`;
-  const res = await fetch(url, {
+  const res = await zohoFetch(url, {
     method: "POST",
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
     body: form,
@@ -499,7 +503,7 @@ async function fetchVendorsFromZoho(
 ): Promise<ZohoVendor[]> {
   const url =
     `${apiBase()}/contacts?organization_id=${encodeURIComponent(orgId())}&contact_type=vendor&per_page=200`;
-  const res = await fetch(url, {
+  const res = await zohoFetch(url, {
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
   });
   const raw = await res.json();
@@ -521,7 +525,7 @@ async function fetchAccountsFromZoho(
 ): Promise<ZohoAccount[]> {
   const url =
     `${apiBase()}/chartofaccounts?organization_id=${encodeURIComponent(orgId())}&per_page=200`;
-  const res = await fetch(url, {
+  const res = await zohoFetch(url, {
     headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
   });
   const raw = await res.json();
@@ -676,6 +680,11 @@ Deno.serve(async (req) => {
 
   try {
     const supabase = getSupabase();
+    const meter = createZohoMeter(
+      supabase,
+      meterContextFromRequest(req, "push", "zoho-push"),
+    );
+    zohoFetch = meter.fetch;
 
     try {
       await assertHumanApproved(supabase, input.document_id);
@@ -1465,6 +1474,7 @@ Deno.serve(async (req) => {
       external_doc_id: externalDocId,
       erp_sync_log_id: syncRow.id,
       sandbox_organization_id: orgId(),
+      usage: meter.summary(),
       money_mapping: {
         currency: mapped.currency ?? null,
         currency_id: money.currencyId,

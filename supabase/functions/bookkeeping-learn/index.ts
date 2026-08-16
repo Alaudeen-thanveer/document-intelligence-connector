@@ -10,6 +10,10 @@
 // See docs/BOOKKEEPING_PATTERNS_SPEC.md.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
+
+/** Set per request; every Zoho call goes through it so usage is metered. */
+let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
 import {
   buildPartyProfiles,
   type HistoryDoc,
@@ -194,7 +198,7 @@ async function zohoGet(
   const qs = new URLSearchParams({ organization_id: orgId(), ...params });
   const url = `${apiBase()}/${path}?${qs.toString()}`;
   for (let attempt = 1; attempt <= 4; attempt++) {
-    const res = await fetch(url, {
+    const res = await zohoFetch(url, {
       headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
     });
     const raw = await res.json().catch(() => ({}));
@@ -351,6 +355,11 @@ Deno.serve(async (req) => {
   const monthsBack = Math.max(1, Math.min(60, input.months_back ?? 24));
   const cap = Math.max(1, Math.min(2000, input.max_docs_per_kind ?? 500));
   const supabase = getSupabase();
+  const meter = createZohoMeter(supabase, {
+    ...meterContextFromRequest(req, "learn", "bookkeeping-learn"),
+    company_id: companyId,
+  });
+  zohoFetch = meter.fetch;
 
   const { data: run } = await supabase
     .from("bk_learn_runs")
@@ -848,6 +857,7 @@ Deno.serve(async (req) => {
       later_than_usual_proposed: laterThanUsualProposed,
       journal_patterns_written: journalPatternsWritten,
       journal_patterns_proposable: journalPatternsProposable,
+      usage: meter.summary(),
       profiles_written: written,
       proposable: profiles.filter(isProposable).length,
       rhythms_written: rhythmsWritten,

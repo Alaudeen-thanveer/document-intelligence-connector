@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { ConnectionsPage } from "./components/ConnectionsPage";
 import { MonthEndPage } from "./components/MonthEndPage";
+import { ApiUsagePage } from "./components/ApiUsagePage";
+import { setActor } from "./lib/functions";
 import { DocumentList } from "./components/DocumentList";
 import { ReviewPanel } from "./components/ReviewPanel";
 import { RulesManager } from "./components/RulesManager";
@@ -13,6 +15,9 @@ export default function App() {
   const { documents, loading, error, setDocuments } = useDocuments();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [reviewerName, setReviewerName] = useState("reviewer");
+  useEffect(() => {
+    setActor(reviewerName);
+  }, [reviewerName]);
   const [failedJudgmentIds, setFailedJudgmentIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -21,13 +26,15 @@ export default function App() {
   const [rulesVersion, setRulesVersion] = useState(0);
   // Hash-routed pages: #connections and #month-end are their own pages;
   // anything else = documents.
-  type View = "documents" | "connections" | "month-end";
+  type View = "documents" | "connections" | "month-end" | "api-usage";
   const viewFromHash = (): View =>
     window.location.hash === "#connections"
       ? "connections"
       : window.location.hash === "#month-end"
         ? "month-end"
-        : "documents";
+        : window.location.hash === "#api-usage"
+          ? "api-usage"
+          : "documents";
   const [view, setView] = useState<View>(viewFromHash);
 
   useEffect(() => {
@@ -93,7 +100,9 @@ export default function App() {
               ? "Connections"
               : view === "month-end"
                 ? "Month-end"
-                : "Document review"}
+                : view === "api-usage"
+                  ? "API usage"
+                  : "Document review"}
           </h1>
         </div>
         <div className="topbar-actions">
@@ -118,6 +127,14 @@ export default function App() {
               onClick={() => navigate("month-end")}
             >
               Month-end
+            </button>
+            <button
+              type="button"
+              className={`tab-btn${view === "api-usage" ? " active" : ""}`}
+              onClick={() => navigate("api-usage")}
+              title="Admin: Zoho API calls vs plan limits"
+            >
+              API usage
             </button>
           </nav>
           <button
@@ -149,6 +166,8 @@ export default function App() {
         <ConnectionsPage />
       ) : view === "month-end" ? (
         <MonthEndPage />
+      ) : view === "api-usage" ? (
+        <ApiUsagePage />
       ) : (
       <main className="layout">
         <section className="list-pane">
