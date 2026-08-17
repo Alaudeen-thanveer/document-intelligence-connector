@@ -74,6 +74,22 @@ Gap between invoice date and entry date; between entry and payment. Feeds the cu
 
 Which accounts are *used* vs merely defined. Feeds the review screen: show the ~15 accounts this customer actually uses first, the rest under “more”.
 
+### 3.9 Bank statement lines — built (bank layers 1–4)
+
+**What it learns.** For every categorised bank transaction in Zoho Books, every customer/vendor payment (its description + reference), and every statement line a reviewer confirms in this app: the statement description's *fingerprint* (salient words after stripping numbers, references and bank boilerplate — `bank_patterns.ts`), the side (money in / money out), and what the bookkeeper decided it was — party, account, and kind (customer receipt, vendor payment, expense, deposit, transfer). Grouped by (fingerprint, side); the dominant decision becomes the pattern with `share`, `sample_size`, amount band and confidence `share × (1 − 1/(n+1))`. Same words on opposite sides are different habits (a POS payment vs a refund).
+
+**What it suggests, per line, or nothing.** When a statement comes in (CSV/TSV upload, PDF via the vision model, pasted text, or — once the mailbox is wired — an email body/attachment through the same `ingest` entry point), every line gets at most one suggestion, in order of trust:
+1. **Open document** — money in that names an unpaid invoice's number or equals its balance (party name breaks amount ties) → *customer receipt applied to that invoice*; money out likewise → *vendor payment applied to that bill*. An amount-only match with two candidates at that amount is ambiguous → no suggestion.
+2. **Learned pattern** — the fingerprint matches (all tokens, or ≥⅔ of a 3+-token pattern) and score ≥ 0.55 → the usual party / account / kind, labelled *learned* (or *your rule* once accepted).
+3. **Party name** in the line with nothing else → the party only, kind by side, no account, low confidence.
+Below the gate, or nothing at all → the line stays **open**; the reviewer fills it. A split habit (e.g. salary batch booked two ways) scores under the gate and is deliberately not suggested.
+
+**Propose, don't impose, structurally.** Suggestions live in `bank_statement_lines.suggestion`; the reviewer's decision lives in `chosen_*` and is the only thing that ever reaches Zoho (`push.ts`: `/customerpayments` with `invoices[]`, `/vendorpayments` with `bills[]`, `/expenses` paid through the bank, `/banktransactions` for deposits and transfers). Confirm records whether the reviewer *accepted*, *changed* or *filled a blank* — the disagreement signal. Vendors/customers must exist in Zoho Books (synced cache, or the party Zoho itself returned on the matched open document). Every confirmed/posted line becomes an observation for the next learn, so the app learns from decisions without creating any rule.
+
+**Phase 1 — getting the payment record right (built).** Before anything else a line is checked against what THIS APP already posted (posted statement lines and documents pushed as expenses) for the same party/description and amount within `company_config.already_recorded_window_days` — if found, the suggestion is *link, don't create* and push creates nothing. Then, per line: refunds (money out to a customer = open credit note / unused payment → credit-note or payment refund; money in from a vendor = open vendor credit / unused payment → vendor-credit or vendor-payment refund), retainer receipts, and open-document allocation across several invoices/bills (named in the line → exact subset-sum → oldest-due-first). Short by ≤ `bank_charge_tolerance[currency]` (default AED 5, USD 13; other currencies none) → settle in full + bank charges (customer payments natively; vendor side as a bank-charge expense — and only when the line is OVER, since a short vendor payment is a partial); short by more → partial, residual stays open; over → the remainder is an advance (unused credit), never forced onto a document. Write-off of a residual is proposed only when the company has set its IFRS-based policy (`writeoff_after_days` + `writeoff_max_amount`, both NULL by default) and the document is old enough. On the review screen, unused credit the chosen party holds is offered as "apply to this invoice/bill?" and applied on push via `/invoices/{id}/credits` or `/bills/{id}/credits` only when ticked. Confirm records accepted / changed / filled-blank; guards refuse allocations that exceed the line and write-offs without a policy. Test: `bank-phase1-payment-record-accuracy`.
+
+**Tables:** `bk_bank_patterns` (layer 1), `bank_statements` + `bank_statement_lines` (layers 2–4, phase-1 columns), policy columns on `company_config`. **Function:** `bank-statement` (`ingest` / `suggest` / `confirm` / `push` / `party_credits`). **UI:** the Bank page (policies card, allocation editor); Review panel (unused-credit prompt). **Tests:** `bk-bank-layer1-accuracy`, `bank-layer2-parse-accuracy`, `bank-layer3-suggest-accuracy`, `bank-phase1-payment-record-accuracy`.
+
 ## 4. Knowledge base shape
 
 Three layers, every entry carrying `sample_size`, `confidence`, and `last_seen`.
@@ -130,6 +146,7 @@ All available on the connection already in place. Line-item detail requires fetc
 4. Items per customer (invoice side)
 5. Recurring journals (month-end context)
 6. Timing (payment behaviour)
+7. Bank statement lines: learn from categorised bank history → ingest statements → suggest per line (open document / learned / party name / nothing) → confirm → post; confirmations feed the learner. **Built.**
 
 Each step ships as: onboarding job → tables → suggestions surface → override logging. Continuous learning (every approved document updates the profile) is part of step 1, not a later phase.
 

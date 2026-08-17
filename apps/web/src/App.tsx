@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import type { Session } from "@supabase/supabase-js";
 import { ApiUsagePage } from "./components/ApiUsagePage";
+import { BankPage } from "./components/BankPage";
 import { ConnectionsPage } from "./components/ConnectionsPage";
 import { MonthEndPage } from "./components/MonthEndPage";
 import { SignInPage } from "./components/SignInPage";
@@ -15,6 +16,7 @@ const LEGACY_HASH: Record<string, string> = {
   "month-end": "/month-end",
   "api-usage": "/api-usage",
   rules: "/rules",
+  bank: "/bank",
 };
 
 export default function App() {
@@ -47,6 +49,7 @@ export default function App() {
       <Routes>
         <Route element={<AppLayout session={session} />}>
           <Route path="/" element={<DocumentsPage />} />
+          <Route path="/bank" element={<BankPage />} />
           <Route path="/month-end" element={<MonthEndPage />} />
           <Route path="/connections" element={<ConnectionsPage />} />
           <Route path="/rules" element={<RulesPage />} />

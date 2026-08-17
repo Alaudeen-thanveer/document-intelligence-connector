@@ -57,6 +57,7 @@ export function AppLayout({ session }: { session: Session }) {
         <div className="rail-divider" />
 
         <div className="rail-group">
+          <RailLink to="/bank" label="Bank" icon="⌸" />
           <RailLink to="/connections" label="Connections" icon="⇄" />
           <RailLink to="/rules" label="Rules" icon="§" />
           <RailLink to="/api-usage" label="API usage" icon="▦" />

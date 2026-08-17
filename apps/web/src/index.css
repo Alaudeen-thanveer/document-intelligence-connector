@@ -976,6 +976,120 @@ button.linkish {
   }
 }
 
+/* ---------------------------------------------------------------- Bank page */
+.bank-intake {
+  display: grid;
+  grid-template-columns: minmax(14rem, 1fr) minmax(14rem, 1fr);
+  gap: 0.9rem 1.2rem;
+  align-items: start;
+}
+.bank-intake label {
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+.bank-intake select,
+.bank-intake textarea,
+.bank-intake input[type="file"] {
+  font: inherit;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.5rem 0.65rem;
+}
+.bank-intake textarea {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.78rem;
+  resize: vertical;
+}
+.bank-paste { grid-column: 1 / -1; }
+.bank-intake-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 0.9rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.bank-notice { margin: 0.4rem 0 0; }
+
+.bank-statements {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin: 0.9rem 0;
+}
+.bank-stmt-chip {
+  display: grid;
+  gap: 0.1rem;
+  text-align: left;
+  font: inherit;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0.5rem 0.8rem;
+  cursor: pointer;
+}
+.bank-stmt-chip span { font-size: 0.74rem; color: var(--muted); }
+.bank-stmt-chip.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(61, 190, 160, 0.18); }
+
+.bank-lines td, .bank-lines th { vertical-align: top; }
+.bank-lines select {
+  font: inherit;
+  font-size: 0.8rem;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.28rem 0.4rem;
+  max-width: 14rem;
+}
+.bank-desc { max-width: 22rem; font-size: 0.84rem; }
+.bank-desc small { display: block; font-size: 0.72rem; }
+.bank-why { max-width: 20rem; font-size: 0.78rem; }
+.bank-why small { display: block; margin-top: 0.25rem; line-height: 1.35; }
+.bank-actions { white-space: nowrap; }
+.bank-actions .btn + .btn { margin-left: 0.3rem; }
+.bank-apply { display: inline-flex; gap: 0.35rem; align-items: baseline; font-size: 0.8rem; }
+.bank-apply input { accent-color: var(--accent); }
+.bank-line.no-suggestion td { background: rgba(224, 163, 84, 0.06); }
+.bank-line.status-confirmed td { background: rgba(61, 190, 160, 0.06); }
+.bank-line.status-posted td { opacity: 0.72; }
+.bank-line.status-skipped td { opacity: 0.5; }
+.bank-line.status-failed td { background: rgba(224, 112, 112, 0.08); }
+.bank-src { font-size: 0.68rem; }
+.bank-src-open_document { color: var(--accent); }
+.bank-src-accepted_rule { color: var(--accent); }
+.bank-src-learned { color: #9dc4ff; }
+.bank-src-party_name { color: var(--warn); }
+@media (max-width: 800px) { .bank-intake { grid-template-columns: 1fr; } }
+
+/* Bank — phase 1: policies + allocation editor */
+.bank-policies .panel-header h2 { font-size: 0.86rem; font-weight: 500; color: var(--muted); }
+.bank-policy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 0.8rem 1.2rem; margin-top: 0.6rem; }
+.bank-policy-grid label { display: grid; gap: 0.3rem; font-size: 0.8rem; color: var(--text); }
+.bank-policy-grid input { font: inherit; color: var(--text); background: rgba(255,255,255,0.05); border: 1px solid var(--line); border-radius: 8px; padding: 0.4rem 0.55rem; }
+.bank-policy-grid small { font-size: 0.72rem; line-height: 1.35; }
+.bank-policy-note { grid-column: 1 / -1; }
+.bank-alloc-cell { min-width: 17rem; }
+.bank-alloc { display: grid; gap: 0.3rem; font-size: 0.8rem; }
+.bank-alloc-row { display: grid; grid-template-columns: 1fr 6.5rem auto; gap: 0.4rem; align-items: center; }
+.bank-alloc-row input, .bank-alloc-opts input[type="number"] { font: inherit; font-size: 0.8rem; color: var(--text); background: rgba(255,255,255,0.05); border: 1px solid var(--line); border-radius: 6px; padding: 0.22rem 0.4rem; width: 6.5rem; text-align: right; }
+.bank-x { background: transparent; border: 0; color: var(--muted); cursor: pointer; font-size: 0.8rem; padding: 0 0.2rem; }
+.bank-x:hover { color: var(--danger); }
+.bank-alloc-sum { font-size: 0.74rem; color: var(--text); }
+.bank-adv { color: var(--warn); }
+.bank-alloc-opts { display: flex; gap: 0.8rem; flex-wrap: wrap; align-items: center; }
+.bank-alloc-opts label { display: inline-flex; gap: 0.35rem; align-items: center; font-size: 0.76rem; color: var(--muted); }
+
+/* Review — unused credit prompt */
+.unused-credit { border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: 10px; padding: 0.7rem 0.9rem; margin: 0 0 0.9rem; display: grid; gap: 0.4rem; background: rgba(224,163,84,0.06); }
+.unused-credit-head { margin: 0; font-size: 0.86rem; }
+.unused-credit-row { display: grid; grid-template-columns: auto 1fr 7rem auto; gap: 0.5rem; align-items: center; font-size: 0.8rem; }
+.unused-credit-row input[type="number"] { font: inherit; font-size: 0.8rem; color: var(--text); background: rgba(255,255,255,0.05); border: 1px solid var(--line); border-radius: 6px; padding: 0.22rem 0.4rem; text-align: right; }
+.unused-credit-row input[type="checkbox"] { accent-color: var(--accent); }
 .signin-wrap {
   max-width: 420px;
   margin: 12vh auto 0;

@@ -46,6 +46,12 @@ where id = 'USER_UUID';
 
 Then sign out/in again.
 
+### Demo scripts and the bank statement flow
+
+- `scripts/demo/reset-demo.mjs` calls human-only edges (learner, judgment), so it signs in as a local Auth user: set `DEMO_USER_EMAIL` / `DEMO_USER_PASSWORD` in the root `.env` (a user created as above, who is a company member). Never commit credentials.
+- The `bank-statement` edge is human-only for `suggest` / `confirm` / `push` / `party_credits`. `ingest` additionally accepts the service role **only** with `source: "email"` — the mailbox pipeline's machine-to-machine path. Browser callers always need a user session.
+- Bank tables (`bk_bank_patterns`, `bank_statements`, `bank_statement_lines`) follow the company-scoped model (`current_company_id()`), no anon access — see migration `20260817180000_bank_tables_company_rls.sql`.
+
 ## Situation A — local guardrails (ops, always)
 
 - Local Supabase only on `127.0.0.1` / `localhost` — **no** ngrok/public tunnel to the DB or Studio.

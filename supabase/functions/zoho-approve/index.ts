@@ -31,12 +31,24 @@ interface ApproveInput {
   account_id?: string | null;
   paid_through_account_id?: string | null;
   tax_treatment?: string | null;
+  /**
+   * Unused credit the reviewer chose to apply once the document exists
+   * (advances = unused payments, credit notes / vendor credits). Applied
+   * AFTER a successful create; a failure here never undoes the document —
+   * it is reported in the response.
+   */
+  apply_credits?: Array<{
+    kind: "customerpayment" | "creditnote" | "vendorpayment" | "vendorcredit";
+    zoho_id: string;
+    amount: number;
+  }> | null;
 }
 
 interface ApproveResult {
   success: boolean;
   zoho_bill_id?: string;
   error?: string;
+  credits_applied?: { applied: number; ok: boolean; response?: unknown } | null;
 }
 
 let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
@@ -264,6 +276,43 @@ async function zohoCreate(
   >;
   const id = root.bill_id ?? root.invoice_id ?? root.expense_id ?? raw.bill_id;
   return { id: id != null ? String(id) : null, result };
+}
+
+/**
+ * Apply unused credits to a freshly created invoice or bill.
+ *   invoice: POST /invoices/{id}/credits { invoice_payments[], apply_creditnotes[] }
+ *   bill:    POST /bills/{id}/credits    { bill_payments[], apply_vendor_credits[] }
+ * Only what the reviewer ticked. Zoho refuses over-application; we surface it.
+ */
+async function applyCreditsToDoc(
+  docKind: "invoice" | "bill",
+  docId: string,
+  credits: NonNullable<ApproveInput["apply_credits"]>,
+): Promise<{ applied: number; ok: boolean; response?: unknown }> {
+  const wanted = credits.filter((c) => c && c.zoho_id && Number(c.amount) > 0);
+  if (!wanted.length) return { applied: 0, ok: true };
+  const body: Record<string, unknown> = {};
+  if (docKind === "invoice") {
+    const pays = wanted.filter((c) => c.kind === "customerpayment").map((c) => ({ payment_id: c.zoho_id, amount_applied: Number(c.amount) }));
+    const cns = wanted.filter((c) => c.kind === "creditnote").map((c) => ({ creditnote_id: c.zoho_id, amount_applied: Number(c.amount) }));
+    if (pays.length) body.invoice_payments = pays;
+    if (cns.length) body.apply_creditnotes = cns;
+  } else {
+    const pays = wanted.filter((c) => c.kind === "vendorpayment").map((c) => ({ payment_id: c.zoho_id, amount_applied: Number(c.amount) }));
+    const vcs = wanted.filter((c) => c.kind === "vendorcredit").map((c) => ({ vendor_credit_id: c.zoho_id, amount_applied: Number(c.amount) }));
+    if (pays.length) body.bill_payments = pays;
+    if (vcs.length) body.apply_vendor_credits = vcs;
+  }
+  if (!Object.keys(body).length) return { applied: 0, ok: true };
+  const result = await withZohoRetry(async (accessToken) => {
+    const res = await zohoFetch(
+      `${apiBase()}/${docKind === "invoice" ? "invoices" : "bills"}/${encodeURIComponent(docId)}/credits?organization_id=${encodeURIComponent(orgId())}`,
+      { method: "POST", headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" }, body: JSON.stringify(body) },
+    );
+    const raw = await res.json().catch(() => ({}));
+    return { ok: res.ok && (raw as { code?: number })?.code === 0, status: res.status, raw };
+  });
+  return { applied: result.ok ? wanted.reduce((t, c) => t + Number(c.amount), 0) : 0, ok: result.ok, response: result.raw };
 }
 
 async function loadCachedVendors(
@@ -615,16 +664,31 @@ Deno.serve(async (req) => {
       source_type: "push",
       erp_name: "zoho_books",
       external_doc_id: zohoId,
+      // bills | invoices | expenses — expenses paid through a bank count as
+      // "already recorded" for the statement flow.
+      external_kind: postAs === "invoice" ? "invoices" : postAs === "expense" ? "expenses" : "bills",
     });
+
+    // Reviewer chose to apply unused credit (advance / credit note / vendor
+    // credit) to this invoice or bill. Best-effort, after the document
+    // exists; reported, never fatal.
+    let creditsApplied: ApproveResult["credits_applied"] = null;
+    if (zohoId && postAs !== "expense" && input.apply_credits?.length) {
+      try {
+        creditsApplied = await applyCreditsToDoc(postAs === "invoice" ? "invoice" : "bill", zohoId, input.apply_credits);
+      } catch (err) {
+        creditsApplied = { applied: 0, ok: false, response: publicError(err) };
+      }
+    }
     await writeAudit(supabase, {
       company_id: companyId,
       invoice_id: invoiceId,
       actor_id: user.id,
       action: "zoho_synced",
-      detail: { zoho_bill_id: zohoId, post_as: postAs },
+      detail: { zoho_bill_id: zohoId, post_as: postAs, credits_applied: creditsApplied?.applied ?? 0 },
     });
 
-    return jsonResponse({ success: true, zoho_bill_id: zohoId ?? undefined });
+    return jsonResponse({ success: true, zoho_bill_id: zohoId ?? undefined, credits_applied: creditsApplied });
   } catch (err) {
     return await fail(publicError(err));
   }

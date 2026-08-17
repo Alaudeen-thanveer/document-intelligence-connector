@@ -44,6 +44,7 @@ export async function callEdgeFunction(
     | "bookkeeping-learn"
     | "month-end"
     | "api-usage"
+    | "bank-statement"
     | "ingest"
     | "inbound-email",
   body: Record<string, unknown>,
