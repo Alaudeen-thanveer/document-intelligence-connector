@@ -14,7 +14,7 @@ export function useDocuments() {
       setLoading(true);
       const { data, error: queryError } = await supabase
         .from("documents")
-        .select("id, source, file_url, status, uploaded_at, doc_type, confidence")
+        .select("id, source, file_url, status, uploaded_at, doc_type, confidence, zoho_bill_id")
         .order("uploaded_at", { ascending: false });
 
       if (cancelled) return;

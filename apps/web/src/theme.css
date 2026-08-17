@@ -1,0 +1,30 @@
+/* Defaults = chalk (pics 1–2). ThemeProvider swaps to ink (pics 3–4). */
+:root {
+  --bg: #f8f9f8;
+  --bg-panel: #ffffff;
+  --bg-panel-2: #f3f4f3;
+  --bg-input: #ffffff;
+  --border: #e5e7eb;
+  --border-soft: #eef0ee;
+  --accent: #10b981;
+  --accent-2: #059669;
+  --accent-soft: #d1fae5;
+  --accent-dim: #a7f3d0;
+  --text: #111827;
+  --text-dim: #4b5563;
+  --text-faint: #9ca3af;
+  --warn: #f97316;
+  --warn-soft: #fff7ed;
+  --warn-border: #fdba74;
+  --on-accent: #ffffff;
+
+  /* Legacy names used by existing screens — follow the active theme. */
+  --bg-0: var(--bg);
+  --bg-1: var(--bg);
+  --panel: var(--bg-panel);
+  --panel-solid: var(--bg-panel);
+  --line: var(--border);
+  --muted: var(--text-dim);
+  --accent-deep: var(--accent-2);
+  --flag: var(--warn);
+}

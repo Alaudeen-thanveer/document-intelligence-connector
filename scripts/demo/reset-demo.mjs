@@ -46,7 +46,7 @@ for (const line of readFileSync(ENV_PATH, "utf8").split(/\r?\n/)) {
 
 function run(script) {
   return new Promise((ok, fail) => {
-    const child = spawn(process.execPath, [resolve(HERE, script), ENV_PATH], { stdio: "inherit" });
+    const child = spawn(process.execPath, [resolve(HERE, script), ENV_PATH], { stdio: "inherit", env: process.env });
     child.on("exit", (code) => (code === 0 ? ok() : fail(new Error(`${script} exited ${code}`))));
     child.on("error", fail);
   });
@@ -85,11 +85,34 @@ await fetch(`${env.SUPABASE_URL}/rest/v1/bk_journal_patterns?label=like.*Travel*
 step(1, "Seeding Zoho-shaped history and demo parties");
 await run("seed-history.mjs");
 
+// Human-triggered edges (learner, judgment) require a signed-in user since
+// the auth hardening. Sign in as the local demo reviewer; credentials come
+// from the env file (DEMO_USER_EMAIL / DEMO_USER_PASSWORD), never from here.
+const demoEmail = env.DEMO_USER_EMAIL || process.env.DEMO_USER_EMAIL;
+const demoPassword = env.DEMO_USER_PASSWORD || process.env.DEMO_USER_PASSWORD;
+if (!demoEmail || !demoPassword) {
+  console.error("Set DEMO_USER_EMAIL and DEMO_USER_PASSWORD in .env (a local Auth user who is a company member) — see docs/SECURITY_BASELINE.md.");
+  process.exit(1);
+}
+const signIn = await fetch(`${env.SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+  method: "POST",
+  headers: { apikey: env.SUPABASE_ANON_KEY, "Content-Type": "application/json" },
+  body: JSON.stringify({ email: demoEmail, password: demoPassword }),
+});
+const session = await signIn.json();
+if (!signIn.ok || !session.access_token) {
+  console.error("Could not sign in as the demo reviewer:", JSON.stringify(session).slice(0, 300));
+  process.exit(1);
+}
+process.env.DEMO_USER_JWT = session.access_token; // children use it for judgment
+console.log(`    signed in as ${demoEmail}`);
+
 step(2, "Running the real learner over that history (no Zoho calls)");
 const learn = await fetch(`${env.SUPABASE_URL}/functions/v1/bookkeeping-learn`, {
   method: "POST",
   headers: {
-    Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`,
+    Authorization: `Bearer ${session.access_token}`,
+    apikey: env.SUPABASE_ANON_KEY,
     "Content-Type": "application/json",
     "X-Actor": "demo-reset",
   },

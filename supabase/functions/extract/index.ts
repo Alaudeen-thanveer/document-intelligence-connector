@@ -9,6 +9,7 @@ import {
   extractLineItemsWithGemini,
   reExtractFieldWithGemini,
 } from "./gemini_fallback.ts";
+import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
 
 const DEFAULT_EXTRACTION_CONFIDENCE_THRESHOLD = 0.8;
 const MINDEE_V1_INVOICE_URL =
@@ -95,17 +96,37 @@ function asDateString(value: unknown): string | null {
   return d.toISOString().slice(0, 10);
 }
 
+/**
+ * Read a Mindee field. Confidence is `null` when the API omitted a score
+ * (Mindee v2 returns confidence: null on every field). Callers must not treat
+ * null as 0 — that forced Gemini fallback on every field (issue #2).
+ */
 function mindeeField(
   prediction: Record<string, unknown>,
   key: string,
-): { value: unknown; confidence: number } {
+): { value: unknown; confidence: number | null } {
   const field = prediction[key] as
-    | { value?: unknown; confidence?: number }
+    | { value?: unknown; confidence?: number | null }
     | undefined;
   return {
     value: field?.value ?? null,
-    confidence: typeof field?.confidence === "number" ? field.confidence : 0,
+    confidence: typeof field?.confidence === "number" ? field.confidence : null,
   };
+}
+
+/**
+ * Map OCR confidence for threshold routing.
+ * - Missing/unparseable value → 0 (always eligible for Gemini)
+ * - Real numeric score from Mindee (v1) → use as-is
+ * - Value present but score omitted (v2) → trust OCR (1); only fall back when empty
+ */
+function resolveOcrConfidence(
+  normalizedValue: unknown,
+  rawConfidence: number | null,
+): number {
+  if (normalizedValue == null || normalizedValue === "") return 0;
+  if (typeof rawConfidence === "number") return rawConfidence;
+  return 1;
 }
 
 /** Load invoice bytes; prefer Storage client so Docker-local 127.0.0.1 URLs work. */
@@ -113,10 +134,25 @@ async function loadDocumentBytes(
   supabase: SupabaseClient,
   fileUrl: string,
 ): Promise<{ bytes: Uint8Array; contentType: string; filename: string }> {
-  const publicMarker = "/storage/v1/object/public/invoices/";
-  const publicIdx = fileUrl.indexOf(publicMarker);
-  if (publicIdx >= 0) {
-    const path = decodeURIComponent(fileUrl.slice(publicIdx + publicMarker.length));
+  const markers = [
+    "/storage/v1/object/public/invoices/",
+    "/storage/v1/object/sign/invoices/",
+    "/storage/v1/object/authenticated/invoices/",
+    "storage://invoices/",
+  ];
+  let path: string | null = null;
+  for (const marker of markers) {
+    const idx = fileUrl.indexOf(marker);
+    if (idx >= 0) {
+      path = decodeURIComponent(fileUrl.slice(idx + marker.length).split("?")[0]);
+      break;
+    }
+  }
+  if (!path && !fileUrl.includes("://") && fileUrl.includes("/")) {
+    path = fileUrl.split("?")[0];
+  }
+
+  if (path) {
     const { data, error } = await supabase.storage.from("invoices").download(path);
     if (error || !data) {
       throw new Error(`storage download failed: ${error?.message ?? "no data"}`);
@@ -150,7 +186,7 @@ async function loadDocumentBytes(
 function pickField(
   prediction: Record<string, unknown>,
   keys: string[],
-): { value: unknown; confidence: number } {
+): { value: unknown; confidence: number | null } {
   for (const key of keys) {
     const field = mindeeField(prediction, key);
     if (field.value != null && field.value !== "") return field;
@@ -426,20 +462,24 @@ function mapMindeeToFields(
     "document_date",
   ]);
 
+  const vendorValue = supplier.value != null ? String(supplier.value) : null;
+  const totalValue = asNumber(total.value);
+  const dateValue = asDateString(date.value);
+
   return {
     vendor_raw: {
-      value: supplier.value != null ? String(supplier.value) : null,
-      confidence: supplier.confidence,
+      value: vendorValue,
+      confidence: resolveOcrConfidence(vendorValue, supplier.confidence),
       source: "mindee",
     },
     total_amount: {
-      value: asNumber(total.value),
-      confidence: total.confidence,
+      value: totalValue,
+      confidence: resolveOcrConfidence(totalValue, total.confidence),
       source: "mindee",
     },
     invoice_date: {
-      value: asDateString(date.value),
-      confidence: date.confidence,
+      value: dateValue,
+      confidence: resolveOcrConfidence(dateValue, date.confidence),
       source: "mindee",
     },
     currency: {
@@ -542,17 +582,23 @@ async function applyFieldFallbacks(
   for (const field of targets) {
     const current = result[field];
     const ocrConfidence = current.confidence;
+    const missing = current.value == null || current.value === "";
     result[field] = {
       ...current,
       ocr_confidence: ocrConfidence,
       ai_fallback_triggered: false,
     };
 
-    if (ocrConfidence >= threshold) continue;
+    // Keep Mindee when it produced a value at/above threshold.
+    // Missing values always fall back; low real scores (v1) also fall back.
+    // v2 null scores are resolved to 1 when a value exists (see resolveOcrConfidence).
+    if (!missing && ocrConfidence >= threshold) continue;
 
     try {
       console.log(
-        `Low OCR confidence on ${field} (${ocrConfidence} < ${threshold}); running Gemini fallback`,
+        missing
+          ? `OCR found no ${field}; running Gemini fallback`
+          : `Low OCR confidence on ${field} (${ocrConfidence} < ${threshold}); running Gemini fallback`,
       );
       const replaced = await reExtractFieldWithGemini(imageUrl, field);
       result[field] = {
@@ -721,9 +767,24 @@ async function persistExtraction(
 }
 
 Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers":
+          "authorization, content-type, apikey, x-client-info, x-action-id, x-actor",
+      },
+    });
+  }
+
   if (req.method !== "POST") {
     return jsonResponse({ error: "Method not allowed" }, 405);
   }
+
+  // Human UI or ingest sibling (service_role). Reject anon-as-Bearer.
+  const auth = await requireAuth(req, { allowServiceRole: true });
+  if (isAuthFail(auth)) return auth.response;
 
   let input: ExtractInput;
   try {

@@ -1,4 +1,4 @@
-import { functionsUrl } from "./supabase";
+import { functionsUrl, supabase } from "./supabase";
 
 /**
  * Who is clicking, for the API-usage log. Set once by the app shell from
@@ -10,16 +10,19 @@ export function setActor(name: string): void {
 }
 
 /**
- * Every call gets an X-Action-Id so the Zoho calls it causes server-side
- * are grouped as one "click" on the API-usage dashboard. Callers may pass
- * their own id to group several function calls (e.g. extract + judgment)
- * under a single click.
+ * Situation B: protected edge calls must carry the signed-in user's JWT.
+ * Never silently fall back to the anon key (that was frontend-only "security").
  */
-function authHeaders(actionId: string): HeadersInit {
+async function authHeaders(actionId: string): Promise<HeadersInit> {
   const anon = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
+  const { data } = await supabase.auth.getSession();
+  const accessToken = data.session?.access_token?.trim();
+  if (!accessToken) {
+    throw new Error("Sign in required before calling edge functions");
+  }
   return {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${anon}`,
+    Authorization: `Bearer ${accessToken}`,
     apikey: anon,
     "X-Action-Id": actionId,
     "X-Actor": currentActor,
@@ -41,13 +44,15 @@ export async function callEdgeFunction(
     | "bookkeeping-learn"
     | "month-end"
     | "api-usage"
-    | "bank-statement",
+    | "bank-statement"
+    | "ingest"
+    | "inbound-email",
   body: Record<string, unknown>,
   opts?: { actionId?: string },
 ): Promise<{ ok: boolean; status: number; body: Record<string, unknown> }> {
   const res = await fetch(`${functionsUrl}/${name}`, {
     method: "POST",
-    headers: authHeaders(opts?.actionId ?? newActionId()),
+    headers: await authHeaders(opts?.actionId ?? newActionId()),
     body: JSON.stringify(body),
   });
   const text = await res.text();

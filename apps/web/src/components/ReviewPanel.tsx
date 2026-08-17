@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { callEdgeFunction } from "../lib/functions";
+import { invoiceStoragePath } from "../lib/storagePath";
 import { supabase } from "../lib/supabase";
 import { entityAccountType, findByName } from "../lib/zoho";
 import { useZohoEntities } from "../hooks/useZohoEntities";
@@ -511,6 +512,25 @@ export function ReviewPanel({
     return null;
   }
 
+  async function openDocumentFile() {
+    if (!document?.file_url) return;
+    const path = invoiceStoragePath(document.file_url);
+    if (!path) {
+      window.open(document.file_url, "_blank", "noopener,noreferrer");
+      return;
+    }
+    const { data, error: signError } = await supabase.storage
+      .from("invoices")
+      .createSignedUrl(path, 3600);
+    if (signError || !data?.signedUrl) {
+      setActionMsg(
+        `Could not open file: ${signError?.message ?? "signed URL failed"}`,
+      );
+      return;
+    }
+    window.open(data.signedUrl, "_blank", "noopener,noreferrer");
+  }
+
   async function correct() {
     if (!extracted) {
       setActionMsg("No extracted fields to correct.");
@@ -724,56 +744,47 @@ export function ReviewPanel({
     }
 
     try {
-      const push = await callEdgeFunction("zoho-push", {
-        document_id: document!.id,
-        post_as: postAs,
-        vendor_id: vendorId || undefined,
-        customer_id: customerId || undefined,
-        // With per-line accounts on every line, no transaction-level
-        // account is sent — each line already says where it posts.
-        account_id: allLinesHaveAccounts ? undefined : accountId || undefined,
-        paid_through_account_id: paidThroughId || undefined,
-        tax_treatment: taxTreatment || undefined,
-        apply_credits: Object.entries(applyCredits)
-          .filter(([, amt]) => amt > 0)
-          .map(([id, amt]) => {
-            const c = partyCredits.find((x) => x.zoho_id === id)!;
-            return { kind: c.kind, zoho_id: id, amount: amt };
-          }),
+      const { data, error } = await supabase.functions.invoke("zoho-approve", {
+        body: {
+          invoice_id: document!.id,
+          post_as: postAs,
+          vendor_id: vendorId || undefined,
+          customer_id: customerId || undefined,
+          account_id: allLinesHaveAccounts ? undefined : accountId || undefined,
+          paid_through_account_id: paidThroughId || undefined,
+          tax_treatment: taxTreatment || undefined,
+          apply_credits: Object.entries(applyCredits)
+            .filter(([, amt]) => amt > 0)
+            .map(([id, amt]) => {
+              const c = partyCredits.find((x) => x.zoho_id === id)!;
+              return { kind: c.kind, zoho_id: id, amount: amt };
+            }),
+        },
       });
-      if (!push.ok) {
-        const detail = String(
-          push.body.error ?? push.body.reason ?? push.status,
-        );
-        const gatewayHint =
-          push.status === 502 ||
-          /invalid response|upstream/i.test(detail)
-            ? " Edge Functions runtime was down or restarting — keep `npx supabase functions serve --env-file .env` running, then click Approve → Zoho again."
-            : "";
+      const result = (data ?? {}) as {
+        success?: boolean;
+        zoho_bill_id?: string;
+        error?: string;
+      };
+      if (error || !result.success) {
+        const detail = result.error ?? error?.message ?? "Zoho sync failed";
         setActionMsg(
-          `Approved in app, but Zoho push failed: ${detail}.${gatewayHint} Status stays approved until a successful push sets synced.`,
+          `Zoho sync failed: ${detail}. Status is sync_failed — fix the fields and Approve again.`,
         );
       } else {
-        const attach = push.body.attachment as
-          | { present_on_bill?: boolean; uploaded?: boolean }
-          | undefined;
-        const attachOk = Boolean(attach?.present_on_bill ?? attach?.uploaded);
-        const docId = String(push.body.external_doc_id ?? "");
         const label = postAs === "invoice"
           ? "Invoice"
           : postAs === "expense"
             ? "Expense"
             : "Bill";
-        setZohoBillId(docId || null);
+        setZohoBillId(result.zoho_bill_id ?? null);
         setActionMsg(
-          `Pushed to Zoho. ${label} ${docId}` +
-            (attachOk ? " — attachment present." : " — attachment not confirmed.") +
-            ` Check Zoho Books → ${label}s, or Studio table erp_sync_log.`,
+          `Pushed to Zoho. ${label} ${result.zoho_bill_id ?? ""}. Check Zoho Books or audit_log.`,
         );
       }
     } catch {
       setActionMsg(
-        "Approved in app. Zoho push function is not reachable — start `npx supabase functions serve --env-file .env`, then click Approve → Zoho again.",
+        "zoho-approve is not reachable — start `npm run functions:serve`, then click Approve → Zoho again.",
       );
     }
 
@@ -843,9 +854,13 @@ export function ReviewPanel({
         <div>
           <dt>File</dt>
           <dd className="truncate">
-            <a href={document.file_url} target="_blank" rel="noreferrer">
+            <button
+              type="button"
+              className="linkish"
+              onClick={() => void openDocumentFile()}
+            >
               Open file
-            </a>
+            </button>
           </dd>
         </div>
         <div>

@@ -7,6 +7,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
+import { isAuthFail, requireUser } from "../_shared/require_user.ts";
 
 /** Set per request; every Zoho call goes through it so usage is metered. */
 let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
@@ -450,6 +451,25 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: "Method not allowed" }, 405);
   }
 
+  const auth = await requireUser(req);
+  if (isAuthFail(auth)) return auth.response;
+
+  const companyId =
+    typeof auth.user?.app_metadata?.company_id === "string" &&
+      auth.user.app_metadata.company_id.trim()
+      ? auth.user.app_metadata.company_id.trim()
+      : null;
+  if (!companyId) {
+    return jsonResponse(
+      {
+        ok: false,
+        error:
+          "No company_id on this account. Set app_metadata.company_id / company_members, then sign out/in.",
+      },
+      403,
+    );
+  }
+
   let input: PullInput = {};
   try {
     const text = await req.text();
@@ -488,11 +508,12 @@ Deno.serve(async (req) => {
         }
       }
 
-      // Replace the cache for this kind atomically enough for a POC.
+      // Replace the cache for this kind for this company only.
       const { error: delError } = await supabase
         .from("zoho_entities")
         .delete()
-        .eq("kind", kind);
+        .eq("kind", kind)
+        .eq("company_id", companyId);
       if (delError) {
         throw new Error(`zoho_entities delete failed: ${delError.message}`);
       }
@@ -500,7 +521,7 @@ Deno.serve(async (req) => {
       if (rows.length > 0) {
         const { error: insError } = await supabase
           .from("zoho_entities")
-          .insert(rows);
+          .insert(rows.map((r) => ({ ...r, company_id: companyId })));
         if (insError) {
           throw new Error(`zoho_entities insert failed: ${insError.message}`);
         }

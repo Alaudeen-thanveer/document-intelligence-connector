@@ -308,15 +308,22 @@ export function suggestForLines(lines: LineForSuggest[], ctx: SuggestContext): A
       const byAmount = pool.filter((d) => Math.abs(d.balance - line.amount) <= AMOUNT_TOLERANCE);
       if (byAmount.length === 1) { party = { zoho_id: byAmount[0].party_zoho_id, name: byAmount[0].party_name }; howParty = `${fmt(line.amount)} equals the open balance of ${byAmount[0].number}`; }
     }
+    // Learned evidence: identifies the party when nothing else did, and
+    // strengthens the suggestion when it agrees with a party found by name.
     let learnedParty: BankPattern | null = null;
-    if (!party) {
+    {
       const m = matchBankPattern(line.description, line.side, ctx.patterns);
       const paymentKind = wantKind === "invoice" ? "customer_payment" : "vendor_payment";
       if (isBankMatchSuggestible(m) && m.pattern.txn_kind === paymentKind && m.pattern.party_kind === pk && m.pattern.party_zoho_id) {
-        const p = partyById.get(`${pk}:${m.pattern.party_zoho_id}`);
-        party = { zoho_id: m.pattern.party_zoho_id, name: p?.name ?? m.pattern.party_name ?? "" };
-        howParty = `lines like this were ${wantKind === "invoice" ? "receipts from" : "payments to"} ${party.name} before`;
-        learnedParty = m.pattern;
+        if (!party) {
+          const p = partyById.get(`${pk}:${m.pattern.party_zoho_id}`);
+          party = { zoho_id: m.pattern.party_zoho_id, name: p?.name ?? m.pattern.party_name ?? "" };
+          howParty = `lines like this were ${wantKind === "invoice" ? "receipts from" : "payments to"} ${party.name} before`;
+          learnedParty = m.pattern;
+        } else if (party.zoho_id === m.pattern.party_zoho_id) {
+          howParty += ` (and ${m.pattern.sample_size} earlier lines like this were ${wantKind === "invoice" ? "receipts from" : "payments to"} ${party.name})`;
+          learnedParty = m.pattern;
+        }
       }
     }
 

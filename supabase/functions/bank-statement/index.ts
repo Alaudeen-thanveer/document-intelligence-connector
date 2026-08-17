@@ -19,6 +19,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { GoogleGenerativeAI } from "npm:@google/generative-ai@0.24.1";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
+import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
 import { normalizeModelRows, type ParsedLine, type ParseResult, parseStatementText } from "./parse.ts";
 import {
   DEFAULT_POLICIES, fetchOpenCredits, fetchOpenDocuments, suggestForLines,
@@ -251,8 +252,24 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: "Invalid JSON body" }, 400);
   }
   const action = String(input.action ?? "");
+
+  // Same posture as every human-triggered edge: a signed-in user's JWT.
+  // The one exception is `ingest`, which the mailbox pipeline calls
+  // machine-to-machine with the service role (source 'email'); browser
+  // callers of ingest still need a user session. Everything that decides
+  // or posts (confirm / push) is human-only.
+  const auth = await requireAuth(req, {
+    corsHeaders: CORS_HEADERS,
+    allowServiceRole: action === "ingest",
+  });
+  if (isAuthFail(auth)) return auth.response;
+  if (auth.isServiceRole && String(input.source ?? "") !== "email") {
+    return jsonResponse({ ok: false, error: "Sign in required" }, 401);
+  }
+
   const companyId = String(input.company_id ?? DEFAULT_COMPANY);
-  const actor = req.headers.get("x-actor")?.trim() || "reviewer";
+  const actor = auth.user?.email?.split("@")[0]
+    ?? (req.headers.get("x-actor")?.trim() || (auth.isServiceRole ? "mailbox" : "reviewer"));
   const supabase = getSupabase();
   const meter = createZohoMeter(supabase, { ...meterContextFromRequest(req, `bank-${action || "unknown"}`, "bank-statement"), company_id: companyId });
 

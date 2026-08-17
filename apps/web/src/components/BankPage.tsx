@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useOutletContext } from "react-router-dom";
+import type { AppOutletContext } from "../layout/AppLayout";
 import { callEdgeFunction, newActionId } from "../lib/functions";
 import { supabase } from "../lib/supabase";
 
@@ -194,7 +196,8 @@ function needsAccount(kind: TxnKind | ""): boolean {
   return kind === "expense" || kind === "deposit" || kind === "transfer";
 }
 
-export function BankPage({ reviewerName }: { reviewerName: string }) {
+export function BankPage() {
+  const { reviewerName } = useOutletContext<AppOutletContext>();
   const [bankAccounts, setBankAccounts] = useState<Entity[]>([]);
   const [vendors, setVendors] = useState<Entity[]>([]);
   const [customers, setCustomers] = useState<Entity[]>([]);

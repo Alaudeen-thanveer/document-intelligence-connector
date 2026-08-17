@@ -6,6 +6,7 @@ export interface DocumentRow {
   uploaded_at: string;
   doc_type: string | null;
   confidence: number | null;
+  zoho_bill_id?: string | null;
 }
 
 export interface ExtractedFieldsRow {
@@ -87,5 +88,6 @@ export function isFlaggedStatus(status: string): boolean {
     "flagged",
     "rejected",
     "extraction_failed",
+    "sync_failed",
   ].includes(status);
 }

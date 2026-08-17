@@ -79,11 +79,13 @@ for (const d of DOCS) {
 }
 
 // Run REAL judgment on the two under review so their checks are genuine.
-const ANON = env.SUPABASE_ANON_KEY;
+// Judgment is human-only: use the demo reviewer's JWT (set by reset-demo).
+const JWT = process.env.DEMO_USER_JWT;
+if (!JWT) { console.log("(no DEMO_USER_JWT — skipping judgment; run via reset-demo.mjs)"); process.exit(0); }
 for (const id of [DOCS[0].id, DOCS[1].id]) {
   const r = await fetch(`${U}/functions/v1/judgment`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${ANON}`, "Content-Type": "application/json", "X-Actor": "demo-seed" },
+    headers: { Authorization: `Bearer ${JWT}`, apikey: env.SUPABASE_ANON_KEY, "Content-Type": "application/json", "X-Actor": "demo-seed" },
     body: JSON.stringify({ document_id: id }),
   });
   const j = await r.json();
