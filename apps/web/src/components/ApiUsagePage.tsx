@@ -36,6 +36,9 @@ const ACTION_LABEL: Record<string, string> = {
   judgment: "Judgment",
   "usage-dashboard": "This dashboard",
   probe: "Probe",
+  "bank-ingest": "Bank: read statement",
+  "bank-suggest": "Bank: re-suggest",
+  "bank-push": "Bank: post to Zoho",
 };
 
 function pct(n: number | null): string {

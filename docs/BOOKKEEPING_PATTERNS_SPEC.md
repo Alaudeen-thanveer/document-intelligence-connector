@@ -74,6 +74,20 @@ Gap between invoice date and entry date; between entry and payment. Feeds the cu
 
 Which accounts are *used* vs merely defined. Feeds the review screen: show the ~15 accounts this customer actually uses first, the rest under “more”.
 
+### 3.9 Bank statement lines — built (bank layers 1–4)
+
+**What it learns.** For every categorised bank transaction in Zoho Books, every customer/vendor payment (its description + reference), and every statement line a reviewer confirms in this app: the statement description's *fingerprint* (salient words after stripping numbers, references and bank boilerplate — `bank_patterns.ts`), the side (money in / money out), and what the bookkeeper decided it was — party, account, and kind (customer receipt, vendor payment, expense, deposit, transfer). Grouped by (fingerprint, side); the dominant decision becomes the pattern with `share`, `sample_size`, amount band and confidence `share × (1 − 1/(n+1))`. Same words on opposite sides are different habits (a POS payment vs a refund).
+
+**What it suggests, per line, or nothing.** When a statement comes in (CSV/TSV upload, PDF via the vision model, pasted text, or — once the mailbox is wired — an email body/attachment through the same `ingest` entry point), every line gets at most one suggestion, in order of trust:
+1. **Open document** — money in that names an unpaid invoice's number or equals its balance (party name breaks amount ties) → *customer receipt applied to that invoice*; money out likewise → *vendor payment applied to that bill*. An amount-only match with two candidates at that amount is ambiguous → no suggestion.
+2. **Learned pattern** — the fingerprint matches (all tokens, or ≥⅔ of a 3+-token pattern) and score ≥ 0.55 → the usual party / account / kind, labelled *learned* (or *your rule* once accepted).
+3. **Party name** in the line with nothing else → the party only, kind by side, no account, low confidence.
+Below the gate, or nothing at all → the line stays **open**; the reviewer fills it. A split habit (e.g. salary batch booked two ways) scores under the gate and is deliberately not suggested.
+
+**Propose, don't impose, structurally.** Suggestions live in `bank_statement_lines.suggestion`; the reviewer's decision lives in `chosen_*` and is the only thing that ever reaches Zoho (`push.ts`: `/customerpayments` with `invoices[]`, `/vendorpayments` with `bills[]`, `/expenses` paid through the bank, `/banktransactions` for deposits and transfers). Confirm records whether the reviewer *accepted*, *changed* or *filled a blank* — the disagreement signal. Vendors/customers must exist in Zoho Books (synced cache, or the party Zoho itself returned on the matched open document). Every confirmed/posted line becomes an observation for the next learn, so the app learns from decisions without creating any rule.
+
+**Tables:** `bk_bank_patterns` (layer 1), `bank_statements` + `bank_statement_lines` (layers 2–4). **Function:** `bank-statement` (`ingest` / `suggest` / `confirm` / `push`). **UI:** the Bank page. **Tests:** `bk-bank-layer1-accuracy`, `bank-layer2-parse-accuracy`, `bank-layer3-suggest-accuracy`.
+
 ## 4. Knowledge base shape
 
 Three layers, every entry carrying `sample_size`, `confidence`, and `last_seen`.
@@ -130,6 +144,7 @@ All available on the connection already in place. Line-item detail requires fetc
 4. Items per customer (invoice side)
 5. Recurring journals (month-end context)
 6. Timing (payment behaviour)
+7. Bank statement lines: learn from categorised bank history → ingest statements → suggest per line (open document / learned / party name / nothing) → confirm → post; confirmations feed the learner. **Built.**
 
 Each step ships as: onboarding job → tables → suggestions surface → override logging. Continuous learning (every approved document updates the profile) is part of step 1, not a later phase.
 

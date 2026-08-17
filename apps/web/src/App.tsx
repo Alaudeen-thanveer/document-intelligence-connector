@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { ConnectionsPage } from "./components/ConnectionsPage";
+import { BankPage } from "./components/BankPage";
 import { MonthEndPage } from "./components/MonthEndPage";
 import { ApiUsagePage } from "./components/ApiUsagePage";
 import { setActor } from "./lib/functions";
@@ -26,7 +27,7 @@ export default function App() {
   const [rulesVersion, setRulesVersion] = useState(0);
   // Hash-routed pages: #connections and #month-end are their own pages;
   // anything else = documents.
-  type View = "documents" | "connections" | "month-end" | "api-usage";
+  type View = "documents" | "connections" | "month-end" | "api-usage" | "bank";
   const viewFromHash = (): View =>
     window.location.hash === "#connections"
       ? "connections"
@@ -34,7 +35,9 @@ export default function App() {
         ? "month-end"
         : window.location.hash === "#api-usage"
           ? "api-usage"
-          : "documents";
+          : window.location.hash === "#bank"
+            ? "bank"
+            : "documents";
   const [view, setView] = useState<View>(viewFromHash);
 
   useEffect(() => {
@@ -102,7 +105,9 @@ export default function App() {
                 ? "Month-end"
                 : view === "api-usage"
                   ? "API usage"
-                  : "Document review"}
+                  : view === "bank"
+                    ? "Bank"
+                    : "Document review"}
           </h1>
         </div>
         <div className="topbar-actions">
@@ -113,6 +118,14 @@ export default function App() {
               onClick={() => navigate("documents")}
             >
               Documents
+            </button>
+            <button
+              type="button"
+              className={`tab-btn${view === "bank" ? " active" : ""}`}
+              onClick={() => navigate("bank")}
+              title="Bank statements: suggestions per line, you decide, then post"
+            >
+              Bank
             </button>
             <button
               type="button"
@@ -168,6 +181,8 @@ export default function App() {
         <MonthEndPage />
       ) : view === "api-usage" ? (
         <ApiUsagePage />
+      ) : view === "bank" ? (
+        <BankPage reviewerName={reviewerName} />
       ) : (
       <main className="layout">
         <section className="list-pane">

@@ -38,6 +38,12 @@ import {
   isJournalPatternProposable,
   type JournalForPattern,
 } from "./journal_patterns.ts";
+import {
+  type BankObservation,
+  type BankSide,
+  type BankTxnKind,
+  buildBankPatterns,
+} from "./bank_patterns.ts";
 
 type DocKind =
   | "bill"
@@ -255,6 +261,9 @@ function toHistoryDoc(
   kind: DocKind,
   raw: Record<string, unknown>,
 ): HistoryDoc | null {
+  // Payments feed layer 6 and bank transactions feed bank layer 1; neither
+  // is a party→account document.
+  if (!KIND_META[kind]) return null;
   if (kind === "vendorpayment" || kind === "customerpayment") return null;
   const doc = (raw[KIND_META[kind].rootKey] ?? raw) as Record<string, unknown>;
 
@@ -335,6 +344,204 @@ function toHistoryDoc(
 }
 
 // ---------------------------------------------------------------------------
+// Bank transactions (bank layer 1).
+// ---------------------------------------------------------------------------
+
+/** Zoho transaction_type → the kind we learn. */
+function bankTxnKind(t: string): BankTxnKind {
+  const s = t.toLowerCase();
+  if (s === "customer_payment") return "customer_payment";
+  if (s === "vendor_payment") return "vendor_payment";
+  if (s.includes("transfer")) return "transfer";
+  if (
+    s === "expense" || s === "card_payment" || s === "expense_refund" ||
+    s.includes("charge") || s.includes("tax")
+  ) return "expense";
+  if (
+    s === "deposit" || s === "sales_without_invoices" || s === "interest_income" ||
+    s === "other_income" || s === "owner_contribution" || s === "refund"
+  ) return "deposit";
+  return "other";
+}
+
+/**
+ * List categorised transactions on every bank/cash account and cache the
+ * rows. Zoho keeps payment-type rows under the payments endpoints (their
+ * detail 404s here), so only expense/deposit/transfer kinds are detail-
+ * fetched, and only to learn the category account id.
+ */
+async function fetchBankTransactions(
+  supabase: SupabaseClient,
+  token: string,
+  companyId: string,
+  fromDate: string,
+  cap: number,
+): Promise<number> {
+  const accts = await zohoGet(token, "bankaccounts");
+  const accounts = ((accts.bankaccounts as Array<Record<string, unknown>>) ?? [])
+    .filter((a) => a.account_id != null);
+  let fetched = 0;
+  for (const a of accounts) {
+    const accountId = String(a.account_id);
+    let page = 1;
+    let count = 0;
+    while (count < cap && page <= 25) {
+      let raw: Record<string, unknown>;
+      try {
+        raw = await zohoGet(token, "banktransactions", {
+          account_id: accountId,
+          date_start: fromDate,
+          per_page: "200",
+          page: String(page),
+          sort_column: "date",
+          sort_order: "D",
+        });
+      } catch {
+        // Some orgs reject the date filter here; fall back to unfiltered.
+        raw = await zohoGet(token, "banktransactions", {
+          account_id: accountId,
+          per_page: "200",
+          page: String(page),
+        });
+      }
+      const rows = (raw.banktransactions as Array<Record<string, unknown>>) ?? [];
+      for (const row of rows) {
+        const id = String(row.transaction_id ?? "");
+        if (!id) continue;
+        // Uncategorised feed lines teach nothing yet.
+        const status = String(row.status ?? "").toLowerCase();
+        if (status === "uncategorized") continue;
+        const { data: have } = await supabase
+          .from("bk_history_raw")
+          .select("zoho_id")
+          .eq("company_id", companyId)
+          .eq("doc_kind", "banktransaction")
+          .eq("zoho_id", id)
+          .maybeSingle();
+        if (have) { count++; continue; }
+
+        const kind = bankTxnKind(String(row.transaction_type ?? ""));
+        let payload: Record<string, unknown> = { banktransaction: row };
+        if (kind !== "customer_payment" && kind !== "vendor_payment") {
+          try {
+            const detail = await zohoGet(token, `banktransactions/${id}`);
+            if (detail.banktransaction) {
+              payload = {
+                banktransaction: {
+                  ...row,
+                  ...(detail.banktransaction as Record<string, unknown>),
+                },
+              };
+            }
+          } catch {
+            // list row is enough; category id resolves by name later
+          }
+        }
+        await supabase.from("bk_history_raw").upsert({
+          company_id: companyId,
+          doc_kind: "banktransaction",
+          zoho_id: id,
+          payload,
+        }, { onConflict: "company_id,doc_kind,zoho_id" });
+        fetched++;
+        count++;
+        if (count >= cap) break;
+      }
+      const more = Boolean(
+        (raw as { page_context?: { has_more_page?: boolean } }).page_context
+          ?.has_more_page,
+      );
+      if (!more) break;
+      page++;
+    }
+  }
+  return fetched;
+}
+
+/**
+ * Turn cached history into bank observations. Three sources:
+ *   • categorised bank transactions (description, payee, category account)
+ *   • customer / vendor payments (description + reference, party, deposit
+ *     or paid-through account)
+ *   • lines a reviewer confirmed in this app (added in bank layer 4)
+ * accountByName resolves a category shown only by name on list rows.
+ */
+function bankObservationsFromHistory(
+  rawRows: Array<{ doc_kind: string; payload: unknown }>,
+  accountByName: Map<string, string>,
+): BankObservation[] {
+  const out: BankObservation[] = [];
+  for (const r of rawRows) {
+    const p = r.payload as Record<string, unknown>;
+    if (r.doc_kind === "banktransaction") {
+      const t = (p.banktransaction ?? p) as Record<string, unknown>;
+      // First non-empty of description / reference / payee — feeds often
+      // leave description blank and put the counterparty in payee.
+      const description = [t.description, t.reference_number, t.payee]
+        .map((x) => (x == null ? "" : String(x).trim()))
+        .find(Boolean) ?? "";
+      if (!description) continue;
+      const side: BankSide = String(t.debit_or_credit ?? "").toLowerCase() === "credit"
+        ? "credit"
+        : "debit";
+      const kind = bankTxnKind(String(t.transaction_type ?? ""));
+      const isPayment = kind === "customer_payment" || kind === "vendor_payment";
+      // Category account: from detail line_items, else by offset name.
+      const li = ((t.line_items as Array<Record<string, unknown>>) ?? [])[0];
+      const offsetName = t.offset_account_name != null ? String(t.offset_account_name) : null;
+      const accountId = li?.account_id != null
+        ? String(li.account_id)
+        : offsetName && accountByName.has(offsetName.toLowerCase())
+        ? accountByName.get(offsetName.toLowerCase())!
+        : null;
+      const partyId = t.customer_id != null && String(t.customer_id) !== ""
+        ? String(t.customer_id)
+        : t.vendor_id != null && String(t.vendor_id) !== ""
+        ? String(t.vendor_id)
+        : null;
+      out.push({
+        description,
+        side,
+        amount: Number(t.amount ?? 0) || 0,
+        date: String(t.date ?? "").slice(0, 10),
+        txn_kind: kind,
+        party_kind: partyId
+          ? (kind === "vendor_payment" || (kind === "expense" && side === "debit") ? "vendor" : "customer")
+          : null,
+        party_zoho_id: partyId,
+        party_name: t.payee != null && String(t.payee) !== "" ? String(t.payee) : null,
+        account_id: isPayment ? null : accountId,
+        account_name: isPayment ? null : (li?.account_name != null ? String(li.account_name) : offsetName),
+        source: "zoho_bank",
+      });
+    } else if (r.doc_kind === "customerpayment" || r.doc_kind === "vendorpayment") {
+      const root = r.doc_kind === "customerpayment" ? "payment" : "vendorpayment";
+      const d = (p[root] ?? p) as Record<string, unknown>;
+      const description = [d.description, d.reference_number]
+        .map((x) => (x == null ? "" : String(x).trim()))
+        .filter(Boolean)
+        .join(" ");
+      if (!description) continue;
+      const isCustomer = r.doc_kind === "customerpayment";
+      out.push({
+        description,
+        side: isCustomer ? "credit" : "debit",
+        amount: Number(d.amount ?? 0) || 0,
+        date: String(d.date ?? "").slice(0, 10),
+        txn_kind: isCustomer ? "customer_payment" : "vendor_payment",
+        party_kind: isCustomer ? "customer" : "vendor",
+        party_zoho_id: String((isCustomer ? d.customer_id : d.vendor_id) ?? "") || null,
+        party_name: String((isCustomer ? d.customer_name : d.vendor_name) ?? "") || null,
+        account_id: null,
+        account_name: null,
+        source: "zoho_payment",
+      });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -374,6 +581,7 @@ Deno.serve(async (req) => {
     let expensesFetched = 0;
     let journalsFetched = 0;
     let paymentsFetched = 0;
+    let bankTransactionsFetched = 0;
 
     if (!input.reanalyze_only) {
       const token = await getAccessToken(supabase);
@@ -423,6 +631,15 @@ Deno.serve(async (req) => {
           else paymentsFetched++;
         }
       }
+
+      // Bank transactions are listed per bank account, not by date range
+      // across the org, so they get their own pass. The list row already
+      // carries what we learn from (description, payee, side, category as
+      // offset_account_name); detail is fetched only for non-payment kinds
+      // to resolve the category account's id, and only when unseen.
+      bankTransactionsFetched = await fetchBankTransactions(
+        supabase, token, companyId, fromDate, cap,
+      );
     }
 
     // Analyse everything we hold for this company.
@@ -826,6 +1043,67 @@ Deno.serve(async (req) => {
       if (isJournalPatternProposable(jp)) journalPatternsProposable++;
     }
 
+    // ------------------------------------------------------------------
+    // Bank layer 1: statement description → party / account / kind.
+    // Sources: cached bank transactions + payments, plus every statement
+    // line a reviewer has confirmed in this app (bank layer 4 writes them).
+    // Human decisions on a pattern survive recompute, as everywhere else.
+    // ------------------------------------------------------------------
+    const { data: acctRows } = await supabase
+      .from("zoho_entities")
+      .select("zoho_id, name")
+      .eq("kind", "account");
+    const accountByName = new Map<string, string>();
+    for (const a of acctRows ?? []) accountByName.set(String(a.name).toLowerCase(), String(a.zoho_id));
+
+    const bankObs = bankObservationsFromHistory(rawRows ?? [], accountByName);
+    // Confirmed lines (table exists from bank layer 2 onward; tolerate absence).
+    const { data: confirmed } = await supabase
+      .from("bank_statement_lines")
+      .select("description, side, amount, txn_date, chosen_txn_kind, chosen_party_kind, chosen_party_zoho_id, chosen_party_name, chosen_account_id, chosen_account_name")
+      .eq("company_id", companyId)
+      .in("status", ["confirmed", "posted"]);
+    for (const c of confirmed ?? []) {
+      if (!c.chosen_txn_kind) continue;
+      bankObs.push({
+        description: String(c.description ?? ""),
+        side: c.side as BankSide,
+        amount: Number(c.amount ?? 0) || 0,
+        date: String(c.txn_date ?? "").slice(0, 10),
+        txn_kind: c.chosen_txn_kind as BankTxnKind,
+        party_kind: (c.chosen_party_kind as "vendor" | "customer" | null) ?? null,
+        party_zoho_id: c.chosen_party_zoho_id ? String(c.chosen_party_zoho_id) : null,
+        party_name: c.chosen_party_name ? String(c.chosen_party_name) : null,
+        account_id: c.chosen_account_id ? String(c.chosen_account_id) : null,
+        account_name: c.chosen_account_name ? String(c.chosen_account_name) : null,
+        source: "confirmed_line",
+      });
+    }
+
+    let bankPatternsWritten = 0;
+    const bankPatterns = buildBankPatterns(bankObs);
+    for (const bp of bankPatterns) {
+      const { data: existing } = await supabase
+        .from("bk_bank_patterns")
+        .select("suggestion_status")
+        .eq("company_id", companyId)
+        .eq("fingerprint", bp.fingerprint)
+        .eq("side", bp.side)
+        .maybeSingle();
+      const keep = existing?.suggestion_status && existing.suggestion_status !== "proposed"
+        ? existing.suggestion_status
+        : "proposed";
+      const { error } = await supabase.from("bk_bank_patterns").upsert({
+        company_id: companyId,
+        ...bp,
+        first_seen: bp.first_seen || null,
+        last_seen: bp.last_seen || null,
+        suggestion_status: keep,
+        computed_at: new Date().toISOString(),
+      }, { onConflict: "company_id,fingerprint,side" });
+      if (!error) bankPatternsWritten++;
+    }
+
     if (runId) {
       await supabase.from("bk_learn_runs").update({
         status: "completed",
@@ -834,6 +1112,7 @@ Deno.serve(async (req) => {
         expenses_fetched: expensesFetched,
         journals_fetched: journalsFetched,
         payments_fetched: paymentsFetched,
+        bank_transactions_fetched: bankTransactionsFetched,
         profiles_written: written,
         finished_at: new Date().toISOString(),
       }).eq("id", runId);
@@ -857,6 +1136,10 @@ Deno.serve(async (req) => {
       later_than_usual_proposed: laterThanUsualProposed,
       journal_patterns_written: journalPatternsWritten,
       journal_patterns_proposable: journalPatternsProposable,
+      bank_transactions_fetched: bankTransactionsFetched,
+      bank_observations: bankObs.length,
+      bank_patterns_written: bankPatternsWritten,
+      bank_patterns_suggestible: bankPatterns.filter((p) => p.confidence >= 0.55).length,
       usage: meter.summary(),
       profiles_written: written,
       proposable: profiles.filter(isProposable).length,

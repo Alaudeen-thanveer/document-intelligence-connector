@@ -40,7 +40,8 @@ export async function callEdgeFunction(
     | "zoho-pull"
     | "bookkeeping-learn"
     | "month-end"
-    | "api-usage",
+    | "api-usage"
+    | "bank-statement",
   body: Record<string, unknown>,
   opts?: { actionId?: string },
 ): Promise<{ ok: boolean; status: number; body: Record<string, unknown> }> {
