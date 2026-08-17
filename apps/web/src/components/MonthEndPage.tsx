@@ -34,6 +34,7 @@ interface MonthEndResult {
     needs_attention: number;
   };
   nudges: Nudge[];
+  warnings?: string[];
   error?: string;
 }
 
@@ -114,6 +115,11 @@ export function MonthEndPage() {
       </p>
 
       {error && <p className="error-text">{error}</p>}
+      {result?.warnings?.map((w) => (
+        <p key={w} className="muted" style={{ color: "var(--warn)" }}>
+          {w}
+        </p>
+      ))}
 
       {result && (
         <div className="conn-kind-grid">

@@ -1,236 +1,70 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
+import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import type { Session } from "@supabase/supabase-js";
+import { ApiUsagePage } from "./components/ApiUsagePage";
 import { ConnectionsPage } from "./components/ConnectionsPage";
 import { MonthEndPage } from "./components/MonthEndPage";
-import { ApiUsagePage } from "./components/ApiUsagePage";
-import { setActor } from "./lib/functions";
-import { DocumentList } from "./components/DocumentList";
-import { ReviewPanel } from "./components/ReviewPanel";
-import { RulesManager } from "./components/RulesManager";
-import { UploadInvoice } from "./components/UploadInvoice";
-import { useDocumentDetail } from "./hooks/useDocumentDetail";
-import { useDocuments } from "./hooks/useDocuments";
+import { SignInPage } from "./components/SignInPage";
+import { AppLayout } from "./layout/AppLayout";
 import { supabase } from "./lib/supabase";
+import { DocumentsPage } from "./pages/DocumentsPage";
+import { RulesPage } from "./pages/RulesPage";
+
+const LEGACY_HASH: Record<string, string> = {
+  connections: "/connections",
+  "month-end": "/month-end",
+  "api-usage": "/api-usage",
+  rules: "/rules",
+};
 
 export default function App() {
-  const { documents, loading, error, setDocuments } = useDocuments();
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [reviewerName, setReviewerName] = useState("reviewer");
-  useEffect(() => {
-    setActor(reviewerName);
-  }, [reviewerName]);
-  const [failedJudgmentIds, setFailedJudgmentIds] = useState<Set<string>>(
-    () => new Set(),
-  );
-  const [tick, setTick] = useState(0);
-  const [rulesOpen, setRulesOpen] = useState(false);
-  const [rulesVersion, setRulesVersion] = useState(0);
-  // Hash-routed pages: #connections and #month-end are their own pages;
-  // anything else = documents.
-  type View = "documents" | "connections" | "month-end" | "api-usage";
-  const viewFromHash = (): View =>
-    window.location.hash === "#connections"
-      ? "connections"
-      : window.location.hash === "#month-end"
-        ? "month-end"
-        : window.location.hash === "#api-usage"
-          ? "api-usage"
-          : "documents";
-  const [view, setView] = useState<View>(viewFromHash);
+  const [session, setSession] = useState<Session | null | undefined>(undefined);
 
   useEffect(() => {
-    function onHashChange() {
-      setView(viewFromHash());
-    }
-    window.addEventListener("hashchange", onHashChange);
-    return () => window.removeEventListener("hashchange", onHashChange);
+    void supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+    });
+    const { data } = supabase.auth.onAuthStateChange((_event, next) => {
+      setSession(next);
+    });
+    return () => data.subscription.unsubscribe();
   }, []);
 
-  function navigate(next: View) {
-    window.location.hash = next === "documents" ? "#" : `#${next}`;
+  if (session === undefined) {
+    return (
+      <div className="app-shell">
+        <div className="atmosphere" aria-hidden="true" />
+        <p className="muted">Checking session…</p>
+      </div>
+    );
   }
 
-  const selected = useMemo(
-    () => documents.find((d) => d.id === selectedId) ?? null,
-    [documents, selectedId],
-  );
-
-  const detail = useDocumentDetail(selectedId, tick);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadFailed() {
-      const { data } = await supabase
-        .from("judgment_results")
-        .select("document_id")
-        .eq("passed", false);
-
-      if (cancelled) return;
-      setFailedJudgmentIds(new Set((data ?? []).map((r) => r.document_id)));
-    }
-
-    void loadFailed();
-
-    const channel = supabase
-      .channel("judgment-flags")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "judgment_results" },
-        () => {
-          void loadFailed();
-          setTick((n) => n + 1);
-        },
-      )
-      .subscribe();
-
-    return () => {
-      cancelled = true;
-      void supabase.removeChannel(channel);
-    };
-  }, []);
+  if (!session) return <SignInPage />;
 
   return (
-    <div className="app-shell">
-      <div className="atmosphere" aria-hidden="true" />
-      <header className="topbar">
-        <div>
-          <p className="brand">Document Intelligence Connector</p>
-          <h1>
-            {view === "connections"
-              ? "Connections"
-              : view === "month-end"
-                ? "Month-end"
-                : view === "api-usage"
-                  ? "API usage"
-                  : "Document review"}
-          </h1>
-        </div>
-        <div className="topbar-actions">
-          <nav className="view-nav" aria-label="Pages">
-            <button
-              type="button"
-              className={`tab-btn${view === "documents" ? " active" : ""}`}
-              onClick={() => navigate("documents")}
-            >
-              Documents
-            </button>
-            <button
-              type="button"
-              className={`tab-btn${view === "connections" ? " active" : ""}`}
-              onClick={() => navigate("connections")}
-            >
-              Connections
-            </button>
-            <button
-              type="button"
-              className={`tab-btn${view === "month-end" ? " active" : ""}`}
-              onClick={() => navigate("month-end")}
-            >
-              Month-end
-            </button>
-            <button
-              type="button"
-              className={`tab-btn${view === "api-usage" ? " active" : ""}`}
-              onClick={() => navigate("api-usage")}
-              title="Admin: Zoho API calls vs plan limits"
-            >
-              API usage
-            </button>
-          </nav>
-          <button
-            type="button"
-            className="btn ghost"
-            onClick={() => setRulesOpen(true)}
-          >
-            Rules
-          </button>
-          <label className="reviewer-field">
-            Reviewer
-            <input
-              value={reviewerName}
-              onChange={(e) => setReviewerName(e.target.value)}
-              placeholder="Your name"
-            />
-          </label>
-        </div>
-      </header>
-
-      <RulesManager
-        open={rulesOpen}
-        onClose={() => setRulesOpen(false)}
-        onChanged={() => setRulesVersion((n) => n + 1)}
-        reviewerName={reviewerName}
-      />
-
-      {view === "connections" ? (
-        <ConnectionsPage />
-      ) : view === "month-end" ? (
-        <MonthEndPage />
-      ) : view === "api-usage" ? (
-        <ApiUsagePage />
-      ) : (
-      <main className="layout">
-        <section className="list-pane">
-          <div className="pane-heading">
-            <h2>Documents</h2>
-            <span className="live-dot">Realtime</span>
-          </div>
-          <UploadInvoice
-            onUploaded={(documentId) => {
-              setSelectedId(documentId);
-              void supabase
-                .from("documents")
-                .select(
-                  "id, source, file_url, status, uploaded_at, doc_type, confidence",
-                )
-                .order("uploaded_at", { ascending: false })
-                .then(({ data }) => {
-                  if (data) setDocuments(data);
-                });
-              setTick((n) => n + 1);
-            }}
-          />
-          {loading && <p className="muted">Loading documents…</p>}
-          {error && (
-            <p className="error-text">
-              {error}. Apply the review policies migration and ensure Supabase
-              is running.
-            </p>
-          )}
-          <div className="doc-list-scroll">
-            <DocumentList
-              documents={documents}
-              selectedId={selectedId}
-              onSelect={setSelectedId}
-              failedJudgmentIds={failedJudgmentIds}
-            />
-          </div>
-        </section>
-
-        <ReviewPanel
-          document={selected}
-          extracted={detail.extracted}
-          judgments={detail.judgments}
-          loading={detail.loading}
-          error={detail.error}
-          reviewerName={reviewerName}
-          rulesVersion={rulesVersion}
-          onChanged={() => {
-            // Reload list from source of truth after mutations.
-            void supabase
-              .from("documents")
-              .select(
-                "id, source, file_url, status, uploaded_at, doc_type, confidence",
-              )
-              .order("uploaded_at", { ascending: false })
-              .then(({ data }) => {
-                if (data) setDocuments(data);
-              });
-            setTick((n) => n + 1);
-          }}
-        />
-      </main>
-      )}
-    </div>
+    <>
+      <LegacyHashRedirect />
+      <Routes>
+        <Route element={<AppLayout session={session} />}>
+          <Route path="/" element={<DocumentsPage />} />
+          <Route path="/month-end" element={<MonthEndPage />} />
+          <Route path="/connections" element={<ConnectionsPage />} />
+          <Route path="/rules" element={<RulesPage />} />
+          <Route path="/api-usage" element={<ApiUsagePage />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Route>
+      </Routes>
+    </>
   );
+}
+
+/** Old hash tabs (#connections) → real paths (/connections). */
+function LegacyHashRedirect() {
+  const navigate = useNavigate();
+  useEffect(() => {
+    const raw = window.location.hash.replace(/^#\/?/, "");
+    const dest = LEGACY_HASH[raw];
+    if (dest) navigate(dest, { replace: true });
+  }, [navigate]);
+  return null;
 }

@@ -27,6 +27,7 @@ import {
   LEARNED_RULE_NAMES,
   type PeerDoc,
 } from "./learned_checks.ts";
+import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
 
 const DEFAULT_COMPANY_ID = "00000000-0000-4000-8000-000000000001";
 const DEFAULT_DUPLICATE_DAYS = 3;
@@ -263,7 +264,8 @@ Deno.serve(async (req) => {
       status: 204,
       headers: {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "authorization, content-type, apikey",
+        "Access-Control-Allow-Headers":
+          "authorization, content-type, apikey, x-client-info, x-action-id, x-actor",
       },
     });
   }
@@ -271,6 +273,9 @@ Deno.serve(async (req) => {
   if (req.method !== "POST") {
     return jsonResponse({ error: "POST required" }, 405);
   }
+
+  const auth = await requireAuth(req, { allowServiceRole: true });
+  if (isAuthFail(auth)) return auth.response;
 
   let input: JudgmentInput;
   try {

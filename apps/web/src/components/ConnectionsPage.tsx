@@ -198,15 +198,15 @@ export function ConnectionsPage() {
 
   return (
     <main className="connections-layout">
-      <div className="pane-heading">
+      <div className="page-head">
         <h2>Connections</h2>
+        <p>
+          External systems this app syncs with, and exactly what is cached
+          locally from each.
+        </p>
       </div>
-      <p className="muted connections-intro">
-        External systems this app syncs with, and exactly what is cached
-        locally from each.
-      </p>
 
-      <section className="panel connection-card">
+      <section className="card connection-card">
         <header className="panel-header">
           <div>
             <p className="eyebrow">Accounting</p>
@@ -214,8 +214,8 @@ export function ConnectionsPage() {
           </div>
           <div className="conn-header-side">
             <span
-              className={`status-pill ${
-                allRows.length > 0 ? "status-synced" : "status-needs_review"
+              className={`badge ${
+                allRows.length > 0 ? "badge-ok" : "badge-warn"
               }`}
             >
               {allRows.length > 0 ? "synced" : "not synced"}
@@ -247,13 +247,13 @@ export function ConnectionsPage() {
                 <button
                   key={section.key}
                   type="button"
-                  className={`conn-kind-tile${active ? " active" : ""}`}
+                  className={`stat conn-kind-tile${active ? " active" : ""}`}
                   onClick={() =>
                     setExpandedKind(active ? null : section.key)
                   }
                 >
-                  <span className="conn-kind-count">{rows.length}</span>
-                  <span className="conn-kind-label">{section.label}</span>
+                  <span className="num">{rows.length}</span>
+                  <span className="lbl">{section.label}</span>
                 </button>
               );
             })}

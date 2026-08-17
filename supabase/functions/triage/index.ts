@@ -1,7 +1,11 @@
 // Triage inbound documents: cheap heuristics first, LLM only when ambiguous.
 // Classifies into: invoice | purchase_order | tax_notice | irrelevant
+//
+// Auth: not exposed to the browser. Callers must use service_role (or a user
+// JWT). Anon Bearer is rejected — Situation B.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
 
 type DocType = "invoice" | "purchase_order" | "tax_notice" | "irrelevant";
 
@@ -296,6 +300,9 @@ Deno.serve(async (req) => {
   if (req.method !== "POST") {
     return jsonResponse({ error: "Method not allowed" }, 405);
   }
+
+  const auth = await requireAuth(req, { allowServiceRole: true });
+  if (isAuthFail(auth)) return auth.response;
 
   let input: TriageInput;
   try {
