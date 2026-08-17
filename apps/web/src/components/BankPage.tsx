@@ -11,7 +11,19 @@ import { supabase } from "../lib/supabase";
  */
 
 type Side = "debit" | "credit";
-type TxnKind = "customer_payment" | "vendor_payment" | "expense" | "deposit" | "transfer" | "other";
+type TxnKind =
+  | "customer_payment" | "vendor_payment" | "expense" | "deposit" | "transfer" | "other"
+  | "already_recorded" | "retainer_receipt"
+  | "creditnote_refund" | "payment_refund" | "vendorcredit_refund" | "vendorpayment_refund";
+
+interface Allocation {
+  doc_kind: "invoice" | "bill" | "retainer";
+  doc_zoho_id: string;
+  doc_number: string;
+  amount_applied: number;
+  balance: number;
+  due_date: string | null;
+}
 
 interface Suggestion {
   txn_kind: TxnKind;
@@ -20,13 +32,30 @@ interface Suggestion {
   party_name: string | null;
   account_id: string | null;
   account_name: string | null;
-  doc_kind: "invoice" | "bill" | null;
+  doc_kind: "invoice" | "bill" | "retainer" | null;
   doc_zoho_id: string | null;
   doc_number: string | null;
   doc_balance: number | null;
+  allocations: Allocation[];
+  advance_amount: number;
+  bank_charges: number;
+  residual: number;
+  writeoff: { doc_kind: string; doc_zoho_id: string; doc_number: string; amount: number; reason: string } | null;
+  ref_kind: string | null;
+  ref_zoho_id: string | null;
+  ref_number: string | null;
+  candidates: Allocation[];
   confidence: number;
-  source: "open_document" | "learned" | "accepted_rule" | "party_name";
+  source: "already_recorded" | "open_document" | "open_credit" | "learned" | "accepted_rule" | "party_name";
   reason: string;
+}
+
+interface Policies {
+  already_recorded_window_days: number;
+  bank_charge_tolerance: Record<string, number>;
+  writeoff_after_days: number | null;
+  writeoff_max_amount: number | null;
+  writeoff_policy_note: string | null;
 }
 
 interface Line {
@@ -46,11 +75,18 @@ interface Line {
   chosen_party_name: string | null;
   chosen_account_id: string | null;
   chosen_account_name: string | null;
-  chosen_doc_kind: "invoice" | "bill" | null;
+  chosen_doc_kind: "invoice" | "bill" | "retainer" | null;
   chosen_doc_zoho_id: string | null;
   chosen_doc_number: string | null;
+  chosen_allocations: Array<{ doc_kind: string; doc_zoho_id: string; doc_number: string | null; amount_applied: number }> | null;
+  chosen_bank_charges: number | null;
+  chosen_writeoff: boolean;
+  chosen_ref_kind: string | null;
+  chosen_ref_zoho_id: string | null;
+  chosen_ref_number: string | null;
   decision: string | null;
   zoho_txn_id: string | null;
+  zoho_extra_ids: Array<{ kind: string; zoho_id: string }> | null;
   error: string | null;
 }
 
@@ -77,15 +113,24 @@ const KIND_LABEL: Record<TxnKind, string> = {
   deposit: "Deposit / other income",
   transfer: "Transfer",
   other: "Other",
+  already_recorded: "Already recorded — link",
+  retainer_receipt: "Retainer receipt",
+  creditnote_refund: "Refund of credit note",
+  payment_refund: "Refund of customer advance",
+  vendorcredit_refund: "Refund of vendor credit",
+  vendorpayment_refund: "Refund of vendor advance",
 };
-const KINDS_IN: TxnKind[] = ["customer_payment", "deposit", "transfer", "other"];
-const KINDS_OUT: TxnKind[] = ["vendor_payment", "expense", "transfer", "other"];
+const KINDS_IN: TxnKind[] = ["customer_payment", "retainer_receipt", "vendorcredit_refund", "vendorpayment_refund", "deposit", "transfer", "already_recorded", "other"];
+const KINDS_OUT: TxnKind[] = ["vendor_payment", "expense", "creditnote_refund", "payment_refund", "transfer", "already_recorded", "other"];
 const SOURCE_LABEL: Record<Suggestion["source"], string> = {
+  already_recorded: "already posted by this app",
   open_document: "matches an open document",
+  open_credit: "matches an open credit",
   accepted_rule: "your rule",
   learned: "learned from history",
   party_name: "name only",
 };
+const REFUND_KINDS: TxnKind[] = ["creditnote_refund", "payment_refund", "vendorcredit_refund", "vendorpayment_refund"];
 
 function money(n: number | null | undefined): string {
   return n == null ? "—" : n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -98,11 +143,22 @@ interface Draft {
   party_zoho_id: string;
   account_id: string;
   doc_zoho_id: string;
+  /** Split across documents; edited by the reviewer. */
+  allocations: Array<{ doc_kind: string; doc_zoho_id: string; doc_number: string; amount_applied: number; balance: number }>;
+  bank_charges: number;
+  writeoff: boolean;
+  ref_kind: string;
+  ref_zoho_id: string;
+  ref_number: string;
 }
 function draftFrom(l: Line): Draft {
   const s = l.suggestion;
   if (l.status !== "open" && l.chosen_txn_kind) {
-    return { txn_kind: l.chosen_txn_kind, party_kind: l.chosen_party_kind, party_zoho_id: l.chosen_party_zoho_id ?? "", account_id: l.chosen_account_id ?? "", doc_zoho_id: l.chosen_doc_zoho_id ?? "" };
+    return {
+      txn_kind: l.chosen_txn_kind, party_kind: l.chosen_party_kind, party_zoho_id: l.chosen_party_zoho_id ?? "", account_id: l.chosen_account_id ?? "", doc_zoho_id: l.chosen_doc_zoho_id ?? "",
+      allocations: (l.chosen_allocations ?? []).map((a) => ({ doc_kind: a.doc_kind, doc_zoho_id: a.doc_zoho_id, doc_number: a.doc_number ?? "", amount_applied: a.amount_applied, balance: 0 })),
+      bank_charges: l.chosen_bank_charges ?? 0, writeoff: l.chosen_writeoff, ref_kind: l.chosen_ref_kind ?? "", ref_zoho_id: l.chosen_ref_zoho_id ?? "", ref_number: l.chosen_ref_number ?? "",
+    };
   }
   return {
     txn_kind: s?.txn_kind ?? "",
@@ -110,17 +166,29 @@ function draftFrom(l: Line): Draft {
     party_zoho_id: s?.party_zoho_id ?? "",
     account_id: s?.account_id ?? "",
     doc_zoho_id: s?.doc_zoho_id ?? "",
+    allocations: (s?.allocations ?? []).map((a) => ({ ...a })),
+    bank_charges: s?.bank_charges ?? 0,
+    writeoff: Boolean(s?.writeoff),
+    ref_kind: s?.ref_kind ?? "",
+    ref_zoho_id: s?.ref_zoho_id ?? "",
+    ref_number: s?.ref_number ?? "",
   };
 }
 /** Which party list a kind uses (expense: vendor is optional — bank charges have none). */
 function partyKindFor(kind: TxnKind | ""): "vendor" | "customer" | null {
-  if (kind === "customer_payment" || kind === "deposit") return "customer";
-  if (kind === "vendor_payment" || kind === "expense") return "vendor";
+  if (kind === "customer_payment" || kind === "deposit" || kind === "retainer_receipt" || kind === "creditnote_refund" || kind === "payment_refund") return "customer";
+  if (kind === "vendor_payment" || kind === "expense" || kind === "vendorcredit_refund" || kind === "vendorpayment_refund") return "vendor";
   return null;
 }
-/** Receipts and payments must name who; expenses and deposits need not. */
+/** Receipts, payments and refunds must name who; expenses and deposits need not. */
 function partyRequired(kind: TxnKind | ""): boolean {
+  return kind === "customer_payment" || kind === "vendor_payment" || kind === "retainer_receipt" || REFUND_KINDS.includes(kind as TxnKind);
+}
+function isPayment(kind: TxnKind | ""): boolean {
   return kind === "customer_payment" || kind === "vendor_payment";
+}
+function sumAlloc(a: Draft["allocations"]): number {
+  return Math.round(a.reduce((t, x) => t + (Number(x.amount_applied) || 0), 0) * 100) / 100;
 }
 function needsAccount(kind: TxnKind | ""): boolean {
   return kind === "expense" || kind === "deposit" || kind === "transfer";
@@ -141,6 +209,50 @@ export function BankPage({ reviewerName }: { reviewerName: string }) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [showPosted, setShowPosted] = useState(true);
+  const [policies, setPolicies] = useState<Policies | null>(null);
+  const [policyDraft, setPolicyDraft] = useState<{ window: string; aed: string; usd: string; woDays: string; woAmount: string; woNote: string } | null>(null);
+  const [showPolicies, setShowPolicies] = useState(false);
+
+  const loadPolicies = useCallback(async () => {
+    const { data } = await supabase.from("company_config").select("already_recorded_window_days, bank_charge_tolerance, writeoff_after_days, writeoff_max_amount, writeoff_policy_note").limit(1).maybeSingle();
+    if (!data) return;
+    const p: Policies = {
+      already_recorded_window_days: Number(data.already_recorded_window_days ?? 3),
+      bank_charge_tolerance: (data.bank_charge_tolerance as Record<string, number>) ?? { AED: 5, USD: 13 },
+      writeoff_after_days: data.writeoff_after_days != null ? Number(data.writeoff_after_days) : null,
+      writeoff_max_amount: data.writeoff_max_amount != null ? Number(data.writeoff_max_amount) : null,
+      writeoff_policy_note: (data.writeoff_policy_note as string | null) ?? null,
+    };
+    setPolicies(p);
+    setPolicyDraft({ window: String(p.already_recorded_window_days), aed: String(p.bank_charge_tolerance.AED ?? ""), usd: String(p.bank_charge_tolerance.USD ?? ""), woDays: p.writeoff_after_days != null ? String(p.writeoff_after_days) : "", woAmount: p.writeoff_max_amount != null ? String(p.writeoff_max_amount) : "", woNote: p.writeoff_policy_note ?? "" });
+  }, []);
+  async function savePolicies() {
+    if (!policyDraft) return;
+    const tol: Record<string, number> = {};
+    if (policyDraft.aed.trim()) tol.AED = Number(policyDraft.aed);
+    if (policyDraft.usd.trim()) tol.USD = Number(policyDraft.usd);
+    const woDays = policyDraft.woDays.trim() ? Number(policyDraft.woDays) : null;
+    const woAmt = policyDraft.woAmount.trim() ? Number(policyDraft.woAmount) : null;
+    if ((woDays == null) !== (woAmt == null)) { setError("Write-off policy needs both a period and a maximum amount — or leave both empty to disable."); return; }
+    setBusy("policies"); setError(null);
+    const { error: e } = await supabase.from("company_config").update({
+      already_recorded_window_days: Math.max(0, Number(policyDraft.window) || 0),
+      bank_charge_tolerance: tol, writeoff_after_days: woDays, writeoff_max_amount: woAmt, writeoff_policy_note: policyDraft.woNote.trim() || null,
+    }).not("company_id", "is", null);
+    setBusy(null);
+    if (e) { setError(e.message); return; }
+    setNotice("Policies saved. They apply to the next statement you read (or press Re-suggest on this one).");
+    await loadPolicies();
+  }
+  async function resuggest() {
+    if (!current) return;
+    setBusy("suggest"); setError(null);
+    const res = await callEdgeFunction("bank-statement", { action: "suggest", statement_id: current.id });
+    setBusy(null);
+    if (!res.ok) { setError(String(res.body.error ?? "could not re-suggest")); return; }
+    setDrafts({});
+    await loadLines(current.id);
+  }
 
   // ---- masters + statement list -------------------------------------
   const loadMasters = useCallback(async () => {
@@ -166,7 +278,7 @@ export function BankPage({ reviewerName }: { reviewerName: string }) {
     });
   }, []);
 
-  useEffect(() => { void loadMasters(); void loadStatements(); }, [loadMasters, loadStatements]);
+  useEffect(() => { void loadMasters(); void loadStatements(); void loadPolicies(); }, [loadMasters, loadStatements, loadPolicies]);
   useEffect(() => { if (bankAccounts.length && !bankAccountId) setBankAccountId(bankAccounts[0].zoho_id); }, [bankAccounts, bankAccountId]);
   useEffect(() => { if (current) void loadLines(current.id); }, [current, loadLines]);
 
@@ -203,36 +315,79 @@ export function BankPage({ reviewerName }: { reviewerName: string }) {
   // ---- decide --------------------------------------------------------
   function setDraft(id: string, patch: Partial<Draft>) {
     setDrafts((d) => {
-      const cur = d[id] ?? { txn_kind: "", party_kind: null, party_zoho_id: "", account_id: "", doc_zoho_id: "" };
-      const next = { ...cur, ...patch };
+      const cur: Draft = d[id] ?? { txn_kind: "", party_kind: null, party_zoho_id: "", account_id: "", doc_zoho_id: "", allocations: [], bank_charges: 0, writeoff: false, ref_kind: "", ref_zoho_id: "", ref_number: "" };
+      const next: Draft = { ...cur, ...patch };
       if (patch.txn_kind !== undefined) {
         next.party_kind = partyKindFor(patch.txn_kind);
         if (next.party_kind !== cur.party_kind) next.party_zoho_id = "";
         if (!needsAccount(patch.txn_kind)) next.account_id = "";
-        if (patch.txn_kind !== "customer_payment" && patch.txn_kind !== "vendor_payment") next.doc_zoho_id = "";
+        if (!isPayment(patch.txn_kind) && patch.txn_kind !== "retainer_receipt") { next.doc_zoho_id = ""; next.allocations = []; next.bank_charges = 0; next.writeoff = false; }
+        if (patch.txn_kind !== "already_recorded" && !REFUND_KINDS.includes(patch.txn_kind as TxnKind) && patch.txn_kind !== "retainer_receipt") { next.ref_kind = ""; next.ref_zoho_id = ""; next.ref_number = ""; }
       }
       return { ...d, [id]: next };
+    });
+  }
+  /** Allocation editor helpers. */
+  function setAllocAmount(id: string, docId: string, value: string) {
+    setDrafts((d) => {
+      const cur = d[id]; if (!cur) return d;
+      const allocations = cur.allocations.map((a) => a.doc_zoho_id === docId ? { ...a, amount_applied: Math.max(0, Number(value) || 0) } : a);
+      return { ...d, [id]: { ...cur, allocations, doc_zoho_id: allocations[0]?.doc_zoho_id ?? "" } };
+    });
+  }
+  function addAlloc(id: string, c: Allocation) {
+    setDrafts((d) => {
+      const cur = d[id]; if (!cur || cur.allocations.some((a) => a.doc_zoho_id === c.doc_zoho_id)) return d;
+      const line = lines.find((l) => l.id === id);
+      const room = line ? Math.max(0, line.amount + (line.side === "credit" ? cur.bank_charges : 0) - sumAlloc(cur.allocations)) : 0;
+      const allocations = [...cur.allocations, { doc_kind: c.doc_kind, doc_zoho_id: c.doc_zoho_id, doc_number: c.doc_number, amount_applied: Math.min(c.balance, room), balance: c.balance }];
+      return { ...d, [id]: { ...cur, allocations, doc_zoho_id: allocations[0].doc_zoho_id } };
+    });
+  }
+  function removeAlloc(id: string, docId: string) {
+    setDrafts((d) => {
+      const cur = d[id]; if (!cur) return d;
+      const allocations = cur.allocations.filter((a) => a.doc_zoho_id !== docId);
+      return { ...d, [id]: { ...cur, allocations, doc_zoho_id: allocations[0]?.doc_zoho_id ?? "" } };
     });
   }
   function nameOf(list: Entity[], id: string): string | null {
     return list.find((e) => e.zoho_id === id)?.name ?? null;
   }
-  async function confirm(l: Line) {
-    const d = drafts[l.id];
-    if (!d?.txn_kind) { setError(`Line ${l.line_no}: choose what this is first.`); return; }
-    if (partyRequired(d.txn_kind) && !d.party_zoho_id) { setError(`Line ${l.line_no}: pick the ${partyKindFor(d.txn_kind)}.`); return; }
-    if (needsAccount(d.txn_kind) && !d.account_id) { setError(`Line ${l.line_no}: pick the account.`); return; }
-    setBusy(l.id); setError(null);
+  function confirmPayload(l: Line, d: Draft): Record<string, unknown> {
     const s = l.suggestion;
-    const docKind = d.txn_kind === "customer_payment" ? "invoice" : d.txn_kind === "vendor_payment" ? "bill" : null;
-    const res = await callEdgeFunction("bank-statement", {
+    const allocs = d.allocations.filter((a) => a.amount_applied > 0);
+    return {
       action: "confirm", line_id: l.id, chosen_txn_kind: d.txn_kind,
       chosen_party_kind: d.party_kind, chosen_party_zoho_id: d.party_zoho_id || null,
       chosen_party_name: d.party_zoho_id ? (nameOf(d.party_kind === "customer" ? customers : vendors, d.party_zoho_id) ?? s?.party_name ?? null) : null,
       chosen_account_id: d.account_id || null, chosen_account_name: d.account_id ? nameOf(accounts, d.account_id) : null,
-      chosen_doc_kind: d.doc_zoho_id ? docKind : null, chosen_doc_zoho_id: d.doc_zoho_id || null,
-      chosen_doc_number: d.doc_zoho_id && s?.doc_zoho_id === d.doc_zoho_id ? s.doc_number : null,
-    });
+      chosen_allocations: allocs.map((a) => ({ doc_kind: a.doc_kind, doc_zoho_id: a.doc_zoho_id, doc_number: a.doc_number, amount_applied: a.amount_applied })),
+      chosen_doc_kind: allocs[0]?.doc_kind ?? null, chosen_doc_zoho_id: allocs[0]?.doc_zoho_id ?? null, chosen_doc_number: allocs[0]?.doc_number ?? null,
+      chosen_bank_charges: d.bank_charges || null,
+      chosen_writeoff: d.writeoff,
+      chosen_ref_kind: d.ref_kind || null, chosen_ref_zoho_id: d.ref_zoho_id || null, chosen_ref_number: d.ref_number || null,
+    };
+  }
+  function draftProblem(l: Line, d: Draft | undefined): string | null {
+    if (!d?.txn_kind) return "choose what this is first";
+    if (partyRequired(d.txn_kind) && !d.party_zoho_id) return `pick the ${partyKindFor(d.txn_kind)}`;
+    if (needsAccount(d.txn_kind) && !d.account_id) return "pick the account";
+    if ((d.txn_kind === "already_recorded" || REFUND_KINDS.includes(d.txn_kind as TxnKind) || d.txn_kind === "retainer_receipt") && !d.ref_zoho_id) return "this needs the existing Zoho record it refers to — only a suggestion can supply it";
+    if (isPayment(d.txn_kind)) {
+      const cap = l.amount + (l.side === "credit" ? d.bank_charges : 0) + 0.005;
+      if (sumAlloc(d.allocations) > cap) return `allocations (${money(sumAlloc(d.allocations))}) exceed the line`;
+      if (d.allocations.some((a) => a.amount_applied > a.balance + 0.005 && a.balance > 0)) return "an allocation exceeds that document's balance";
+    }
+    if (d.writeoff && (!policies || policies.writeoff_after_days == null)) return "set the write-off policy first";
+    return null;
+  }
+  async function confirm(l: Line) {
+    const d = drafts[l.id];
+    const problem = draftProblem(l, d);
+    if (problem || !d) { setError(`Line ${l.line_no}: ${problem}.`); return; }
+    setBusy(l.id); setError(null);
+    const res = await callEdgeFunction("bank-statement", confirmPayload(l, d));
     setBusy(null);
     if (!res.ok) { setError(`Line ${l.line_no}: ${String(res.body.error ?? "could not confirm")}`); return; }
     if (current) await loadLines(current.id);
@@ -249,27 +404,23 @@ export function BankPage({ reviewerName }: { reviewerName: string }) {
   }
   /** Confirm every open line whose suggestion is complete, in one action. */
   async function acceptAllSuggested() {
-    const targets = lines.filter((l) => l.status === "open" && l.suggestion && draftComplete(drafts[l.id]));
+    const targets = lines.filter((l) => l.status === "open" && l.suggestion && draftComplete(drafts[l.id], l));
     if (!targets.length) return;
     setBusy("bulk"); setError(null);
     const actionId = newActionId();
     let ok = 0;
     for (const l of targets) {
-      const d = drafts[l.id]; const s = l.suggestion!;
-      const res = await callEdgeFunction("bank-statement", {
-        action: "confirm", line_id: l.id, chosen_txn_kind: d.txn_kind,
-        chosen_party_kind: d.party_kind, chosen_party_zoho_id: d.party_zoho_id || null, chosen_party_name: s.party_name,
-        chosen_account_id: d.account_id || null, chosen_account_name: s.account_name,
-        chosen_doc_kind: d.doc_zoho_id ? s.doc_kind : null, chosen_doc_zoho_id: d.doc_zoho_id || null, chosen_doc_number: d.doc_zoho_id ? s.doc_number : null,
-      }, { actionId });
+      const d = drafts[l.id];
+      const res = await callEdgeFunction("bank-statement", confirmPayload(l, d), { actionId });
       if (res.ok) ok++;
     }
     setBusy(null);
     setNotice(`${ok} of ${targets.length} suggested lines confirmed. Nothing has gone to Zoho yet — press “Post confirmed to Zoho”.`);
     if (current) await loadLines(current.id);
   }
-  function draftComplete(d: Draft | undefined): boolean {
+  function draftComplete(d: Draft | undefined, l?: Line): boolean {
     if (!d?.txn_kind) return false;
+    if (l) return draftProblem(l, d) === null;
     if (partyRequired(d.txn_kind) && !d.party_zoho_id) return false;
     if (needsAccount(d.txn_kind) && !d.account_id) return false;
     return true;
@@ -339,6 +490,56 @@ export function BankPage({ reviewerName }: { reviewerName: string }) {
             <span className="muted" style={{ fontSize: ".8rem" }}>Dates are read day-first (UAE/UK). Amounts: separate debit/credit columns, a signed amount, DR/CR or brackets all work.</span>
           </div>
         </div>
+      </section>
+
+      {/* ------------------------------------------------- policies */}
+      <section className="panel connection-card bank-policies">
+        <header className="panel-header">
+          <div>
+            <p className="eyebrow">Policies</p>
+            <h2>
+              Already-recorded window {policies?.already_recorded_window_days ?? 3} days · bank charges {Object.entries(policies?.bank_charge_tolerance ?? {}).map(([c, v]) => `${c} ${v}`).join(", ") || "none"} ·
+              write-off {policies?.writeoff_after_days != null ? `≤ ${money(policies.writeoff_max_amount)} after ${policies.writeoff_after_days} days` : "not set — nothing is ever proposed for write-off"}
+            </h2>
+          </div>
+          <button type="button" className="btn ghost btn-small" onClick={() => setShowPolicies((v) => !v)}>{showPolicies ? "Close" : "Edit"}</button>
+        </header>
+        {showPolicies && policyDraft && (
+          <div className="bank-policy-grid">
+            <label>
+              “Already recorded” window (days)
+              <input type="number" min={0} value={policyDraft.window} onChange={(e) => setPolicyDraft({ ...policyDraft, window: e.target.value })} />
+              <small className="muted">A statement line matching something this app already posted, within this many days, is linked instead of created. Only our own posts are checked — Zoho is not queried.</small>
+            </label>
+            <label>
+              Bank-charge tolerance, AED
+              <input type="number" min={0} step="0.01" value={policyDraft.aed} onChange={(e) => setPolicyDraft({ ...policyDraft, aed: e.target.value })} />
+              <small className="muted">A receipt short by up to this settles the invoice in full with the gap as bank charges. Beyond it: partial.</small>
+            </label>
+            <label>
+              Bank-charge tolerance, USD
+              <input type="number" min={0} step="0.01" value={policyDraft.usd} onChange={(e) => setPolicyDraft({ ...policyDraft, usd: e.target.value })} />
+              <small className="muted">Applies to USD statements. Other currencies: no bank-charge suggestion.</small>
+            </label>
+            <label>
+              Write-off: propose after (days past due)
+              <input type="number" min={0} value={policyDraft.woDays} onChange={(e) => setPolicyDraft({ ...policyDraft, woDays: e.target.value })} placeholder="not set" />
+            </label>
+            <label>
+              Write-off: only residuals up to (amount)
+              <input type="number" min={0} step="0.01" value={policyDraft.woAmount} onChange={(e) => setPolicyDraft({ ...policyDraft, woAmount: e.target.value })} placeholder="not set" />
+              <small className="muted">Your IFRS-based policy — the company's decision, not the app's. Leave both empty and no write-off is ever suggested.</small>
+            </label>
+            <label className="bank-policy-note">
+              Policy note (for the audit trail)
+              <input type="text" value={policyDraft.woNote} onChange={(e) => setPolicyDraft({ ...policyDraft, woNote: e.target.value })} placeholder="e.g. IFRS 9 simplified approach; immaterial residuals written off after 90 days" />
+            </label>
+            <div className="bank-intake-actions">
+              <button type="button" className="btn primary btn-small" disabled={busy === "policies"} onClick={() => void savePolicies()}>{busy === "policies" ? "Saving…" : "Save policies"}</button>
+              {current && <button type="button" className="btn ghost btn-small" disabled={!!busy} onClick={() => void resuggest()}>{busy === "suggest" ? "Re-suggesting…" : "Re-suggest open lines"}</button>}
+            </div>
+          </div>
+        )}
       </section>
 
       {error && <p className="error-text">{error}</p>}
@@ -420,21 +621,67 @@ export function BankPage({ reviewerName }: { reviewerName: string }) {
                           </select>
                         ) : <span className="muted">—</span>}
                       </td>
-                      <td>
+                      <td className="bank-alloc-cell">
                         {locked ? (
-                          <span>{l.chosen_doc_number ? `${l.chosen_doc_kind === "invoice" ? "Invoice" : "Bill"} ${l.chosen_doc_number}` : l.chosen_account_name ?? "—"}</span>
+                          <span>
+                            {l.chosen_allocations?.length ? l.chosen_allocations.map((a) => `${a.doc_number ?? a.doc_zoho_id} ${money(a.amount_applied)}`).join(" · ")
+                              : l.chosen_ref_number || l.chosen_ref_zoho_id ? `${l.chosen_ref_kind ?? "record"} ${l.chosen_ref_number ?? l.chosen_ref_zoho_id}`
+                              : l.chosen_account_name ?? (isPayment(l.chosen_txn_kind ?? "") ? "on account (advance)" : "—")}
+                            {l.chosen_bank_charges ? <small className="muted"> · bank charges {money(l.chosen_bank_charges)}</small> : null}
+                            {l.chosen_writeoff ? <small className="muted"> · write-off</small> : null}
+                            {l.zoho_extra_ids?.length ? <small className="muted"> · also {l.zoho_extra_ids.map((x) => x.kind).join(", ")}</small> : null}
+                          </span>
                         ) : needsAccount(d.txn_kind) ? (
                           <select value={d.account_id} onChange={(e) => setDraft(l.id, { account_id: e.target.value })} disabled={!!busy}>
                             <option value="">— account —</option>
                             {accounts.map((a) => <option key={a.zoho_id} value={a.zoho_id}>{a.name}</option>)}
                           </select>
-                        ) : (d.txn_kind === "customer_payment" || d.txn_kind === "vendor_payment") ? (
-                          s?.doc_zoho_id ? (
-                            <label className="bank-apply">
-                              <input type="checkbox" checked={d.doc_zoho_id === s.doc_zoho_id} onChange={(e) => setDraft(l.id, { doc_zoho_id: e.target.checked ? s.doc_zoho_id! : "" })} disabled={!!busy} />
-                              apply to {s.doc_kind === "invoice" ? "invoice" : "bill"} <b>{s.doc_number}</b> <span className="muted">(balance {money(s.doc_balance)})</span>
-                            </label>
-                          ) : <span className="muted">on account — no open {d.txn_kind === "customer_payment" ? "invoice" : "bill"} matched</span>
+                        ) : d.txn_kind === "already_recorded" ? (
+                          d.ref_zoho_id ? <span>link to {d.ref_kind} <code>{d.ref_zoho_id}</code> — nothing new is created</span> : <span className="error-text">no earlier post to link to — only a suggestion can supply one</span>
+                        ) : REFUND_KINDS.includes(d.txn_kind as TxnKind) || d.txn_kind === "retainer_receipt" ? (
+                          d.ref_zoho_id ? <span>{d.txn_kind === "retainer_receipt" ? "retainer" : "refund of"} <b>{d.ref_number || d.ref_zoho_id}</b>{s?.doc_balance != null && d.txn_kind === "retainer_receipt" ? <span className="muted"> (balance {money(s.doc_balance)})</span> : null}</span> : <span className="error-text">needs the open credit / retainer it refers to</span>
+                        ) : isPayment(d.txn_kind) ? (
+                          <div className="bank-alloc">
+                            {d.allocations.map((a) => (
+                              <div key={a.doc_zoho_id} className="bank-alloc-row">
+                                <span title={`balance ${money(a.balance)}`}>{a.doc_kind === "invoice" ? "Inv" : "Bill"} <b>{a.doc_number}</b> <small className="muted">of {money(a.balance)}</small></span>
+                                <input type="number" step="0.01" min={0} value={a.amount_applied} onChange={(e) => setAllocAmount(l.id, a.doc_zoho_id, e.target.value)} disabled={!!busy} />
+                                <button type="button" className="bank-x" title="remove" onClick={() => removeAlloc(l.id, a.doc_zoho_id)} disabled={!!busy}>✕</button>
+                              </div>
+                            ))}
+                            {(s?.candidates ?? []).filter((c) => !d.allocations.some((a) => a.doc_zoho_id === c.doc_zoho_id)).length > 0 && (
+                              <select value="" onChange={(e) => { const c = (s?.candidates ?? []).find((x) => x.doc_zoho_id === e.target.value); if (c) addAlloc(l.id, c); }} disabled={!!busy}>
+                                <option value="">+ add another open {l.side === "credit" ? "invoice" : "bill"}…</option>
+                                {(s?.candidates ?? []).filter((c) => !d.allocations.some((a) => a.doc_zoho_id === c.doc_zoho_id)).map((c) => <option key={c.doc_zoho_id} value={c.doc_zoho_id}>{c.doc_number} · {money(c.balance)}{c.due_date ? ` · due ${c.due_date}` : ""}</option>)}
+                              </select>
+                            )}
+                            {(() => {
+                              const applied = sumAlloc(d.allocations);
+                              const cap = l.amount + (l.side === "credit" ? d.bank_charges : 0);
+                              const unapplied = Math.round((l.amount - applied - (l.side === "debit" ? d.bank_charges : 0)) * 100) / 100;
+                              return (
+                                <div className="bank-alloc-sum">
+                                  <span>applied {money(applied)}</span>
+                                  {d.bank_charges > 0 && <span> · bank charges {money(d.bank_charges)}</span>}
+                                  {applied > cap + 0.005 ? <span className="error-text"> · exceeds the line by {money(applied - cap)}</span>
+                                    : unapplied > 0.005 ? <span className="bank-adv"> · {money(unapplied)} stays as an advance on account</span>
+                                    : d.allocations.length === 0 ? <span className="muted"> · on account (advance) — nothing applied</span> : null}
+                                  {s && s.residual > 0 && d.allocations.length > 0 && <span className="muted"> · document keeps {money(s.residual)} open</span>}
+                                </div>
+                              );
+                            })()}
+                            <div className="bank-alloc-opts">
+                              {(l.side === "credit" || d.bank_charges > 0 || (s?.bank_charges ?? 0) > 0) && (
+                                <label><span>bank charges</span><input type="number" step="0.01" min={0} value={d.bank_charges} onChange={(e) => setDraft(l.id, { bank_charges: Math.max(0, Number(e.target.value) || 0) })} disabled={!!busy} /></label>
+                              )}
+                              {s?.writeoff && (
+                                <label className="bank-apply" title={s.writeoff.reason}>
+                                  <input type="checkbox" checked={d.writeoff} onChange={(e) => setDraft(l.id, { writeoff: e.target.checked })} disabled={!!busy || !policies || policies.writeoff_after_days == null} />
+                                  write off the {money(s.writeoff.amount)} residual on {s.writeoff.doc_number} (policy)
+                                </label>
+                              )}
+                            </div>
+                          </div>
                         ) : <span className="muted">—</span>}
                       </td>
                       <td className="bank-why">
@@ -444,14 +691,14 @@ export function BankPage({ reviewerName }: { reviewerName: string }) {
                             <small className="muted">{s.reason}</small>
                           </>
                         ) : l.status === "open" ? <span className="muted">nothing suggested — your call</span> : null}
-                        {l.status === "posted" && <small className="muted">Zoho {l.zoho_txn_id}</small>}
+                        {l.status === "posted" && <small className="muted">{l.chosen_txn_kind === "already_recorded" ? "linked to" : "Zoho"} {l.zoho_txn_id}{l.zoho_extra_ids?.length ? ` + ${l.zoho_extra_ids.map((x) => `${x.kind} ${x.zoho_id}`).join(", ")}` : ""}</small>}
                         {l.status === "failed" && <small className="error-text">{l.error}</small>}
                         {l.status === "confirmed" && <small className="muted">confirmed{l.decision === "changed_suggestion" ? " (changed)" : l.decision === "filled_blank" ? " (filled by you)" : ""} · not yet posted</small>}
                       </td>
                       <td className="bank-actions">
                         {l.status === "open" && (
                           <>
-                            <button type="button" className="btn primary btn-small" disabled={!!busy || !draftComplete(d)} onClick={() => void confirm(l)}>{busy === l.id ? "…" : "Confirm"}</button>
+                            <button type="button" className="btn primary btn-small" disabled={!!busy || draftProblem(l, d) !== null} title={draftProblem(l, d) ?? "confirm this line"} onClick={() => void confirm(l)}>{busy === l.id ? "…" : "Confirm"}</button>
                             <button type="button" className="btn ghost btn-small" disabled={!!busy} onClick={() => void skip(l)}>Skip</button>
                           </>
                         )}

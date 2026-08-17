@@ -282,6 +282,32 @@ export function ReviewPanel({
     };
   }, [learnedPartyId, postAs, rulesVersion]);
 
+  // Unused credit the chosen party holds in Zoho (advances, credit notes /
+  // vendor credits). Shown as a question — "apply to this document?" —
+  // and only applied on push if the reviewer ticks it. Bills and invoices
+  // only; expenses are paid on the spot.
+  type PartyCredit = { kind: "customerpayment" | "creditnote" | "vendorpayment" | "vendorcredit"; zoho_id: string; number: string; balance: number; date: string };
+  const [partyCredits, setPartyCredits] = useState<PartyCredit[]>([]);
+  const [applyCredits, setApplyCredits] = useState<Record<string, number>>({});
+  useEffect(() => {
+    setPartyCredits([]);
+    setApplyCredits({});
+    if (!learnedPartyId || postAs === "expense") return;
+    let cancelled = false;
+    void callEdgeFunction("bank-statement", {
+      action: "party_credits",
+      party_kind: postAs === "invoice" ? "customer" : "vendor",
+      party_zoho_id: learnedPartyId,
+    }).then((res) => {
+      if (cancelled || !res.ok) return;
+      const credits = ((res.body as { credits?: PartyCredit[] }).credits ?? []).filter((c) => c.balance > 0);
+      setPartyCredits(credits);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [learnedPartyId, postAs]);
+
   // Load the extracted line items for this document's latest extraction.
   useEffect(() => {
     if (!extracted?.id) {
@@ -708,6 +734,12 @@ export function ReviewPanel({
         account_id: allLinesHaveAccounts ? undefined : accountId || undefined,
         paid_through_account_id: paidThroughId || undefined,
         tax_treatment: taxTreatment || undefined,
+        apply_credits: Object.entries(applyCredits)
+          .filter(([, amt]) => amt > 0)
+          .map(([id, amt]) => {
+            const c = partyCredits.find((x) => x.zoho_id === id)!;
+            return { kind: c.kind, zoho_id: id, amount: amt };
+          }),
       });
       if (!push.ok) {
         const detail = String(
@@ -1131,6 +1163,41 @@ export function ReviewPanel({
 
       <section className="section">
         <h3>Post to Zoho</h3>
+        {partyCredits.length > 0 && postAs !== "expense" && (
+          <div className="unused-credit">
+            <p className="unused-credit-head">
+              This {postAs === "invoice" ? "customer" : "vendor"} holds{" "}
+              <b>{partyCredits.reduce((t, c) => t + c.balance, 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</b>{" "}
+              of unused credit in Zoho Books. Apply it to this {postAs === "invoice" ? "invoice" : "bill"} when it posts?
+            </p>
+            {partyCredits.map((c) => {
+              const label = c.kind === "creditnote" ? "credit note" : c.kind === "vendorcredit" ? "vendor credit" : "advance (unused payment)";
+              const chosen = applyCredits[c.zoho_id] ?? 0;
+              return (
+                <label key={c.zoho_id} className="unused-credit-row">
+                  <input
+                    type="checkbox"
+                    checked={chosen > 0}
+                    disabled={!!busy}
+                    onChange={(e) => setApplyCredits((prev) => ({ ...prev, [c.zoho_id]: e.target.checked ? c.balance : 0 }))}
+                  />
+                  <span>{label} <b>{c.number}</b> · {c.date}</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min={0}
+                    max={c.balance}
+                    value={chosen}
+                    disabled={!!busy || chosen === 0}
+                    onChange={(e) => setApplyCredits((prev) => ({ ...prev, [c.zoho_id]: Math.min(c.balance, Math.max(0, Number(e.target.value) || 0)) }))}
+                  />
+                  <small className="muted">of {c.balance.toLocaleString(undefined, { minimumFractionDigits: 2 })}</small>
+                </label>
+              );
+            })}
+            <small className="muted">Nothing is applied unless ticked. Applied after the document is created, as its own step.</small>
+          </div>
+        )}
         <div className="zoho-sync-row">
           <p className="muted">
             {zoho.loading

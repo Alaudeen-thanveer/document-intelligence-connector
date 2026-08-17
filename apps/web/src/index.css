@@ -1000,3 +1000,28 @@ a {
 .bank-src-learned { color: #9dc4ff; }
 .bank-src-party_name { color: var(--warn); }
 @media (max-width: 800px) { .bank-intake { grid-template-columns: 1fr; } }
+
+/* Bank — phase 1: policies + allocation editor */
+.bank-policies .panel-header h2 { font-size: 0.86rem; font-weight: 500; color: var(--muted); }
+.bank-policy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 0.8rem 1.2rem; margin-top: 0.6rem; }
+.bank-policy-grid label { display: grid; gap: 0.3rem; font-size: 0.8rem; color: var(--text); }
+.bank-policy-grid input { font: inherit; color: var(--text); background: rgba(255,255,255,0.05); border: 1px solid var(--line); border-radius: 8px; padding: 0.4rem 0.55rem; }
+.bank-policy-grid small { font-size: 0.72rem; line-height: 1.35; }
+.bank-policy-note { grid-column: 1 / -1; }
+.bank-alloc-cell { min-width: 17rem; }
+.bank-alloc { display: grid; gap: 0.3rem; font-size: 0.8rem; }
+.bank-alloc-row { display: grid; grid-template-columns: 1fr 6.5rem auto; gap: 0.4rem; align-items: center; }
+.bank-alloc-row input, .bank-alloc-opts input[type="number"] { font: inherit; font-size: 0.8rem; color: var(--text); background: rgba(255,255,255,0.05); border: 1px solid var(--line); border-radius: 6px; padding: 0.22rem 0.4rem; width: 6.5rem; text-align: right; }
+.bank-x { background: transparent; border: 0; color: var(--muted); cursor: pointer; font-size: 0.8rem; padding: 0 0.2rem; }
+.bank-x:hover { color: var(--danger); }
+.bank-alloc-sum { font-size: 0.74rem; color: var(--text); }
+.bank-adv { color: var(--warn); }
+.bank-alloc-opts { display: flex; gap: 0.8rem; flex-wrap: wrap; align-items: center; }
+.bank-alloc-opts label { display: inline-flex; gap: 0.35rem; align-items: center; font-size: 0.76rem; color: var(--muted); }
+
+/* Review — unused credit prompt */
+.unused-credit { border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: 10px; padding: 0.7rem 0.9rem; margin: 0 0 0.9rem; display: grid; gap: 0.4rem; background: rgba(224,163,84,0.06); }
+.unused-credit-head { margin: 0; font-size: 0.86rem; }
+.unused-credit-row { display: grid; grid-template-columns: auto 1fr 7rem auto; gap: 0.5rem; align-items: center; font-size: 0.8rem; }
+.unused-credit-row input[type="number"] { font: inherit; font-size: 0.8rem; color: var(--text); background: rgba(255,255,255,0.05); border: 1px solid var(--line); border-radius: 6px; padding: 0.22rem 0.4rem; text-align: right; }
+.unused-credit-row input[type="checkbox"] { accent-color: var(--accent); }

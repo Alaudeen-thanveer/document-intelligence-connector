@@ -37,6 +37,17 @@ interface PushInput {
   /** Bank/cash account the expense was paid through (expense only). */
   paid_through_account_id?: string | null;
   /**
+   * Unused credit the reviewer chose to apply once the document exists:
+   * advances (unused customer/vendor payments) and credit notes / vendor
+   * credits. Applied AFTER a successful create; a failure here never undoes
+   * the document — it is reported in the response instead.
+   */
+  apply_credits?: Array<{
+    kind: "customerpayment" | "creditnote" | "vendorpayment" | "vendorcredit";
+    zoho_id: string;
+    amount: number;
+  }> | null;
+  /**
    * VAT treatment for THIS transaction (e.g. vat_registered, out_of_scope).
    * Treatment is transactional, not just party-level — a VAT-registered
    * vendor can still have an out-of-scope bill. When omitted, Zoho applies
@@ -435,6 +446,49 @@ async function getZohoBill(
 }
 
 /** Create an invoice or expense in Zoho Books; extracts the created doc id. */
+/**
+ * Apply unused credits to a freshly created invoice or bill.
+ *   invoice: POST /invoices/{id}/credits  { invoice_payments[], apply_creditnotes[] }
+ *   bill:    POST /bills/{id}/credits     { bill_payments[], apply_vendor_credits[] }
+ * Only what the reviewer picked; never more than the credit's balance was
+ * shown to hold. Zoho refuses over-application, and we surface its message.
+ */
+async function applyCreditsToDoc(
+  accessToken: string,
+  docKind: "invoice" | "bill",
+  docId: string,
+  credits: NonNullable<PushInput["apply_credits"]>,
+): Promise<{ applied: number; results: Array<Record<string, unknown>> }> {
+  const results: Array<Record<string, unknown>> = [];
+  let applied = 0;
+  const wanted = credits.filter((c) => c && c.zoho_id && Number(c.amount) > 0);
+  if (!wanted.length) return { applied, results };
+  const body: Record<string, unknown> = {};
+  if (docKind === "invoice") {
+    const pays = wanted.filter((c) => c.kind === "customerpayment").map((c) => ({ payment_id: c.zoho_id, amount_applied: Number(c.amount) }));
+    const cns = wanted.filter((c) => c.kind === "creditnote").map((c) => ({ creditnote_id: c.zoho_id, amount_applied: Number(c.amount) }));
+    if (pays.length) body.invoice_payments = pays;
+    if (cns.length) body.apply_creditnotes = cns;
+  } else {
+    const pays = wanted.filter((c) => c.kind === "vendorpayment").map((c) => ({ payment_id: c.zoho_id, amount_applied: Number(c.amount) }));
+    const vcs = wanted.filter((c) => c.kind === "vendorcredit").map((c) => ({ vendor_credit_id: c.zoho_id, amount_applied: Number(c.amount) }));
+    if (pays.length) body.bill_payments = pays;
+    if (vcs.length) body.apply_vendor_credits = vcs;
+  }
+  if (!Object.keys(body).length) return { applied, results };
+  const url = `${apiBase()}/${docKind === "invoice" ? "invoices" : "bills"}/${encodeURIComponent(docId)}/credits?organization_id=${encodeURIComponent(orgId())}`;
+  const res = await zohoFetch(url, {
+    method: "POST",
+    headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const raw = await res.json().catch(async () => await res.text());
+  const ok = res.ok && (raw as { code?: number })?.code === 0;
+  if (ok) applied = wanted.reduce((t, c) => t + Number(c.amount), 0);
+  results.push({ ok, status: res.status, body, response: raw });
+  return { applied, results };
+}
+
 async function createZohoDoc(
   accessToken: string,
   path: "invoices" | "expenses",
@@ -1015,6 +1069,7 @@ Deno.serve(async (req) => {
           source_type: "push",
           erp_name: "zoho_books",
           external_doc_id: externalDocId,
+          external_kind: path,
           judgment_result_id: judgmentResultId,
         })
         .select("id")
@@ -1027,6 +1082,22 @@ Deno.serve(async (req) => {
         .from("documents")
         .update({ status: "synced" })
         .eq("id", input.document_id);
+
+      // Reviewer chose to apply unused credit (advance / credit note) to
+      // this invoice: do it now that it exists. Best-effort, reported.
+      let creditsApplied: { applied: number; results: Array<Record<string, unknown>> } | null = null;
+      if (postAs === "invoice" && input.apply_credits?.length) {
+        try {
+          const { result: cr } = await withZohoRetry(async (tok) => {
+            const r = await applyCreditsToDoc(tok, "invoice", externalDocId, input.apply_credits!);
+            creditsApplied = r;
+            return { ok: r.results.every((x) => x.ok), status: 200, raw: r } as ZohoCallResult;
+          });
+          void cr;
+        } catch (err) {
+          creditsApplied = { applied: 0, results: [{ ok: false, error: err instanceof Error ? err.message : String(err) }] };
+        }
+      }
 
       // Best-effort attachment; the Zoho document already exists either way.
       let attachOk = false;
@@ -1066,6 +1137,7 @@ Deno.serve(async (req) => {
         erp_sync_log_id: syncRow.id,
         sandbox_organization_id: orgId(),
         retried: createRetried,
+        credits_applied: creditsApplied,
         attachment: {
           uploaded: attachOk,
           filename,
@@ -1453,6 +1525,7 @@ Deno.serve(async (req) => {
         source_type: "push",
         erp_name: "zoho_books",
         external_doc_id: externalDocId,
+        external_kind: "bills",
         judgment_result_id: judgmentResultId,
       })
       .select("id")
@@ -1467,9 +1540,24 @@ Deno.serve(async (req) => {
       .update({ status: "synced" })
       .eq("id", input.document_id);
 
+    // Reviewer chose to apply unused vendor credit / advance to this bill.
+    let billCreditsApplied: { applied: number; results: Array<Record<string, unknown>> } | null = null;
+    if (input.apply_credits?.length) {
+      try {
+        await withZohoRetry(async (tok) => {
+          const r = await applyCreditsToDoc(tok, "bill", externalDocId, input.apply_credits!);
+          billCreditsApplied = r;
+          return { ok: r.results.every((x) => x.ok), status: 200, raw: r } as ZohoCallResult;
+        });
+      } catch (err) {
+        billCreditsApplied = { applied: 0, results: [{ ok: false, error: err instanceof Error ? err.message : String(err) }] };
+      }
+    }
+
     return jsonResponse({
       ok: true,
       post_as: "bill",
+      credits_applied: billCreditsApplied,
       document_id: input.document_id,
       external_doc_id: externalDocId,
       erp_sync_log_id: syncRow.id,

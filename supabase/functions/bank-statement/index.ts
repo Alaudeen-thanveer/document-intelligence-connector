@@ -11,6 +11,7 @@
 //   confirm  { line_id, chosen_* } Record what the reviewer decided. Nothing
 //                                  goes to Zoho here.
 //   push     { statement_id | line_ids } Post confirmed lines to Zoho Books.
+//   party_credits { party_kind, party_zoho_id } Unused credit a party holds.
 //
 // The email path calls `ingest` with source 'email' and the body/attachment
 // text — same code, different tag.
@@ -19,7 +20,10 @@ import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { GoogleGenerativeAI } from "npm:@google/generative-ai@0.24.1";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { normalizeModelRows, type ParsedLine, type ParseResult, parseStatementText } from "./parse.ts";
-import { fetchOpenDocuments, suggestForLines, type LineForSuggest, type OpenDoc, type PartyRef, type Suggestion } from "./suggest.ts";
+import {
+  DEFAULT_POLICIES, fetchOpenCredits, fetchOpenDocuments, suggestForLines,
+  type LineForSuggest, type OpenCredit, type OpenDoc, type PartyRef, type Policies, type RecordedPost, type Suggestion,
+} from "./suggest.ts";
 import { type BankPattern } from "../bookkeeping-learn/bank_patterns.ts";
 import { pushLine } from "./push.ts";
 
@@ -133,6 +137,67 @@ async function loadParties(supabase: SupabaseClient): Promise<PartyRef[]> {
   return (data ?? []).map((r) => ({ kind: r.kind as "vendor" | "customer", zoho_id: String(r.zoho_id), name: String(r.name) }));
 }
 
+async function loadPolicies(supabase: SupabaseClient, companyId: string): Promise<Policies> {
+  const { data } = await supabase.from("company_config")
+    .select("already_recorded_window_days, bank_charge_tolerance, writeoff_after_days, writeoff_max_amount")
+    .eq("company_id", companyId).maybeSingle();
+  if (!data) return DEFAULT_POLICIES;
+  return {
+    already_recorded_window_days: Number(data.already_recorded_window_days ?? 3),
+    bank_charge_tolerance: (data.bank_charge_tolerance as Record<string, number>) ?? DEFAULT_POLICIES.bank_charge_tolerance,
+    writeoff_after_days: data.writeoff_after_days != null ? Number(data.writeoff_after_days) : null,
+    writeoff_max_amount: data.writeoff_max_amount != null ? Number(data.writeoff_max_amount) : null,
+  };
+}
+
+/**
+ * Everything THIS APP has already posted that could show up on a
+ * statement: posted bank lines (any statement but this one) and documents
+ * pushed to Zoho as expenses (paid through a bank account). Bills and
+ * invoices are not payments and are not included. Zoho itself is not
+ * queried here — by the reviewer's decision.
+ */
+async function loadRecorded(supabase: SupabaseClient, companyId: string, statementId: string): Promise<RecordedPost[]> {
+  const out: RecordedPost[] = [];
+  const { data: lines } = await supabase.from("bank_statement_lines")
+    .select("statement_id, line_no, txn_date, description, side, amount, chosen_txn_kind, chosen_party_kind, chosen_party_zoho_id, chosen_party_name, zoho_txn_id, chosen_ref_kind, chosen_ref_zoho_id, bank_statements!inner(bank_account_name, period_start)")
+    .eq("company_id", companyId).eq("status", "posted").neq("statement_id", statementId);
+  for (const l of lines ?? []) {
+    const k = String(l.chosen_txn_kind ?? "");
+    if (!["customer_payment", "vendor_payment", "expense", "retainer_receipt", "already_recorded"].includes(k)) continue;
+    const st = (l as { bank_statements: { bank_account_name: string | null; period_start: string | null } }).bank_statements;
+    out.push({
+      kind: k === "customer_payment" || k === "retainer_receipt" ? "customer_payment" : k === "vendor_payment" ? "vendor_payment" : k === "expense" ? "expense" : "other",
+      zoho_id: String(l.zoho_txn_id ?? l.chosen_ref_zoho_id ?? ""),
+      ref_kind: (k === "customer_payment" || k === "retainer_receipt") ? "customerpayment" : k === "vendor_payment" ? "vendorpayment" : k === "expense" ? "expense" : "banktransaction",
+      party_kind: (l.chosen_party_kind as "vendor" | "customer" | null) ?? null,
+      party_zoho_id: l.chosen_party_zoho_id ? String(l.chosen_party_zoho_id) : null,
+      party_name: l.chosen_party_name ? String(l.chosen_party_name) : null,
+      amount: Number(l.amount), date: String(l.txn_date), side: l.side as "debit" | "credit",
+      description: String(l.description ?? ""),
+      source: `statement line ${l.line_no} (${st?.bank_account_name ?? "bank"} ${st?.period_start ?? ""})`,
+    });
+  }
+  // Documents pushed as expenses.
+  const { data: syncs } = await supabase.from("erp_sync_log").select("document_id, external_doc_id, synced_at").eq("external_kind", "expenses");
+  if (syncs?.length) {
+    const ids = syncs.map((x) => String(x.document_id));
+    const { data: fields } = await supabase.from("extracted_fields").select("document_id, vendor_raw, total_amount, invoice_date").in("document_id", ids);
+    const byDoc = new Map((fields ?? []).map((f) => [String(f.document_id), f]));
+    for (const x of syncs) {
+      const f = byDoc.get(String(x.document_id));
+      if (!f || f.total_amount == null) continue;
+      out.push({
+        kind: "expense", zoho_id: String(x.external_doc_id), ref_kind: "expense",
+        party_kind: "vendor", party_zoho_id: null, party_name: f.vendor_raw ? String(f.vendor_raw) : null,
+        amount: Number(f.total_amount), date: String(f.invoice_date ?? String(x.synced_at).slice(0, 10)).slice(0, 10), side: "debit",
+        description: f.vendor_raw ? String(f.vendor_raw) : null, source: `expense from document ${String(x.document_id).slice(0, 8)}`,
+      });
+    }
+  }
+  return out.filter((r) => r.zoho_id);
+}
+
 async function computeAndStoreSuggestions(
   supabase: SupabaseClient, zohoFetch: typeof fetch, companyId: string, statementId: string,
 ): Promise<{ suggested: number; open: number; open_docs: number }> {
@@ -141,15 +206,29 @@ async function computeAndStoreSuggestions(
   const list = (lines ?? []) as Array<LineForSuggest & { id: string }>;
   if (!list.length) return { suggested: 0, open: 0, open_docs: 0 };
 
-  const [patterns, parties] = await Promise.all([loadPatterns(supabase, companyId), loadParties(supabase)]);
+  const [patterns, parties, policies, recorded, stmt] = await Promise.all([
+    loadPatterns(supabase, companyId), loadParties(supabase), loadPolicies(supabase, companyId),
+    loadRecorded(supabase, companyId, statementId), supabase.from("bank_statements").select("currency, bank_account_zoho_id").eq("id", statementId).maybeSingle(),
+  ]);
+  let currency = (stmt.data?.currency as string | null) ?? null;
+  if (!currency && stmt.data?.bank_account_zoho_id) {
+    const { data: acct } = await supabase.from("zoho_entities").select("extra").eq("kind", "bank_account").eq("zoho_id", String(stmt.data.bank_account_zoho_id)).maybeSingle();
+    currency = ((acct?.extra as Record<string, unknown> | null)?.currency_code as string | undefined) ?? null;
+  }
+  currency = currency ?? "AED";
   let openDocs: OpenDoc[] = [];
+  let openCredits: OpenCredit[] = [];
   try {
     const token = await getAccessToken(supabase);
-    openDocs = await fetchOpenDocuments(zohoFetch, apiBase(), requireEnv("ZOHO_ORGANIZATION_ID"), token);
+    const org = requireEnv("ZOHO_ORGANIZATION_ID");
+    [openDocs, openCredits] = await Promise.all([
+      fetchOpenDocuments(zohoFetch, apiBase(), org, token),
+      fetchOpenCredits(zohoFetch, apiBase(), org, token),
+    ]);
   } catch (err) {
     console.warn("open documents unavailable; suggesting from patterns only:", err instanceof Error ? err.message : err);
   }
-  const suggestions = suggestForLines(list, { patterns, parties, openDocs });
+  const suggestions = suggestForLines(list, { patterns, parties, openDocs, openCredits, recorded, policies, currency, today: new Date().toISOString().slice(0, 10) });
   let suggested = 0;
   for (let i = 0; i < list.length; i++) {
     const s: Suggestion | null = suggestions[i];
@@ -255,6 +334,25 @@ Deno.serve(async (req) => {
       const kind = String(input.chosen_txn_kind ?? "");
       if (!kind) return jsonResponse({ ok: false, error: "chosen_txn_kind required" }, 400);
       const s = (line.suggestion ?? null) as Suggestion | null;
+      const rawAlloc = Array.isArray(input.chosen_allocations) ? (input.chosen_allocations as Array<Record<string, unknown>>) : null;
+      const allocations = rawAlloc
+        ? rawAlloc.map((a) => ({ doc_kind: String(a.doc_kind ?? ""), doc_zoho_id: String(a.doc_zoho_id ?? ""), doc_number: a.doc_number != null ? String(a.doc_number) : null, amount_applied: Math.round(Number(a.amount_applied ?? 0) * 100) / 100 }))
+          .filter((a) => a.doc_zoho_id && a.amount_applied > 0)
+        : null;
+      const bankCharges = input.chosen_bank_charges != null ? Math.round(Number(input.chosen_bank_charges) * 100) / 100 : 0;
+      const wantsWriteoff = Boolean(input.chosen_writeoff);
+      // Allocations may not exceed what the line brings (plus bank charges
+      // the bank kept on a receipt). Never invent money.
+      if (allocations) {
+        const applied = allocations.reduce((t, a) => t + a.amount_applied, 0);
+        const cap = Number(line.amount) + (kind === "customer_payment" || kind === "retainer_receipt" ? bankCharges : 0) + 0.005;
+        if (applied > cap) return jsonResponse({ ok: false, error: `Allocations total ${applied.toFixed(2)} but the line brings ${Number(line.amount).toFixed(2)}${bankCharges ? ` + ${bankCharges.toFixed(2)} bank charges` : ""}.` }, 422);
+      }
+      if (wantsWriteoff) {
+        const pol = await loadPolicies(supabase, companyId);
+        if (pol.writeoff_after_days == null || pol.writeoff_max_amount == null) return jsonResponse({ ok: false, error: "Set the company's write-off policy first (Bank → Policies) before writing anything off." }, 422);
+      }
+      const first = allocations?.[0];
       const chosen = {
         chosen_txn_kind: kind,
         chosen_party_kind: input.chosen_party_kind ?? null,
@@ -262,9 +360,15 @@ Deno.serve(async (req) => {
         chosen_party_name: input.chosen_party_name ?? null,
         chosen_account_id: input.chosen_account_id ?? null,
         chosen_account_name: input.chosen_account_name ?? null,
-        chosen_doc_kind: input.chosen_doc_kind ?? null,
-        chosen_doc_zoho_id: input.chosen_doc_zoho_id ?? null,
-        chosen_doc_number: input.chosen_doc_number ?? null,
+        chosen_doc_kind: first?.doc_kind ?? input.chosen_doc_kind ?? null,
+        chosen_doc_zoho_id: first?.doc_zoho_id ?? input.chosen_doc_zoho_id ?? null,
+        chosen_doc_number: first?.doc_number ?? input.chosen_doc_number ?? null,
+        chosen_allocations: allocations,
+        chosen_bank_charges: bankCharges || null,
+        chosen_writeoff: wantsWriteoff,
+        chosen_ref_kind: input.chosen_ref_kind ?? null,
+        chosen_ref_zoho_id: input.chosen_ref_zoho_id ?? null,
+        chosen_ref_number: input.chosen_ref_number ?? null,
       };
       // Vendor / customer must exist in Zoho Books — never invented here.
       // Known if it is in the synced cache, or if it arrived on an open
@@ -274,9 +378,12 @@ Deno.serve(async (req) => {
         const fromOpenDoc = s?.source === "open_document" && s.party_zoho_id === chosen.chosen_party_zoho_id;
         if (!p && !fromOpenDoc) return jsonResponse({ ok: false, error: "That party is not in Zoho Books. Create it there, sync, then confirm." }, 422);
       }
+      const effAlloc = allocations ?? (chosen.chosen_doc_zoho_id ? [{ doc_zoho_id: chosen.chosen_doc_zoho_id, amount_applied: Number(line.amount) }] : []);
+      const sameAlloc = !s ? false : JSON.stringify((s.allocations ?? []).map((a) => [a.doc_zoho_id, a.amount_applied])) === JSON.stringify(effAlloc.map((a) => [a.doc_zoho_id, a.amount_applied]));
       const decision = !s ? "filled_blank"
         : (s.txn_kind === kind && (s.party_zoho_id ?? null) === (chosen.chosen_party_zoho_id ?? null) &&
-           (s.account_id ?? null) === (chosen.chosen_account_id ?? null) && (s.doc_zoho_id ?? null) === (chosen.chosen_doc_zoho_id ?? null))
+           (s.account_id ?? null) === (chosen.chosen_account_id ?? null) && (s.ref_zoho_id ?? null) === (chosen.chosen_ref_zoho_id ?? null) &&
+           sameAlloc && Math.abs((s.bank_charges ?? 0) - bankCharges) < 0.005 && Boolean(s.writeoff) === wantsWriteoff)
         ? "accepted_suggestion" : "changed_suggestion";
       await supabase.from("bank_statement_lines").update({
         ...chosen, status: "confirmed", decision, decided_by: actor, decided_at: new Date().toISOString(), error: null,
@@ -292,14 +399,15 @@ Deno.serve(async (req) => {
       const { data: lines } = await q.order("line_no");
       if (!lines?.length) return jsonResponse({ ok: true, pushed: 0, failed: 0, results: [], note: "no confirmed lines to push" });
       const token = await getAccessToken(supabase);
+      const { data: feeAcct } = await supabase.from("zoho_entities").select("zoho_id").eq("kind", "account").ilike("name", "bank fees%").limit(1).maybeSingle();
       const results: Array<Record<string, unknown>> = [];
       let pushed = 0, failed = 0;
       for (const line of lines) {
         const st = (line as { bank_statements: { bank_account_zoho_id: string; currency: string | null } }).bank_statements;
         try {
-          const r = await pushLine(meter.fetch, apiBase(), requireEnv("ZOHO_ORGANIZATION_ID"), token, line as never, st.bank_account_zoho_id);
-          await supabase.from("bank_statement_lines").update({ status: "posted", zoho_txn_id: r.zoho_id, zoho_payload: r.payload, posted_at: new Date().toISOString(), error: null }).eq("id", line.id);
-          results.push({ line_id: line.id, line_no: line.line_no, ok: true, zoho_id: r.zoho_id, kind: r.kind });
+          const r = await pushLine(meter.fetch, apiBase(), requireEnv("ZOHO_ORGANIZATION_ID"), token, line as never, st.bank_account_zoho_id, { bankChargesAccountId: feeAcct?.zoho_id ? String(feeAcct.zoho_id) : null });
+          await supabase.from("bank_statement_lines").update({ status: "posted", zoho_txn_id: r.zoho_id, zoho_payload: r.payload, zoho_extra_ids: r.extra, posted_at: new Date().toISOString(), error: null }).eq("id", line.id);
+          results.push({ line_id: line.id, line_no: line.line_no, ok: true, zoho_id: r.zoho_id, kind: r.kind, extra: r.extra });
           pushed++;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
@@ -311,7 +419,20 @@ Deno.serve(async (req) => {
       return jsonResponse({ ok: failed === 0, pushed, failed, results, usage: meter.summary() });
     }
 
-    return jsonResponse({ ok: false, error: `unknown action '${action}' — use ingest | suggest | confirm | push` }, 400);
+    // ------------------------------------------------------ party_credits
+    // Unused credit a party holds (advances, credit notes / vendor credits)
+    // — for the review screen's "apply to this invoice/bill?" prompt.
+    if (action === "party_credits") {
+      const pk = String(input.party_kind ?? "");
+      const pid = String(input.party_zoho_id ?? "");
+      if (!pk || !pid) return jsonResponse({ ok: false, error: "party_kind and party_zoho_id required" }, 400);
+      const token = await getAccessToken(supabase);
+      const credits = (await fetchOpenCredits(meter.fetch, apiBase(), requireEnv("ZOHO_ORGANIZATION_ID"), token))
+        .filter((c) => c.party_kind === pk && c.party_zoho_id === pid);
+      return jsonResponse({ ok: true, credits, total: credits.reduce((t, c) => t + c.balance, 0), usage: meter.summary() });
+    }
+
+    return jsonResponse({ ok: false, error: `unknown action '${action}' — use ingest | suggest | confirm | push | party_credits` }, 400);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("bank-statement failed:", message);
