@@ -1,6 +1,5 @@
 import { useRef, useState } from "react";
 import { callEdgeFunction } from "../lib/functions";
-import { supabase } from "../lib/supabase";
 
 const ALLOWED_TYPES = new Set([
   "application/pdf",
@@ -14,8 +13,17 @@ interface Props {
   onUploaded: (documentId: string) => void;
 }
 
-function sanitizeFilename(name: string): string {
-  return name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Failed to read file"));
+    reader.onload = () => {
+      const result = String(reader.result ?? "");
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 export function UploadInvoice({ onUploaded }: Props) {
@@ -41,76 +49,29 @@ export function UploadInvoice({ onUploaded }: Props) {
 
     setBusy(true);
     try {
-      const path = `${crypto.randomUUID()}-${sanitizeFilename(file.name)}`;
-      const { error: uploadError } = await supabase.storage
-        .from("invoices")
-        .upload(path, file, {
-          cacheControl: "3600",
-          upsert: false,
-          contentType: file.type,
-        });
-
-      if (uploadError) {
-        throw new Error(uploadError.message);
-      }
-
-      const { data: publicData } = supabase.storage
-        .from("invoices")
-        .getPublicUrl(path);
-
-      const fileUrl = publicData.publicUrl;
-      if (!fileUrl) {
-        throw new Error("Could not build public file URL");
-      }
-
-      const { data: doc, error: insertError } = await supabase
-        .from("documents")
-        .insert({
-          source: "upload",
-          file_url: fileUrl,
-          status: "uploaded",
-          doc_type: "invoice",
-          has_supporting_document: true,
-        })
-        .select("id")
-        .single();
-
-      if (insertError || !doc) {
-        throw new Error(insertError?.message ?? "Failed to create document row");
-      }
-
-      const documentId = doc.id as string;
-      setMessage(`Uploaded ${file.name}. Running extract…`);
-
-      const extract = await callEdgeFunction("extract", {
-        document_id: documentId,
+      setMessage(`Uploading ${file.name} via shared ingest…`);
+      const fileBase64 = await fileToBase64(file);
+      const ingest = await callEdgeFunction("ingest", {
+        source: "upload",
+        filename: file.name,
+        content_type: file.type,
+        file_base64: fileBase64,
       });
-      if (!extract.ok) {
+      if (!ingest.ok) {
         throw new Error(
-          `Extract failed: ${
-            extract.body.error ?? extract.body.reason ?? extract.status
-          }. Is "npx supabase functions serve --env-file .env" running?`,
+          `Ingest failed: ${
+            ingest.body.error ?? ingest.body.reason ?? ingest.status
+          }. Is "npm run functions:serve" running?`,
         );
       }
 
-      setMessage(`Extracted. Running judgment…`);
-      const judgment = await callEdgeFunction("judgment", {
-        document_id: documentId,
-      });
-      if (!judgment.ok) {
-        throw new Error(
-          `Judgment failed: ${
-            judgment.body.error ?? judgment.body.reason ?? judgment.status
-          }`,
-        );
-      }
+      const documentId = String(ingest.body.document_id ?? "");
+      if (!documentId) throw new Error("Ingest returned no document_id");
 
-      const vendor =
-        (extract.body.fields as { vendor_raw?: string } | undefined)
-          ?.vendor_raw ?? "—";
-      const amount =
-        (extract.body.fields as { total_amount?: number } | undefined)
-          ?.total_amount ?? "—";
+      const fields = (ingest.body.extract as { fields?: Record<string, unknown> } | undefined)
+        ?.fields;
+      const vendor = (fields?.vendor_raw as string | undefined) ?? "—";
+      const amount = (fields?.total_amount as number | undefined) ?? "—";
       setMessage(
         `Ready for review: vendor=${vendor}, amount=${amount}. Select the doc to inspect fields / Approve → Zoho.`,
       );
@@ -129,7 +90,7 @@ export function UploadInvoice({ onUploaded }: Props) {
         <div>
           <p className="upload-title">Upload invoice</p>
           <p className="upload-hint">
-            Upload → extract → judgment (needs functions serve)
+            Same ingest path as inbound email (needs functions serve)
           </p>
         </div>
         <button

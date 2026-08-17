@@ -7,6 +7,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
+import { isAuthFail, requireUser } from "../_shared/require_user.ts";
 
 /** Set per request; every Zoho call goes through it so usage is metered. */
 let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
@@ -117,6 +118,9 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
   if (req.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405);
 
+  const auth = await requireUser(req, { corsHeaders: CORS_HEADERS });
+  if (isAuthFail(auth)) return auth.response;
+
   let input: { month?: string; company_id?: string } = {};
   try {
     const text = await req.text();
@@ -139,21 +143,39 @@ Deno.serve(async (req) => {
     const token = await getAccessToken(supabase);
 
     // --- Recurring journals: definitions + what was posted this month ---
-    const rjRaw = await zohoGet(token, "recurringjournals");
-    const defs: RecurringJournalDef[] = (
-      (rjRaw.recurring_journals ?? rjRaw.recurringjournals ?? []) as Array<Record<string, unknown>>
-    ).map((r) => ({
-      recurring_journal_id: String(r.recurring_journal_id ?? ""),
-      recurrence_name: String(r.recurrence_name ?? ""),
-      recurrence_frequency: String(r.recurrence_frequency ?? "months"),
-      repeat_every: Number(r.repeat_every ?? 1) || 1,
-      start_date: String(r.start_date ?? "").slice(0, 10),
-      end_date: r.end_date ? String(r.end_date).slice(0, 10) : null,
-      status: String(r.status ?? "active"),
-      total: r.total != null ? Number(r.total) : null,
-      next_journal_date: r.next_journal_date ? String(r.next_journal_date).slice(0, 10) : null,
-      last_journal_date: r.last_journal_date ? String(r.last_journal_date).slice(0, 10) : null,
-    })).filter((d) => d.recurring_journal_id);
+    // Soft-fail: some UAE roles/scopes return code 57 on recurringjournals
+    // even when journals/bills work. Don't blank the whole Month-end page.
+    const warnings: string[] = [];
+    let defs: RecurringJournalDef[] = [];
+    try {
+      const rjRaw = await zohoGet(token, "recurringjournals");
+      defs = (
+        (rjRaw.recurring_journals ?? rjRaw.recurringjournals ?? []) as Array<
+          Record<string, unknown>
+        >
+      ).map((r) => ({
+        recurring_journal_id: String(r.recurring_journal_id ?? ""),
+        recurrence_name: String(r.recurrence_name ?? ""),
+        recurrence_frequency: String(r.recurrence_frequency ?? "months"),
+        repeat_every: Number(r.repeat_every ?? 1) || 1,
+        start_date: String(r.start_date ?? "").slice(0, 10),
+        end_date: r.end_date ? String(r.end_date).slice(0, 10) : null,
+        status: String(r.status ?? "active"),
+        total: r.total != null ? Number(r.total) : null,
+        next_journal_date: r.next_journal_date
+          ? String(r.next_journal_date).slice(0, 10)
+          : null,
+        last_journal_date: r.last_journal_date
+          ? String(r.last_journal_date).slice(0, 10)
+          : null,
+      })).filter((d) => d.recurring_journal_id);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn("recurringjournals unavailable:", message);
+      warnings.push(
+        `Declared recurring journals unavailable: ${message}. Other nudges still load.`,
+      );
+    }
 
     // Zoho's journals list ignores journal_date_start/end but honours
     // date_start/end (verified on the .ae DC).
@@ -314,6 +336,7 @@ Deno.serve(async (req) => {
         needs_attention: attention.length,
       },
       nudges,
+      warnings: warnings.length ? warnings : undefined,
       usage: meter.summary(),
     });
   } catch (err) {

@@ -11,6 +11,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
+import { isAuthFail, requireUser } from "../_shared/require_user.ts";
 
 const DEFAULT_COMPANY = "00000000-0000-4000-8000-000000000001";
 const CORS_HEADERS: Record<string, string> = {
@@ -98,6 +99,9 @@ async function getAccessToken(supabase: SupabaseClient): Promise<string> {
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
   if (req.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405);
+
+  const auth = await requireUser(req, { corsHeaders: CORS_HEADERS });
+  if (isAuthFail(auth)) return auth.response;
 
   let input: { window_days?: number; company_id?: string; refresh_plan?: boolean } = {};
   try {
