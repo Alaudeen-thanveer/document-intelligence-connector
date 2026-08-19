@@ -349,10 +349,16 @@ Deno.serve(async (req) => {
     const stored = await persistResults(supabase, input.document_id, packaged);
 
     const allPassed = packaged.every((p) => p.result.passed);
+    // Record the verdict on the document — but a document that is already
+    // in Zoho Books (synced) or mid-push (sync_failed) keeps that status: a
+    // re-run (e.g. a duplicate arriving later) must not pull it back into
+    // the review queue as if it had never been posted. The results are
+    // still stored and visible on the review screen.
     await supabase
       .from("documents")
       .update({ status: allPassed ? "judgment_passed" : "needs_review" })
-      .eq("id", input.document_id);
+      .eq("id", input.document_id)
+      .not("status", "in", '("synced","sync_failed")');
 
     return jsonResponse({
       ok: true,
