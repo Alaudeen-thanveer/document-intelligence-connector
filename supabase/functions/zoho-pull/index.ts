@@ -509,15 +509,24 @@ async function fetchKind(
   // lives only in the contact detail (verified on the .ae DC). The TRN is
   // needed for the e-invoice readiness check (buyer TRN on B2B) and the
   // Form 201 review, so enrich a bounded number of contacts per sync.
-  const trnByContact = new Map<string, string | null>();
+  const detailByContact = new Map<string, Record<string, unknown>>();
   for (const c of contacts.slice(0, 300)) {
     const id = String(c.contact_id ?? "");
     if (!id) continue;
     try {
       const res = await zohoFetch(`${apiBase()}/contacts/${id}?organization_id=${encodeURIComponent(orgId())}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
       const raw = await res.json() as { contact?: Record<string, unknown> };
-      trnByContact.set(id, (raw.contact?.tax_reg_no as string | undefined) || null);
-    } catch { /* TRN stays unknown for this contact */ }
+      const d = raw.contact ?? {};
+      detailByContact.set(id, {
+        tax_reg_no: (d.tax_reg_no as string | undefined) || null,
+        // Credit control: Zoho's own limit (0/absent when the org has the
+        // feature off), the open balance, and the credit they hold.
+        credit_limit: d.credit_limit != null && Number(d.credit_limit) > 0 ? Number(d.credit_limit) : null,
+        outstanding_receivable: d.outstanding_receivable_amount != null ? Number(d.outstanding_receivable_amount) : null,
+        unused_credits_receivable: d.unused_credits_receivable_amount != null ? Number(d.unused_credits_receivable_amount) : null,
+        email: (d.email as string | undefined) || null,
+      });
+    } catch { /* detail stays unknown for this contact */ }
   }
   return contacts
     .map((c) => ({
@@ -534,7 +543,8 @@ async function fetchKind(
         // contact's emirate (place_of_contact) is the default source.
         place_of_contact: c.place_of_contact || null,
         // TRN (15 digits when real); null when not registered / not entered.
-        tax_reg_no: trnByContact.get(String(c.contact_id ?? "")) ?? null,
+        // Plus the credit-control fields from the same detail fetch.
+        ...(detailByContact.get(String(c.contact_id ?? "")) ?? { tax_reg_no: null }),
       },
     }))
     .filter((r) => r.zoho_id && r.name);

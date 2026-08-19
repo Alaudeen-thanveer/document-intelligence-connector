@@ -47,7 +47,8 @@ export async function callEdgeFunction(
     | "bank-statement"
     | "ingest"
     | "inbound-email"
-    | "vat-review",
+    | "vat-review"
+    | "cashflow",
   body: Record<string, unknown>,
   opts?: { actionId?: string },
 ): Promise<{ ok: boolean; status: number; body: Record<string, unknown> }> {

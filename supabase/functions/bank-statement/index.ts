@@ -204,6 +204,19 @@ async function loadRecorded(supabase: SupabaseClient, companyId: string, stateme
       });
     }
   }
+  // Vendor payments recorded from the payment run (cashflow) — audited with
+  // vendor/amount/date/zoho id, so the eventual statement line links to them.
+  const { data: runs } = await supabase.from("audit_log").select("detail, created_at").eq("company_id", companyId).eq("action", "vendor_payment_recorded");
+  for (const r of runs ?? []) {
+    const d = (r.detail ?? {}) as Record<string, unknown>;
+    if (!d.zoho_payment_id) continue;
+    out.push({
+      kind: "vendor_payment", zoho_id: String(d.zoho_payment_id), ref_kind: "vendorpayment",
+      party_kind: "vendor", party_zoho_id: d.vendor_zoho_id ? String(d.vendor_zoho_id) : null, party_name: d.vendor_name ? String(d.vendor_name) : null,
+      amount: Number(d.amount ?? 0) || 0, date: String(d.date ?? String(r.created_at).slice(0, 10)), side: "debit",
+      description: d.vendor_name ? String(d.vendor_name) : null, source: `payment run (${String(d.date ?? "")})`,
+    });
+  }
   return out.filter((r) => r.zoho_id);
 }
 

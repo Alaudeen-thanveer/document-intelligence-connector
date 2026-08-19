@@ -3,6 +3,7 @@ import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import type { Session } from "@supabase/supabase-js";
 import { ApiUsagePage } from "./components/ApiUsagePage";
 import { BankPage } from "./components/BankPage";
+import { CashPage } from "./components/CashPage";
 import { ConnectionsPage } from "./components/ConnectionsPage";
 import { MonthEndPage } from "./components/MonthEndPage";
 import { SignInPage } from "./components/SignInPage";
@@ -50,6 +51,7 @@ export default function App() {
         <Route element={<AppLayout session={session} />}>
           <Route path="/" element={<DocumentsPage />} />
           <Route path="/bank" element={<BankPage />} />
+          <Route path="/cash" element={<CashPage />} />
           <Route path="/month-end" element={<MonthEndPage />} />
           <Route path="/connections" element={<ConnectionsPage />} />
           <Route path="/rules" element={<RulesPage />} />
