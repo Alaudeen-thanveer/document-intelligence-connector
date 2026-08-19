@@ -9,6 +9,7 @@ import { useTheme } from "../theme/ThemeProvider";
 const SECTIONS: Record<string, string> = {
   "/": "Documents",
   "/month-end": "Month-end",
+  "/cash": "Cash",
   "/connections": "Connections",
   "/rules": "Rules",
   "/api-usage": "API usage",
@@ -58,6 +59,7 @@ export function AppLayout({ session }: { session: Session }) {
 
         <div className="rail-group">
           <RailLink to="/bank" label="Bank" icon="⌸" />
+          <RailLink to="/cash" label="Cash" icon="◈" />
           <RailLink to="/connections" label="Connections" icon="⇄" />
           <RailLink to="/rules" label="Rules" icon="§" />
           <RailLink to="/api-usage" label="API usage" icon="▦" />

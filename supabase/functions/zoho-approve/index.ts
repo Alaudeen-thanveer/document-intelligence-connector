@@ -3,6 +3,7 @@
 // Never returns a Zoho token. Always scopes the invoice by the caller's company.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { checkEInvoiceReadiness, type EInvoiceFinding } from "./einvoice.ts";
+import { creditCheck, type CreditCheckResult } from "../cashflow/cash.ts";
 import { createClient, type SupabaseClient, type User } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import {
@@ -75,6 +76,8 @@ interface ApproveResult {
   purchase_order?: { zoho_id: string; number: string; how: "input" | "po_number" } | null;
   /** UAE e-invoice field readiness (sales invoices only) — informs, never issues. */
   einvoice?: { findings: EInvoiceFinding[]; ready: boolean } | null;
+  /** Credit control (sales invoices only): exposure vs limit. */
+  credit?: CreditCheckResult | null;
   failed_checks?: Array<{ rule_name: string; notes: string | null }>;
   reconciliation?: Reconciliation;
   money?: { tax_id: string | null; tax_name: string | null; currency_id: string | null; notes: string[] };
@@ -290,6 +293,10 @@ async function withZohoRetry(
     result = await call(token);
   }
   return result;
+}
+
+function result_contact(raw: unknown): Record<string, unknown> | null {
+  return ((raw as { contact?: Record<string, unknown> })?.contact) ?? null;
 }
 
 /** Organisation detail (for the seller TRN), through the metered fetch. */
@@ -686,6 +693,7 @@ Deno.serve(async (req) => {
     const postAs: PostAs = input.post_as ?? "bill";
     let purchaseOrder: ApproveResult["purchase_order"] = null;
     let einvoice: ApproveResult["einvoice"] = null;
+    let creditResult: CreditCheckResult | null = null;
 
     // Period lock (item 10): nothing posts into a locked period through this
     // app. Hard refusal — no override; unlock the period (audited) to change
@@ -751,6 +759,41 @@ Deno.serve(async (req) => {
       if (!pos) {
         return await fail("Zoho needs a place of supply for this customer (UAE VAT). Set the emirate on the customer in Zoho Books and sync, or pass place_of_supply.");
       }
+      // Credit control (item 15): the customer's exposure (open balance +
+      // this invoice) against their limit — Zoho's own credit_limit when the
+      // org enables it, else the app-side map. Over the limit refuses; a
+      // human override (with a reason, audited) still posts.
+      {
+        const { data: cfgRow } = await supabase.from("company_config").select("credit_limits").eq("company_id", companyId).maybeSingle();
+        const limits = (cfgRow?.credit_limits ?? {}) as Record<string, number>;
+        let fresh: Record<string, unknown> = {};
+        try {
+          const res = await withZohoRetry(async (accessToken) => {
+            const r = await zohoFetch(`${apiBase()}/contacts/${encodeURIComponent(customerId)}?organization_id=${encodeURIComponent(orgId())}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+            return { ok: r.ok, status: r.status, raw: await r.json().catch(() => ({})) };
+          });
+          fresh = ((result_contact(res.raw))) ?? {};
+        } catch { /* fall back to the cached extra */ }
+        const { data: custCache } = await supabase.from("zoho_entities").select("name, extra").eq("kind", "customer").eq("zoho_id", customerId).maybeSingle();
+        const cachedExtra = (custCache?.extra as Record<string, unknown>) ?? {};
+        creditResult = creditCheck({
+          customer_name: (fresh.contact_name as string | undefined) ?? (custCache?.name as string | undefined) ?? "the customer",
+          zoho_credit_limit: fresh.credit_limit != null && Number(fresh.credit_limit) > 0 ? Number(fresh.credit_limit) : (cachedExtra.credit_limit != null ? Number(cachedExtra.credit_limit) : null),
+          app_credit_limit: limits[customerId] != null ? Number(limits[customerId]) : null,
+          outstanding: fresh.outstanding_receivable_amount != null ? Number(fresh.outstanding_receivable_amount) : Number(cachedExtra.outstanding_receivable ?? 0) || 0,
+          unused_credits: fresh.unused_credits_receivable_amount != null ? Number(fresh.unused_credits_receivable_amount) : Number(cachedExtra.unused_credits_receivable ?? 0) || 0,
+          invoice_total: documentTotal,
+        });
+        if (creditResult.over && !input.override) {
+          return jsonResponse({
+            success: false,
+            error: `Credit limit: ${creditResult.note}`,
+            failed_checks: [{ rule_name: "credit_limit_exceeded", notes: creditResult.note }],
+            credit: creditResult,
+          }, 409);
+        }
+      }
+
       // UAE e-invoice field readiness (item 9): verify what the PINT AE
       // e-invoice will need BEFORE the invoice exists in Zoho. Informs the
       // reviewer; issuance stays with Zoho and the accredited provider —
@@ -1043,7 +1086,7 @@ Deno.serve(async (req) => {
     });
 
     return jsonResponse({
-      success: true, zoho_bill_id: zohoId ?? undefined, credits_applied: creditsApplied, purchase_order: purchaseOrder, einvoice,
+      success: true, zoho_bill_id: zohoId ?? undefined, credits_applied: creditsApplied, purchase_order: purchaseOrder, einvoice, credit: creditResult,
       reconciliation: recon, money: { tax_id: money.taxId, tax_name: money.taxName, currency_id: money.currencyId, notes: money.notes }, attachment,
     });
   } catch (err) {
