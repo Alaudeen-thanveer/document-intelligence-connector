@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { callEdgeFunction } from "../lib/functions";
 import { invoiceStoragePath } from "../lib/storagePath";
 import { supabase } from "../lib/supabase";
@@ -151,9 +151,17 @@ export function ReviewPanel({
     setTxnTags({});
     setInvoiceNumber(extracted?.invoice_number ?? "");
     setDueDate(extracted?.due_date ?? "");
-    setActionMsg(null);
-    setZohoBillId(null);
-    setPostAs("bill");
+    // Messages, the override prompt and the post-as choice belong to the
+    // reviewer's session with THIS document: clear them only when the
+    // selected document changes, not on every live refetch of its fields.
+    if (lastDocIdRef.current !== (document?.id ?? null)) {
+      setActionMsg(null);
+      setZohoBillId(null);
+      setPostAs("bill");
+      setOverridePrompt(null);
+      setOverrideReason("");
+    }
+    lastDocIdRef.current = document?.id ?? null;
     setPostAsTouched(false);
     setVendorId("");
     setCustomerId("");
@@ -290,6 +298,17 @@ export function ReviewPanel({
   type PartyCredit = { kind: "customerpayment" | "creditnote" | "vendorpayment" | "vendorcredit"; zoho_id: string; number: string; balance: number; date: string };
   const [partyCredits, setPartyCredits] = useState<PartyCredit[]>([]);
   const [applyCredits, setApplyCredits] = useState<Record<string, number>>({});
+  // Server-side refusals the reviewer can answer: failed checks need a
+  // reason; lines that do not reconcile need fixing (or an explicit
+  // "post one line at the total").
+  const [overridePrompt, setOverridePrompt] = useState<
+    | { kind: "checks"; failed: Array<{ rule_name: string; notes: string | null }> }
+    | { kind: "reconciliation"; message: string }
+    | null
+  >(null);
+  const [overrideReason, setOverrideReason] = useState("");
+  const lastDocIdRef = useRef<string | null>(null);
+
   useEffect(() => {
     setPartyCredits([]);
     setApplyCredits({});
@@ -650,7 +669,7 @@ export function ReviewPanel({
     setBusy(null);
   }
 
-  async function approve() {
+  async function approve(opts: { override?: boolean; overrideReconciliation?: boolean } = {}) {
     if (!extracted) {
       setActionMsg(
         "Cannot approve: run extract first (no extracted_fields for this document).",
@@ -702,6 +721,21 @@ export function ReviewPanel({
     const alreadyApproved =
       document!.status === "approved" || document!.status === "synced";
 
+    // A failed check is never silently approved: stop here and ask for a
+    // written reason first. With the reason, the rows are marked as
+    // overridden (who + why) and the server audits it as well.
+    if (!alreadyApproved && failedRules.length > 0 && !opts.override) {
+      setOverridePrompt({
+        kind: "checks",
+        failed: failedRules.map((r) => ({ rule_name: r.rule_name, notes: r.notes ?? null })),
+      });
+      setActionMsg(
+        `Not posted: ${failedRules.length} failed check${failedRules.length > 1 ? "s" : ""} — posting needs a written override reason.`,
+      );
+      setBusy(null);
+      return;
+    }
+
     // Re-push path: status already approved after a failed Zoho call.
     if (!alreadyApproved) {
       for (const row of failedRules) {
@@ -709,7 +743,7 @@ export function ReviewPanel({
           .from("judgment_results")
           .update({
             passed: true,
-            notes: `${row.notes ?? ""}${row.notes ? " | " : ""}Approved by ${name}`,
+            notes: `${row.notes ?? ""}${row.notes ? " | " : ""}Overridden by ${name}: ${overrideReason.trim()}`,
             reviewed_by: name,
           })
           .eq("id", row.id);
@@ -759,27 +793,58 @@ export function ReviewPanel({
               const c = partyCredits.find((x) => x.zoho_id === id)!;
               return { kind: c.kind, zoho_id: id, amount: amt };
             }),
+          ...(opts.override ? { override: true, override_reason: overrideReason.trim() } : {}),
+          ...(opts.overrideReconciliation ? { override_reconciliation: true } : {}),
         },
       });
-      const result = (data ?? {}) as {
+      type ApproveResp = {
         success?: boolean;
         zoho_bill_id?: string;
         error?: string;
+        failed_checks?: Array<{ rule_name: string; notes: string | null }>;
+        reconciliation?: { ok: boolean; mode: string; message: string };
+        money?: { tax_name: string | null; notes: string[] };
+        attachment?: { uploaded: boolean; error?: string };
+        already_synced?: boolean;
       };
+      // Non-2xx bodies (409 failed checks, 422 reconciliation) arrive on error.context.
+      let result = (data ?? {}) as ApproveResp;
+      let httpStatus = 200;
+      if (error && (error as { context?: Response }).context) {
+        const ctx = (error as { context: Response }).context;
+        httpStatus = ctx.status;
+        try { result = (await ctx.json()) as ApproveResp; } catch { /* keep */ }
+      }
       if (error || !result.success) {
         const detail = result.error ?? error?.message ?? "Zoho sync failed";
-        setActionMsg(
-          `Zoho sync failed: ${detail}. Status is sync_failed — fix the fields and Approve again.`,
-        );
+        if (httpStatus === 409 && result.failed_checks?.length) {
+          setOverridePrompt({ kind: "checks", failed: result.failed_checks });
+          setActionMsg(`Not posted: ${detail}`);
+        } else if (httpStatus === 422 && result.reconciliation) {
+          setOverridePrompt({ kind: "reconciliation", message: result.reconciliation.message });
+          setActionMsg(`Not posted: ${detail}`);
+        } else {
+          setActionMsg(
+            `Zoho sync failed: ${detail}. Status is sync_failed — fix the fields and Approve again.`,
+          );
+        }
       } else {
+        setOverridePrompt(null);
+        setOverrideReason("");
         const label = postAs === "invoice"
           ? "Invoice"
           : postAs === "expense"
             ? "Expense"
             : "Bill";
         setZohoBillId(result.zoho_bill_id ?? null);
+        const bits = [
+          result.already_synced ? "already in Zoho — nothing new created" : null,
+          result.money?.tax_name ? `VAT as ${result.money.tax_name}` : (result.money?.notes?.[0] ?? null),
+          result.attachment ? (result.attachment.uploaded ? "document attached" : `attachment not uploaded${result.attachment.error ? ` (${result.attachment.error})` : ""}`) : null,
+          result.reconciliation && result.reconciliation.mode !== "net" ? `lines: ${result.reconciliation.message}` : null,
+        ].filter(Boolean).join(" · ");
         setActionMsg(
-          `Pushed to Zoho. ${label} ${result.zoho_bill_id ?? ""}. Check Zoho Books or audit_log.`,
+          `Pushed to Zoho. ${label} ${result.zoho_bill_id ?? ""}.${bits ? ` ${bits}.` : ""}`,
         );
       }
     } catch {
@@ -1474,6 +1539,41 @@ export function ReviewPanel({
       </div>
 
       {actionMsg && <p className="action-msg">{actionMsg}</p>}
+
+      {overridePrompt?.kind === "checks" && (
+        <div className="override-box">
+          <p className="override-head">
+            Judgment failed: {overridePrompt.failed.map((f) => f.rule_name).join(", ")}. Posting anyway is a human override and is written to the audit log with your reason.
+          </p>
+          <ul className="override-list">
+            {overridePrompt.failed.map((f) => <li key={f.rule_name}><b>{f.rule_name}</b>{f.notes ? ` — ${f.notes}` : ""}</li>)}
+          </ul>
+          <label className="override-reason">
+            Override reason
+            <input value={overrideReason} onChange={(e) => setOverrideReason(e.target.value)} placeholder="e.g. confirmed with supplier — not a duplicate, second delivery" disabled={!!busy} />
+          </label>
+          <div className="override-actions">
+            <button type="button" className="btn primary" disabled={!!busy || overrideReason.trim().length < 8} onClick={() => void approve({ override: true })}>
+              {busy === "approve" ? "Pushing…" : "Post anyway (override)"}
+            </button>
+            <button type="button" className="btn ghost" disabled={!!busy} onClick={() => setOverridePrompt(null)}>Cancel</button>
+          </div>
+        </div>
+      )}
+      {overridePrompt?.kind === "reconciliation" && (
+        <div className="override-box">
+          <p className="override-head">Lines do not add up: {overridePrompt.message}.</p>
+          <p className="muted" style={{ margin: 0, fontSize: ".82rem" }}>
+            Fix the line items above (quantity, rate, or the total) and approve again. If the lines genuinely cannot be read, post the document total as a single line instead — the broken lines are never sent.
+          </p>
+          <div className="override-actions">
+            <button type="button" className="btn ghost" disabled={!!busy} onClick={() => void approve({ overrideReconciliation: true })}>
+              {busy === "approve" ? "Pushing…" : "Post one line at the document total"}
+            </button>
+            <button type="button" className="btn ghost" disabled={!!busy} onClick={() => setOverridePrompt(null)}>I will fix the lines</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -569,7 +569,8 @@ export async function fetchOpenCredits(zohoFetch: typeof fetch, apiBase: string,
     const bal = Number(d.balance ?? 0) || 0;
     if (bal > 0) out.push({ kind: "creditnote", zoho_id: String(d.creditnote_id), number: String(d.creditnote_number ?? ""), party_kind: "customer", party_zoho_id: String(d.customer_id ?? ""), party_name: String(d.customer_name ?? ""), date: String(d.date ?? "").slice(0, 10), balance: bal });
   }
-  for (const d of await pageAll(zohoFetch, apiBase, orgId, token, "vendorcredits", "vendorcredits", { status: "open" })) {
+  // Zoho lists vendor credits under "vendor_credits" (underscore), unlike creditnotes.
+  for (const d of await pageAll(zohoFetch, apiBase, orgId, token, "vendorcredits", "vendor_credits", { status: "open" })) {
     const bal = Number(d.balance ?? 0) || 0;
     if (bal > 0) out.push({ kind: "vendorcredit", zoho_id: String(d.vendor_credit_id), number: String(d.vendor_credit_number ?? ""), party_kind: "vendor", party_zoho_id: String(d.vendor_id ?? ""), party_name: String(d.vendor_name ?? ""), date: String(d.date ?? "").slice(0, 10), balance: bal });
   }

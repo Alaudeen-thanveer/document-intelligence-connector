@@ -42,6 +42,22 @@ interface ApproveInput {
     zoho_id: string;
     amount: number;
   }> | null;
+  /**
+   * Human override of a failed judgment. Without it, a document whose
+   * latest checks include a failure is refused (409) with the failed checks
+   * listed. With it, the reason is written to audit_log.
+   */
+  override?: boolean;
+  override_reason?: string | null;
+  /**
+   * Human override of the line reconciliation guard. Without it, a document
+   * whose extracted lines do not add up to its extracted total is refused.
+   * With it, ONE line at the document total is posted (never the broken
+   * lines), and the reason is audited.
+   */
+  override_reconciliation?: boolean;
+  /** UAE VAT: emirate code for sales invoices; defaults to the customer's place_of_contact. */
+  place_of_supply?: string | null;
 }
 
 interface ApproveResult {
@@ -49,6 +65,23 @@ interface ApproveResult {
   zoho_bill_id?: string;
   error?: string;
   credits_applied?: { applied: number; ok: boolean; response?: unknown } | null;
+  failed_checks?: Array<{ rule_name: string; notes: string | null }>;
+  reconciliation?: Reconciliation;
+  money?: { tax_id: string | null; tax_name: string | null; currency_id: string | null; notes: string[] };
+  attachment?: { uploaded: boolean; filename?: string; error?: string };
+  already_synced?: boolean;
+}
+
+/** Outcome of checking Σ extracted lines against the extracted total. */
+interface Reconciliation {
+  ok: boolean;
+  /** net: lines + VAT = total · gross: lines = total (VAT inside) · implicit: no usable lines, one line at the total */
+  mode: "net" | "gross" | "implicit" | "mismatch";
+  lines_total: number;
+  tax_amount: number;
+  document_total: number;
+  dropped_lines: number[];
+  message: string;
 }
 
 let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
@@ -315,6 +348,162 @@ async function applyCreditsToDoc(
   return { applied: result.ok ? wanted.reduce((t, c) => t + Number(c.amount), 0) : 0, ok: result.ok, response: result.raw };
 }
 
+// ---------------------------------------------------------------------------
+// Money: VAT → tax_id, currency → currency_id (ported from zoho-push).
+// VAT lives in Zoho's tax field, never inside a line amount: when the
+// document's VAT matches a synced tax rate, lines are posted NET + tax_id so
+// Zoho recomputes the same gross the invoice shows.
+// ---------------------------------------------------------------------------
+async function resolveMoney(
+  supabase: SupabaseClient,
+  currencyCode: string | null | undefined,
+  grossTotal: number,
+  taxAmount: number | null | undefined,
+): Promise<{ taxId: string | null; taxName: string | null; taxPct: number | null; currencyId: string | null; notes: string[] }> {
+  const notes: string[] = [];
+  let currencyId: string | null = null, taxId: string | null = null, taxName: string | null = null, taxPct: number | null = null;
+  if (currencyCode) {
+    const { data } = await supabase.from("zoho_entities").select("zoho_id").eq("kind", "currency").eq("name", currencyCode).maybeSingle();
+    if (data?.zoho_id) currencyId = String(data.zoho_id);
+    else notes.push(`currency ${currencyCode} not in synced Zoho currencies — Zoho default applies`);
+  }
+  if (taxAmount != null && taxAmount > 0 && grossTotal > taxAmount) {
+    const net = grossTotal - taxAmount;
+    const pct = (taxAmount / net) * 100;
+    const { data: taxes } = await supabase.from("zoho_entities").select("zoho_id, name, extra").eq("kind", "tax");
+    const match = (taxes ?? []).find((t) => {
+      const p = Number((t.extra as { percentage?: unknown })?.percentage);
+      return Number.isFinite(p) && p > 0 && Math.abs(p - pct) <= 0.5;
+    });
+    if (match) { taxId = String(match.zoho_id); taxName = String(match.name); taxPct = Number((match.extra as { percentage?: unknown }).percentage); }
+    else notes.push(`VAT ${taxAmount} on ${grossTotal} (~${pct.toFixed(1)}%) matches no synced Zoho tax rate — posted without tax_id`);
+  }
+  return { taxId, taxName, taxPct, currencyId, notes };
+}
+
+/**
+ * Do the extracted lines add up to the extracted total? Tolerance is 0.05
+ * plus 0.1% of the total (OCR rounding). Lines with no usable rate are
+ * reported as dropped — they never disappear silently.
+ */
+function reconcile(
+  mapped: { line_items: Array<{ rate: number; quantity: number }> },
+  lineRows: ExtractedLineItemRow[],
+  documentTotal: number,
+  taxAmount: number | null,
+): Reconciliation {
+  const tax = taxAmount != null && taxAmount > 0 ? taxAmount : 0;
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  const hasRealLines = lineRows.length > 0;
+  const dropped = lineRows
+    .filter((li) => { const rate = li.rate == null || li.rate === "" ? null : Number(li.rate); const amt = li.amount == null || li.amount === "" ? null : Number(li.amount); return (rate == null || !Number.isFinite(rate)) && (amt == null || !Number.isFinite(amt)); })
+    .map((li) => Number(li.line_no));
+  if (!hasRealLines || dropped.length === lineRows.length) {
+    // No lines, or none readable at all: the header total is the only
+    // reliable money. One line at the total (the old behaviour), flagged.
+    return { ok: true, mode: "implicit", lines_total: round2(documentTotal), tax_amount: tax, document_total: round2(documentTotal), dropped_lines: dropped,
+      message: hasRealLines ? `no extracted line had a readable amount — one line at the document total` : "no extracted lines — one line at the document total" };
+  }
+  const linesTotal = round2(mapped.line_items.reduce((t, li) => t + li.rate * li.quantity, 0));
+  const tol = 0.05 + documentTotal * 0.001;
+  const asNet = Math.abs(linesTotal + tax - documentTotal);
+  const asGross = Math.abs(linesTotal - documentTotal);
+  if (dropped.length === 0 && asNet <= tol) return { ok: true, mode: "net", lines_total: linesTotal, tax_amount: tax, document_total: round2(documentTotal), dropped_lines: [], message: `lines ${linesTotal.toFixed(2)} + VAT ${tax.toFixed(2)} = total ${documentTotal.toFixed(2)}` };
+  if (dropped.length === 0 && tax > 0 && asGross <= tol) return { ok: true, mode: "gross", lines_total: linesTotal, tax_amount: tax, document_total: round2(documentTotal), dropped_lines: [], message: `lines ${linesTotal.toFixed(2)} already include VAT ${tax.toFixed(2)} (= total)` };
+  if (dropped.length === 0 && tax === 0 && asGross <= tol) return { ok: true, mode: "net", lines_total: linesTotal, tax_amount: 0, document_total: round2(documentTotal), dropped_lines: [], message: `lines ${linesTotal.toFixed(2)} = total ${documentTotal.toFixed(2)}` };
+  const why = dropped.length
+    ? `line${dropped.length > 1 ? "s" : ""} ${dropped.join(", ")} ha${dropped.length > 1 ? "ve" : "s"} no amount (OCR could not read quantity × rate) — fix the line${dropped.length > 1 ? "s" : ""} in review`
+    : `lines ${linesTotal.toFixed(2)}${tax ? ` + VAT ${tax.toFixed(2)} = ${(linesTotal + tax).toFixed(2)}` : ""} do not match the document total ${documentTotal.toFixed(2)} — correct the lines or the total in review`;
+  return { ok: false, mode: "mismatch", lines_total: linesTotal, tax_amount: tax, document_total: round2(documentTotal), dropped_lines: dropped, message: why };
+}
+
+/** UAE emirate → Zoho place_of_supply code. */
+const EMIRATE_CODES: Record<string, string> = {
+  "abu dhabi": "AB", ajman: "AJ", dubai: "DU", fujairah: "FU", "ras al khaimah": "RA", "ras al-khaimah": "RA", sharjah: "SH", "umm al quwain": "UQ", "umm al-quwain": "UQ",
+};
+function emirateCode(v: unknown): string | null {
+  if (!v) return null;
+  const s = String(v).trim();
+  if (/^[A-Z]{2}$/.test(s)) return s;
+  return EMIRATE_CODES[s.toLowerCase()] ?? null;
+}
+
+/**
+ * Emirate code for place_of_supply (UAE VAT requires it on sales invoices).
+ * Contacts in the UAE edition carry no place-of-contact field, so: explicit
+ * input → the customer's billing state code → company default → the Zoho
+ * organisation's own emirate.
+ */
+async function resolvePlaceOfSupply(
+  supabase: SupabaseClient,
+  explicit: string | null | undefined,
+  customerId: string,
+  companyId: string,
+): Promise<string | null> {
+  if (explicit?.trim()) return emirateCode(explicit) ?? explicit.trim();
+  const contact = await withZohoRetry(async (accessToken) => {
+    const res = await zohoFetch(`${apiBase()}/contacts/${encodeURIComponent(customerId)}?organization_id=${encodeURIComponent(orgId())}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+    const raw = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, raw };
+  });
+  const c = (contact.raw as { contact?: { place_of_contact?: string; billing_address?: { state_code?: string; state?: string } } })?.contact;
+  const fromContact = emirateCode(c?.place_of_contact) ?? emirateCode(c?.billing_address?.state_code) ?? emirateCode(c?.billing_address?.state);
+  if (fromContact) return fromContact;
+  const { data: cfg } = await supabase.from("company_config").select("default_place_of_supply").eq("company_id", companyId).maybeSingle();
+  const fromCompany = emirateCode(cfg?.default_place_of_supply);
+  if (fromCompany) return fromCompany;
+  const org = await withZohoRetry(async (accessToken) => {
+    const res = await zohoFetch(`${apiBase()}/organizations?organization_id=${encodeURIComponent(orgId())}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+    const raw = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, raw };
+  });
+  const o = ((org.raw as { organizations?: Array<Record<string, unknown>> })?.organizations ?? []).find((x) => String(x.organization_id) === orgId()) ?? ((org.raw as { organizations?: Array<Record<string, unknown>> })?.organizations ?? [])[0];
+  return emirateCode(o?.state) ?? emirateCode((o?.address as { state?: string } | undefined)?.state) ?? null;
+}
+
+/** The document's bytes: private storage ref (storage://invoices/path), legacy public URL, or a fetchable URL. */
+async function loadDocumentBytes(
+  supabase: SupabaseClient,
+  fileUrl: string,
+): Promise<{ bytes: Uint8Array; contentType: string; filename: string }> {
+  let path: string | null = null;
+  if (fileUrl.startsWith("storage://invoices/")) path = fileUrl.slice("storage://invoices/".length);
+  const publicMarker = "/storage/v1/object/public/invoices/";
+  const idx = fileUrl.indexOf(publicMarker);
+  if (!path && idx >= 0) path = decodeURIComponent(fileUrl.slice(idx + publicMarker.length));
+  if (path) {
+    const { data, error } = await supabase.storage.from("invoices").download(path);
+    if (error || !data) throw new Error(`storage download failed: ${error?.message ?? "no data"}`);
+    return { bytes: new Uint8Array(await data.arrayBuffer()), contentType: data.type || "application/pdf", filename: path.split("/").pop() || "document.pdf" };
+  }
+  const res = await fetch(fileUrl);
+  if (!res.ok) throw new Error(`fetch document failed (${res.status})`);
+  return { bytes: new Uint8Array(await res.arrayBuffer()), contentType: res.headers.get("content-type") ?? "application/pdf", filename: fileUrl.split("/").pop()?.split("?")[0] || "document.pdf" };
+}
+
+/** Attach the source document to the Zoho record. Best effort; never undoes the document. */
+async function attachDocument(
+  supabase: SupabaseClient,
+  fileUrl: string | null,
+  zohoPath: string,
+  fieldName: "attachment" | "receipt",
+): Promise<{ uploaded: boolean; filename?: string; error?: string }> {
+  if (!fileUrl) return { uploaded: false, error: "no file on document" };
+  try {
+    const file = await loadDocumentBytes(supabase, fileUrl);
+    const result = await withZohoRetry(async (accessToken) => {
+      const form = new FormData();
+      form.append(fieldName, new Blob([file.bytes], { type: file.contentType }), file.filename);
+      const res = await zohoFetch(`${apiBase()}/${zohoPath}?organization_id=${encodeURIComponent(orgId())}`, { method: "POST", headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, body: form });
+      const raw = await res.json().catch(async () => await res.text());
+      return { ok: res.ok && ((raw as { code?: number })?.code ?? 0) === 0, status: res.status, raw };
+    });
+    return result.ok ? { uploaded: true, filename: file.filename } : { uploaded: false, filename: file.filename, error: publicError(JSON.stringify(result.raw).slice(0, 200)) };
+  } catch (err) {
+    return { uploaded: false, error: publicError(err) };
+  }
+}
+
 async function loadCachedVendors(
   supabase: SupabaseClient,
 ): Promise<ZohoVendor[]> {
@@ -401,7 +590,7 @@ Deno.serve(async (req) => {
       invoice_id: invoiceId,
       actor_id: user.id,
       action: "zoho_sync_failed",
-      detail: { error, ...extra },
+      detail: { error, ...extra, ...(input.override ? { override_reason: input.override_reason ?? null } : {}) },
     });
     return jsonResponse({ success: false, error }, 500);
   };
@@ -422,6 +611,26 @@ Deno.serve(async (req) => {
         { success: false, error: "Invoice not found for this company" },
         404,
       );
+    }
+
+    // Idempotent: a document already in Zoho Books is never posted twice.
+    const { data: docFull } = await supabase.from("documents").select("zoho_bill_id").eq("id", invoiceId).maybeSingle();
+    if (doc.status === "synced" && docFull?.zoho_bill_id) {
+      return jsonResponse({ success: true, zoho_bill_id: String(docFull.zoho_bill_id), already_synced: true });
+    }
+
+    // Judgment gate: a failed check needs an explicit, audited human override.
+    const { data: jr } = await supabase.from("judgment_results").select("rule_name, passed, notes").eq("document_id", invoiceId);
+    const failedChecks = (jr ?? []).filter((r) => r.passed === false).map((r) => ({ rule_name: String(r.rule_name), notes: (r.notes as string | null) ?? null }));
+    if (failedChecks.length && !input.override) {
+      return jsonResponse({
+        success: false,
+        error: `Judgment has ${failedChecks.length} failed check${failedChecks.length > 1 ? "s" : ""} (${failedChecks.map((f) => f.rule_name).join(", ")}). Approve with an override reason to post anyway.`,
+        failed_checks: failedChecks,
+      }, 409);
+    }
+    if (failedChecks.length && input.override && !input.override_reason?.trim()) {
+      return jsonResponse({ success: false, error: "An override reason is required when posting over a failed check.", failed_checks: failedChecks }, 400);
     }
 
     const { data: extracted, error: extractedError } = await supabase
@@ -449,11 +658,40 @@ Deno.serve(async (req) => {
       .order("line_no");
     const lineRows = (lineRowsData ?? []) as ExtractedLineItemRow[];
 
-    const mapped = mapExtractedFieldsToZohoBill(
+    let mapped = mapExtractedFieldsToZohoBill(
       extracted as ExtractedFieldsRow,
       lineRows,
     );
     const postAs: PostAs = input.post_as ?? "bill";
+
+    // Money: resolve VAT → tax_id and currency; reconcile lines vs total.
+    const documentTotal = Number(extracted.total_amount ?? 0) || 0;
+    const taxAmount = extracted.tax_amount != null && extracted.tax_amount !== "" ? Number(extracted.tax_amount) : null;
+    const money = await resolveMoney(supabase, extracted.currency as string | null, documentTotal, taxAmount);
+    let recon = reconcile(mapped, lineRows, documentTotal, taxAmount);
+    if (!recon.ok) {
+      if (!input.override_reconciliation) {
+        return jsonResponse({
+          success: false,
+          error: `Lines do not reconcile: ${recon.message}.`,
+          reconciliation: recon,
+        }, 422);
+      }
+      // Override: post the document total as ONE line, never the broken lines.
+      mapped = { ...mapped, line_items: [{ description: mapped.line_items[0]?.description ?? `Document ${mapped.invoice_number ?? invoiceId.slice(0, 8)}`, rate: documentTotal, quantity: 1 }] };
+      recon = { ...recon, ok: true, mode: "implicit", message: `override: posted as one line at the document total (${recon.message})` };
+    }
+    // Apply VAT: lines are net → add tax_id; lines/implicit are gross → make them net first.
+    if (money.taxId && money.taxPct != null) {
+      const netOf = (gross: number) => Math.round((gross / (1 + money.taxPct! / 100)) * 100) / 100;
+      mapped = {
+        ...mapped,
+        line_items: mapped.line_items.map((li) => {
+          const rate = recon.mode === "net" ? li.rate : netOf(li.rate);
+          return { ...li, rate, ...(li.tax_id ? {} : { tax_id: money.taxId! }) };
+        }),
+      };
+    }
 
     let zohoId: string | null = null;
 
@@ -471,9 +709,15 @@ Deno.serve(async (req) => {
           customerId,
         );
       }
+      const pos = await resolvePlaceOfSupply(supabase, input.place_of_supply, customerId, companyId);
+      if (!pos) {
+        return await fail("Zoho needs a place of supply for this customer (UAE VAT). Set the emirate on the customer in Zoho Books and sync, or pass place_of_supply.");
+      }
       const created = await zohoCreate("invoices", {
         customer_id: customerId,
         date: mapped.date,
+        place_of_supply: pos,
+        ...(money.currencyId ? { currency_id: money.currencyId } : {}),
         reference_number: mapped.invoice_number ||
           `DIC-${invoiceId.replace(/-/g, "").slice(0, 12)}`,
         ...(mapped.due_date ? { due_date: mapped.due_date } : {}),
@@ -493,7 +737,7 @@ Deno.serve(async (req) => {
         })),
       });
       if (!created.result.ok || !created.id) {
-        return await fail("Zoho invoice create failed", {
+        return await fail(`Zoho invoice create failed: ${publicError(String((created.result.raw as { message?: string })?.message ?? created.result.status))}`, {
           status: created.result.status,
         });
       }
@@ -515,18 +759,37 @@ Deno.serve(async (req) => {
           "Expense needs an account and a paid-through bank/cash account.",
         );
       }
+      // Expense amount: the document total, net of VAT when a tax matched
+      // (tax_id then makes Zoho re-add it), else the gross.
+      const expenseNet = money.taxId && money.taxPct != null ? Math.round((documentTotal / (1 + money.taxPct / 100)) * 100) / 100 : documentTotal;
       const created = await zohoCreate("expenses", {
         account_id: accountId,
         paid_through_account_id: paidThrough,
         date: mapped.date,
-        amount: mapped.line_items[0]?.rate,
+        amount: expenseNet,
+        ...(money.taxId ? { tax_id: money.taxId } : {}),
+        ...(money.currencyId ? { currency_id: money.currencyId } : {}),
+        ...(mapped.invoice_number ? { reference_number: mapped.invoice_number } : {}),
         ...(input.vendor_id?.trim() ? { vendor_id: input.vendor_id.trim() } : {}),
         ...(input.tax_treatment?.trim()
           ? { tax_treatment: input.tax_treatment.trim() }
           : {}),
       });
+      // Zoho answers an expense create with code 0 / "The expense has been
+      // recorded." and NO expense object — find the id by reference.
+      if (created.result.ok && !created.id && ((created.result.raw as { code?: number })?.code ?? 0) === 0) {
+        const ref = mapped.invoice_number?.trim();
+        const lookup = await withZohoRetry(async (accessToken) => {
+          const qs = new URLSearchParams({ organization_id: orgId(), ...(ref ? { reference_number: ref } : {}), sort_column: "created_time", sort_order: "D", per_page: "5" });
+          const res = await zohoFetch(`${apiBase()}/expenses?${qs}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+          const raw = await res.json().catch(() => ({}));
+          return { ok: res.ok, status: res.status, raw };
+        });
+        const hit = ((lookup.raw as { expenses?: Array<Record<string, unknown>> })?.expenses ?? [])[0];
+        if (hit?.expense_id) created.id = String(hit.expense_id);
+      }
       if (!created.result.ok || !created.id) {
-        return await fail("Zoho expense create failed", {
+        return await fail(`Zoho expense create failed: ${publicError(String((created.result.raw as { message?: string })?.message ?? created.result.status))}`, {
           status: created.result.status,
         });
       }
@@ -630,6 +893,7 @@ Deno.serve(async (req) => {
         vendor_id: matched.bill.vendor_id,
         bill_number: billNumber,
         date: mapped.date,
+        ...(money.currencyId ? { currency_id: money.currencyId } : {}),
         ...(mapped.due_date ? { due_date: mapped.due_date } : {}),
         ...(mapped.reference_number
           ? { reference_number: mapped.reference_number }
@@ -648,7 +912,7 @@ Deno.serve(async (req) => {
         })),
       });
       if (!created.result.ok || !created.id) {
-        return await fail("Zoho bill create failed", {
+        return await fail(`Zoho bill create failed: ${publicError(String((created.result.raw as { message?: string })?.message ?? created.result.status))}`, {
           status: created.result.status,
         });
       }
@@ -669,6 +933,16 @@ Deno.serve(async (req) => {
       external_kind: postAs === "invoice" ? "invoices" : postAs === "expense" ? "expenses" : "bills",
     });
 
+    // Attach the source document (best effort; the Zoho record already exists).
+    const attachment = zohoId
+      ? await attachDocument(
+        supabase,
+        (doc.file_url as string | null) ?? null,
+        postAs === "invoice" ? `invoices/${zohoId}/attachment` : postAs === "expense" ? `expenses/${zohoId}/receipt` : `bills/${zohoId}/attachment`,
+        postAs === "expense" ? "receipt" : "attachment",
+      )
+      : { uploaded: false, error: "no zoho id" };
+
     // Reviewer chose to apply unused credit (advance / credit note / vendor
     // credit) to this invoice or bill. Best-effort, after the document
     // exists; reported, never fatal.
@@ -685,10 +959,18 @@ Deno.serve(async (req) => {
       invoice_id: invoiceId,
       actor_id: user.id,
       action: "zoho_synced",
-      detail: { zoho_bill_id: zohoId, post_as: postAs, credits_applied: creditsApplied?.applied ?? 0 },
+      detail: {
+        zoho_bill_id: zohoId, post_as: postAs, credits_applied: creditsApplied?.applied ?? 0,
+        reconciliation: recon.mode, tax: money.taxName, attachment: attachment.uploaded,
+        ...(failedChecks.length ? { override_reason: input.override_reason, overridden_checks: failedChecks.map((f) => f.rule_name) } : {}),
+        ...(recon.message.startsWith("override") ? { reconciliation_override: recon.message } : {}),
+      },
     });
 
-    return jsonResponse({ success: true, zoho_bill_id: zohoId ?? undefined, credits_applied: creditsApplied });
+    return jsonResponse({
+      success: true, zoho_bill_id: zohoId ?? undefined, credits_applied: creditsApplied,
+      reconciliation: recon, money: { tax_id: money.taxId, tax_name: money.taxName, currency_id: money.currencyId, notes: money.notes }, attachment,
+    });
   } catch (err) {
     return await fail(publicError(err));
   }

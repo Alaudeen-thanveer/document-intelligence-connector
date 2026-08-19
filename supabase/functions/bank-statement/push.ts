@@ -102,11 +102,14 @@ export async function pushLine(
     if (!line.chosen_party_zoho_id) throw new Error("customer receipt needs a customer");
     if (line.side !== "credit") throw new Error("a customer receipt must be money IN");
     const bankCharges = Math.round(Number(line.chosen_bank_charges ?? 0) * 100) / 100;
+    // Zoho semantics (verified live): `amount` is what the CUSTOMER paid
+    // (invoice side, = line + bank charges); `bank_charges` is what the bank
+    // kept; the deposit into the bank account is amount − bank_charges =
+    // the statement line. Sending the line amount as `amount` with charges
+    // on top makes Zoho reject the invoice application.
     const body: Record<string, unknown> = {
       customer_id: line.chosen_party_zoho_id, payment_mode: "banktransfer",
-      // Zoho: amount is what the customer paid; bank_charges is what the
-      // bank kept; invoices can be settled up to amount + bank_charges.
-      amount, account_id: bankAccountId, ...common,
+      amount: Math.round((amount + bankCharges) * 100) / 100, account_id: bankAccountId, ...common,
     };
     if (bankCharges > 0) body.bank_charges = bankCharges;
     if (kind === "retainer_receipt") {

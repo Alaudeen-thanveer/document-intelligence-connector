@@ -437,6 +437,9 @@ async function fetchKind(
         // Party-level default only; treatment is decided per transaction at
         // push time (a VAT-registered party can have an out-of-scope bill).
         tax_treatment: c.tax_treatment || null,
+        // UAE VAT: Zoho requires place_of_supply on sales invoices; the
+        // contact's emirate (place_of_contact) is the default source.
+        place_of_contact: c.place_of_contact || null,
       },
     }))
     .filter((r) => r.zoho_id && r.name);
