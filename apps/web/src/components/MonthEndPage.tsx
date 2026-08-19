@@ -70,6 +70,17 @@ interface VatForm {
   due_date: string; days_left: number; ready: boolean;
 }
 interface FxAccount { account_id: string; account_name: string; gl_balance?: number | null; fcy_balance?: number | null; adjusted_balance?: number | null; gain_or_loss?: number | null }
+interface ScheduleRowUi {
+  id: string; kind: "prepayment" | "accrual"; label: string; source_kind: string; source_number: string | null;
+  bs_account_id: string; bs_account_name: string | null; pl_account_id: string; pl_account_name: string | null;
+  total: number; months: number; start_period: string; status: "proposed" | "active" | "done" | "dismissed";
+  proposed_periods: number; posted_periods: number;
+}
+interface AssetProposalUi {
+  id: string; bill_number: string | null; line_description: string; amount: number;
+  asset_account_name: string | null; purchase_date: string | null; status: "proposed" | "created" | "dismissed"; zoho_asset_id: string | null;
+}
+interface AccountOption { zoho_id: string; name: string }
 
 interface MonthEndResult {
   ok: boolean;
@@ -88,6 +99,9 @@ interface MonthEndResult {
   reconciliations?: Reconciliation[];
   lock?: LockInfo;
   ct?: CtInfo | null;
+  schedules?: ScheduleRowUi[];
+  asset_proposals?: AssetProposalUi[];
+  fixed_assets?: { active_count: number; types: Array<{ fixed_asset_type_id: string; name: string }> };
   warnings?: string[];
   error?: string;
 }
@@ -128,10 +142,50 @@ export function MonthEndPage() {
   const [fxRate, setFxRate] = useState("");
   const [fxExposure, setFxExposure] = useState<{ accounts: FxAccount[]; currency_code: string; date: string; rate: number } | null>(null);
   const [forceLock, setForceLock] = useState(false);
+  // Schedules + assets (item 16).
+  const [accounts, setAccounts] = useState<AccountOption[]>([]);
+  const [schedEdits, setSchedEdits] = useState<Record<string, { pl_account_id: string; months: string; start_period: string; total: string }>>({});
+  const [manualSched, setManualSched] = useState<{ kind: "prepayment" | "accrual"; label: string; bs_account_id: string; pl_account_id: string; total: string; months: string; start_period: string } | null>(null);
+  const [assetType, setAssetType] = useState("");
 
   useEffect(() => {
     void supabase.from("zoho_entities").select("zoho_id, name").eq("kind", "currency").neq("name", "AED").then(({ data }) => setCurrencies((data ?? []) as Array<{ zoho_id: string; name: string }>));
+    void supabase.from("zoho_entities").select("zoho_id, name").eq("kind", "account").order("name").then(({ data }) => setAccounts((data ?? []) as AccountOption[]));
   }, []);
+
+  async function saveSchedule(row: ScheduleRowUi | null) {
+    const e = row ? schedEdits[row.id] : null;
+    const body = row
+      ? { kind: row.kind, label: row.label, bs_account_id: row.bs_account_id, pl_account_id: e?.pl_account_id || row.pl_account_id, total: Number(e?.total ?? row.total), months: Number(e?.months ?? row.months), start_period: e?.start_period ?? row.start_period }
+      : manualSched && { kind: manualSched.kind, label: manualSched.label, bs_account_id: manualSched.bs_account_id, pl_account_id: manualSched.pl_account_id, total: Number(manualSched.total), months: Number(manualSched.months), start_period: manualSched.start_period };
+    if (!body) return;
+    setBusy("sched"); setMessage(null);
+    const res = await callEdgeFunction("month-end", { month, action: "save_schedule", ...(row ? { schedule_id: row.id } : {}), schedule: body });
+    const b = res.body as { ok?: boolean; error?: string };
+    setMessage(b.ok ? `Schedule active — ${body.months} monthly entries of ~${money(body.total / body.months)} will be proposed from ${body.start_period}.` : `Not saved: ${b.error ?? res.status}`);
+    setBusy(null); setManualSched(null);
+    await load(month);
+  }
+  async function dismissSchedule(id: string) {
+    setBusy("sched");
+    await callEdgeFunction("month-end", { month, action: "dismiss_schedule", schedule_id: id });
+    setBusy(null);
+    await load(month);
+  }
+  async function createAsset(p: AssetProposalUi) {
+    setBusy(`asset:${p.id}`); setMessage(null);
+    const res = await callEdgeFunction("month-end", { month, action: "create_asset", asset_proposal_id: p.id, ...(assetType ? { fixed_asset_type_id: assetType } : {}) });
+    const b = res.body as { ok?: boolean; error?: string; zoho_asset_id?: string | null };
+    setMessage(b.ok ? `Asset created in Zoho's Fixed Assets register${b.zoho_asset_id ? ` (${b.zoho_asset_id})` : ""}.` : `Not created: ${b.error ?? res.status}`);
+    setBusy(null);
+    await load(month);
+  }
+  async function dismissAsset(p: AssetProposalUi) {
+    setBusy(`asset:${p.id}`);
+    await callEdgeFunction("month-end", { month, action: "dismiss_asset", asset_proposal_id: p.id });
+    setBusy(null);
+    await load(month);
+  }
 
   async function runVatReview() {
     setVatBusy(true); setMessage(null);
@@ -466,6 +520,113 @@ export function MonthEndPage() {
           {result.ct.net_profit_ytd != null && (
             <p className="muted">FY-to-date result {money(result.ct.net_profit_ytd)}{result.ct.fy_start ? ` since ${result.ct.fy_start}` : ""} · provision to date {money(result.ct.provision_to_date ?? 0)} · already provided {money(result.ct.already_provided ?? 0)}.
             {(result.ct.top_up ?? 0) > 0 ? " The proposed journal is below under Proposed journals." : ""}</p>
+          )}
+        </section>
+      )}
+
+      {result && ((result.asset_proposals ?? []).length > 0 || (result.fixed_assets?.active_count ?? 0) > 0) && (
+        <section className="panel connection-card">
+          <h3>Fixed assets</h3>
+          <p className="muted">
+            Bill lines that landed on a fixed-asset account. Creating adds the record to Zoho's Fixed
+            Assets register (depreciation then runs there); nothing is created without your click.
+            {result.fixed_assets && result.fixed_assets.active_count > 0 ? ` ${result.fixed_assets.active_count} active asset(s) in the register.` : ""}
+          </p>
+          {(result.fixed_assets?.types ?? []).length > 0 && (
+            <label className="muted">Asset type{" "}
+              <select value={assetType} onChange={(e) => setAssetType(e.target.value)}>
+                <option value="">Choose…</option>
+                {(result.fixed_assets?.types ?? []).map((t) => <option key={t.fixed_asset_type_id} value={t.fixed_asset_type_id}>{t.name}</option>)}
+              </select>
+            </label>
+          )}
+          <ul className="conn-entity-list">
+            {(result.asset_proposals ?? []).map((p) => (
+              <li key={p.id}>
+                <div>
+                  <strong>{p.line_description}</strong> · {money(p.amount)}
+                  <div className="muted">From bill {p.bill_number ?? "—"} · {p.asset_account_name ?? ""} · purchased {p.purchase_date ?? "—"}</div>
+                </div>
+                {p.status === "created" ? (
+                  <span className="status-pill status-synced">in Zoho{p.zoho_asset_id ? ` · ${p.zoho_asset_id}` : ""}</span>
+                ) : p.status === "dismissed" ? (
+                  <span className="status-pill status-pending">dismissed</span>
+                ) : (
+                  <span style={{ display: "flex", gap: 6 }}>
+                    <button type="button" className="btn btn-small" disabled={busy != null} onClick={() => void createAsset(p)}>
+                      {busy === `asset:${p.id}` ? "Creating…" : "Create in Zoho"}
+                    </button>
+                    <button type="button" className="btn ghost btn-small" disabled={busy != null} onClick={() => void dismissAsset(p)}>Not an asset</button>
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {result && (
+        <section className="panel connection-card">
+          <h3>Prepayments &amp; accruals</h3>
+          <p className="muted">
+            A schedule spreads an amount over the months — a prepayment released to expense, or an
+            expense accrued before the bill lands. Each due month appears under Proposed journals for
+            you to post. Prepayment candidates arrive from approved bills; accruals you add here.
+          </p>
+          {(result.schedules ?? []).filter((sc) => sc.status !== "dismissed").map((sc) => {
+            const e = schedEdits[sc.id] ?? { pl_account_id: sc.pl_account_id, months: String(sc.months), start_period: sc.start_period, total: String(sc.total) };
+            return (
+              <div key={sc.id} className="bank-line" style={{ marginTop: 8 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+                  <strong>{sc.label}</strong>
+                  <span className={`status-pill ${sc.status === "done" ? "status-synced" : sc.status === "active" ? "status-synced" : "status-needs_review"}`}>
+                    {sc.status === "active" ? `active · ${sc.posted_periods}/${sc.months} posted` : sc.status}
+                  </span>
+                </div>
+                <div className="muted" style={{ marginTop: 4 }}>
+                  {sc.kind === "prepayment" ? "Prepayment" : "Accrual"} · {sc.bs_account_name ?? sc.bs_account_id} → {sc.pl_account_name ?? "pick the expense account"} · {money(sc.total)} over {sc.months} months from {sc.start_period}
+                  {sc.source_number ? ` · from bill ${sc.source_number}` : ""}
+                </div>
+                {sc.status === "proposed" && (
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8, flexWrap: "wrap" }}>
+                    <select value={e.pl_account_id} onChange={(ev) => setSchedEdits({ ...schedEdits, [sc.id]: { ...e, pl_account_id: ev.target.value } })}>
+                      <option value="">Expense account…</option>
+                      {accounts.map((a) => <option key={a.zoho_id} value={a.zoho_id}>{a.name}</option>)}
+                    </select>
+                    <input type="number" min="1" max="60" style={{ width: 70 }} value={e.months} onChange={(ev) => setSchedEdits({ ...schedEdits, [sc.id]: { ...e, months: ev.target.value } })} /> <span className="muted">months from</span>
+                    <input type="month" value={e.start_period} onChange={(ev) => setSchedEdits({ ...schedEdits, [sc.id]: { ...e, start_period: ev.target.value } })} />
+                    <button type="button" className="btn btn-small" disabled={busy != null || !e.pl_account_id} onClick={() => void saveSchedule(sc)}>{busy === "sched" ? "Saving…" : "Activate"}</button>
+                    <button type="button" className="btn ghost btn-small" disabled={busy != null} onClick={() => void dismissSchedule(sc.id)}>Dismiss</button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          {manualSched ? (
+            <div className="bank-line" style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <select value={manualSched.kind} onChange={(e) => setManualSched({ ...manualSched, kind: e.target.value as "prepayment" | "accrual" })}>
+                <option value="accrual">Accrual</option>
+                <option value="prepayment">Prepayment</option>
+              </select>
+              <input placeholder="Name (e.g. Audit fee accrual FY26)" style={{ minWidth: 220 }} value={manualSched.label} onChange={(e) => setManualSched({ ...manualSched, label: e.target.value })} />
+              <select value={manualSched.bs_account_id} onChange={(e) => setManualSched({ ...manualSched, bs_account_id: e.target.value })}>
+                <option value="">Balance-sheet account…</option>
+                {accounts.map((a) => <option key={a.zoho_id} value={a.zoho_id}>{a.name}</option>)}
+              </select>
+              <select value={manualSched.pl_account_id} onChange={(e) => setManualSched({ ...manualSched, pl_account_id: e.target.value })}>
+                <option value="">P&amp;L account…</option>
+                {accounts.map((a) => <option key={a.zoho_id} value={a.zoho_id}>{a.name}</option>)}
+              </select>
+              <input type="number" placeholder="Total" style={{ width: 110 }} value={manualSched.total} onChange={(e) => setManualSched({ ...manualSched, total: e.target.value })} />
+              <input type="number" min="1" max="60" placeholder="Months" style={{ width: 80 }} value={manualSched.months} onChange={(e) => setManualSched({ ...manualSched, months: e.target.value })} />
+              <input type="month" value={manualSched.start_period} onChange={(e) => setManualSched({ ...manualSched, start_period: e.target.value })} />
+              <button type="button" className="btn btn-small" disabled={busy != null || !manualSched.label || !manualSched.bs_account_id || !manualSched.pl_account_id || !manualSched.total} onClick={() => void saveSchedule(null)}>Add</button>
+              <button type="button" className="btn ghost btn-small" onClick={() => setManualSched(null)}>Cancel</button>
+            </div>
+          ) : (
+            <button type="button" className="btn ghost btn-small" style={{ marginTop: 10 }} onClick={() => setManualSched({ kind: "accrual", label: "", bs_account_id: "", pl_account_id: "", total: "", months: "12", start_period: month })}>
+              + Add an accrual / prepayment by hand
+            </button>
           )}
         </section>
       )}

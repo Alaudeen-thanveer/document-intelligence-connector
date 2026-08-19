@@ -30,6 +30,7 @@ import { reconcileAccount, type ReconResult, type ReconStatementLine, type Recon
 import { buildJournalProposal, journalBody, type PatternForProposal, type ProposalLine } from "./journal_proposals.ts";
 import { computeCtProvision, fiscalYearStart, netProfitFromReport } from "./ct_provision.ts";
 import { bcaBody, bcaParams, parseBcaAccounts, validateRate } from "./fx_reval.ts";
+import { dueScheduleEntries, faDepreciationNudge, validateSchedule, type ScheduleRow } from "./schedules.ts";
 
 /** Same fingerprint as bookkeeping-learn/journal_patterns.ts. */
 function fingerprintLines(
@@ -197,7 +198,7 @@ Deno.serve(async (req) => {
 
   let input: {
     month?: string; company_id?: string;
-    action?: "nudges" | "reconcile" | "post_journal" | "dismiss_journal" | "lock_period" | "unlock_period" | "fx_exposure" | "post_bca";
+    action?: "nudges" | "reconcile" | "post_journal" | "dismiss_journal" | "lock_period" | "unlock_period" | "fx_exposure" | "post_bca" | "save_schedule" | "dismiss_schedule" | "create_asset" | "dismiss_asset";
     bank_account_zoho_id?: string;
     proposal_id?: string;
     journal_date?: string; notes?: string | null; reference_number?: string | null;
@@ -209,6 +210,12 @@ Deno.serve(async (req) => {
     exchange_rate?: number | string;
     adjustment_date?: string;
     account_ids?: string[];
+    /** save_schedule / dismiss_schedule. */
+    schedule_id?: string;
+    schedule?: { kind: "prepayment" | "accrual"; label: string; bs_account_id: string; pl_account_id: string; total: number; months: number; start_period: string };
+    /** create_asset / dismiss_asset. */
+    asset_proposal_id?: string;
+    fixed_asset_type_id?: string;
   } = {};
   try {
     const text = await req.text();
@@ -304,6 +311,79 @@ Deno.serve(async (req) => {
       return jsonResponse({ ok: true, zoho: bca, exposure, usage: meter.summary() });
     }
 
+    // -------------------------- prepayment / accrual schedules (item 16)
+    // save_schedule activates a proposed one (with the reviewer's months /
+    // start / P&L account) or creates a manual accrual/prepayment.
+    if (action === "save_schedule") {
+      const body = input.schedule;
+      if (!body) return jsonResponse({ ok: false, error: "schedule required" }, 400);
+      const v = validateSchedule(body);
+      if (!v.ok) return jsonResponse({ ok: false, error: v.error }, 400);
+      const { data: accs } = await supabase.from("zoho_entities").select("zoho_id, name").eq("kind", "account").in("zoho_id", [body.bs_account_id, body.pl_account_id]);
+      const nameOf = (id: string) => (accs ?? []).find((a) => String(a.zoho_id) === id)?.name ?? null;
+      if (!nameOf(body.bs_account_id) || !nameOf(body.pl_account_id)) return jsonResponse({ ok: false, error: "Pick accounts that exist in Zoho Books (synced)." }, 400);
+      const row = {
+        kind: body.kind, label: body.label.trim(), bs_account_id: body.bs_account_id, bs_account_name: nameOf(body.bs_account_id),
+        pl_account_id: body.pl_account_id, pl_account_name: nameOf(body.pl_account_id),
+        total: Math.round(Number(body.total) * 100) / 100, months: Math.round(Number(body.months)), start_period: body.start_period,
+        status: "active", decided_by: actor, decided_at: new Date().toISOString(),
+      };
+      let saved: Record<string, unknown> | null = null;
+      if (input.schedule_id) {
+        const { data } = await supabase.from("bk_schedules").update(row).eq("id", input.schedule_id).eq("company_id", companyId).in("status", ["proposed", "active"]).select("*").maybeSingle();
+        saved = data;
+      } else {
+        const { data } = await supabase.from("bk_schedules").insert({ ...row, company_id: companyId, source_kind: "manual", created_by: actor }).select("*").maybeSingle();
+        saved = data;
+      }
+      if (!saved) return jsonResponse({ ok: false, error: "Schedule not found (or already done/dismissed)." }, 404);
+      await audit("schedule_activated", { schedule_id: saved.id, kind: row.kind, label: row.label, total: row.total, months: row.months, start_period: row.start_period });
+      return jsonResponse({ ok: true, schedule: saved });
+    }
+    if (action === "dismiss_schedule") {
+      const sid = String(input.schedule_id ?? "");
+      if (!sid) return jsonResponse({ ok: false, error: "schedule_id required" }, 400);
+      const { data } = await supabase.from("bk_schedules").update({ status: "dismissed", decided_by: actor, decided_at: new Date().toISOString() }).eq("id", sid).eq("company_id", companyId).neq("status", "done").select("id").maybeSingle();
+      if (!data) return jsonResponse({ ok: false, error: "Schedule not found (or already done)." }, 404);
+      return jsonResponse({ ok: true, status: "dismissed" });
+    }
+
+    // ------------------------------------------- fixed assets (item 16)
+    // create_asset posts the proposed record into Zoho's Fixed Assets
+    // module — only on this click, never on its own. Zoho's own message is
+    // surfaced verbatim (e.g. when the module is disabled).
+    if (action === "create_asset") {
+      const pid = String(input.asset_proposal_id ?? "");
+      if (!pid) return jsonResponse({ ok: false, error: "asset_proposal_id required" }, 400);
+      const { data: prop } = await supabase.from("bk_asset_proposals").select("*").eq("id", pid).eq("company_id", companyId).maybeSingle();
+      if (!prop) return jsonResponse({ ok: false, error: "proposal not found" }, 404);
+      if (prop.status === "created") return jsonResponse({ ok: false, error: `Already created as Zoho asset ${prop.zoho_asset_id}.` }, 409);
+      const purchaseDate = prop.purchase_date ? String(prop.purchase_date) : today;
+      const body: Record<string, unknown> = {
+        asset_name: String(prop.line_description).slice(0, 100),
+        asset_account_id: String(prop.asset_account_id),
+        purchase_price: Number(prop.amount),
+        dep_start_value: Number(prop.amount),
+        purchase_date: purchaseDate,
+        dep_start_date: purchaseDate,
+        ...(input.fixed_asset_type_id ? { fixed_asset_type_id: String(input.fixed_asset_type_id) } : {}),
+      };
+      const res = await zohoPost(token, "fixedassets", body);
+      if (!res.ok) return jsonResponse({ ok: false, error: `Zoho did not create the asset: ${res.raw.message ?? res.status}`, body }, 502);
+      const asset = (res.raw.fixed_asset ?? res.raw.fixedasset ?? {}) as Record<string, unknown>;
+      const assetId = asset.fixed_asset_id ? String(asset.fixed_asset_id) : null;
+      await supabase.from("bk_asset_proposals").update({ status: "created", zoho_asset_id: assetId, decided_by: actor, decided_at: new Date().toISOString() }).eq("id", pid);
+      await audit("fixed_asset_created", { proposal_id: pid, zoho_asset_id: assetId, asset_name: body.asset_name, amount: prop.amount });
+      return jsonResponse({ ok: true, zoho_asset_id: assetId, asset, usage: meter.summary() });
+    }
+    if (action === "dismiss_asset") {
+      const pid = String(input.asset_proposal_id ?? "");
+      if (!pid) return jsonResponse({ ok: false, error: "asset_proposal_id required" }, 400);
+      const { data } = await supabase.from("bk_asset_proposals").update({ status: "dismissed", decided_by: actor, decided_at: new Date().toISOString() }).eq("id", pid).eq("company_id", companyId).neq("status", "created").select("id").maybeSingle();
+      if (!data) return jsonResponse({ ok: false, error: "Proposal not found (or already created)." }, 404);
+      return jsonResponse({ ok: true, status: "dismissed" });
+    }
+
     // ----------------------------------------------------------- actions
     // Reconcile one bank account in Zoho — only what the nudge proposed
     // (recomputed here, never trusted from the client), only when balanced.
@@ -341,6 +421,14 @@ Deno.serve(async (req) => {
       const journal = (res.raw.journal ?? {}) as Record<string, unknown>;
       const journalId = journal.journal_id ? String(journal.journal_id) : null;
       await supabase.from("bk_journal_proposals").update({ status: "posted", zoho_journal_id: journalId, lines, total: built.total, journal_date: built.body.journal_date, notes: built.body.notes ?? null, reference_number: built.body.reference_number ?? null, decided_by: actor, decided_at: new Date().toISOString() }).eq("id", proposalId);
+      // A schedule whose every month has posted is done.
+      if (prop.schedule_id) {
+        const { data: sched } = await supabase.from("bk_schedules").select("months").eq("id", prop.schedule_id).maybeSingle();
+        const { data: postedRows } = await supabase.from("bk_journal_proposals").select("id").eq("schedule_id", prop.schedule_id).eq("status", "posted");
+        if (sched && (postedRows ?? []).length >= Number(sched.months)) {
+          await supabase.from("bk_schedules").update({ status: "done" }).eq("id", prop.schedule_id);
+        }
+      }
       await supabase.from("audit_log").insert({ company_id: companyId, actor_type: "human", actor_id: auth.user?.id ?? null, action: "journal_posted", detail: { proposal_id: proposalId, zoho_journal_id: journalId, total: built.total, journal_date: built.body.journal_date, actor } }).then(() => {}, () => {});
       return jsonResponse({ ok: true, zoho_journal_id: journalId, journal, usage: meter.summary() });
     }
@@ -575,6 +663,46 @@ Deno.serve(async (req) => {
       }
     }
 
+    // --- Item 16: schedules — every due month of an active schedule
+    // becomes a journal proposal (kind schedule), never twice per period.
+    const { data: schedRows } = await supabase.from("bk_schedules").select("*").eq("company_id", companyId).in("status", ["proposed", "active"]);
+    const schedules: Array<Record<string, unknown>> = [];
+    for (const sr of schedRows ?? []) {
+      const { data: props } = await supabase.from("bk_journal_proposals").select("period, status").eq("schedule_id", sr.id);
+      const proposedPeriods = (props ?? []).map((x) => String(x.period));
+      const postedCount = (props ?? []).filter((x) => x.status === "posted").length;
+      let created = 0;
+      if (sr.status === "active") {
+        const row: ScheduleRow = { id: String(sr.id), kind: sr.kind as "prepayment" | "accrual", label: String(sr.label), bs_account_id: String(sr.bs_account_id), bs_account_name: (sr.bs_account_name as string | null) ?? null, pl_account_id: String(sr.pl_account_id), pl_account_name: (sr.pl_account_name as string | null) ?? null, total: Number(sr.total), months: Number(sr.months), start_period: String(sr.start_period) };
+        for (const due of dueScheduleEntries(row, proposedPeriods, month, today)) {
+          const { data: ins, error: insErr } = await supabase.from("bk_journal_proposals").insert({
+            company_id: companyId, pattern_id: null, kind: "schedule", schedule_id: sr.id, period: due.period,
+            journal_date: due.journal_date, reference_number: due.reference_number, notes: due.notes,
+            lines: due.lines, total: due.amount, status: "proposed",
+          }).select("*").maybeSingle();
+          if (ins) { journalProposals.push(ins); created++; }
+          else if (insErr) console.warn(`schedule entry insert failed (${sr.label} ${due.period}): ${insErr.message}`);
+        }
+      }
+      schedules.push({ ...sr, proposed_periods: proposedPeriods.length + created, posted_periods: postedCount });
+    }
+    // Schedule entries still awaiting a decision (ANY period — an unposted
+    // June release is still June's business) plus this period's decided ones.
+    const { data: schedProps } = await supabase.from("bk_journal_proposals").select("*").eq("company_id", companyId).eq("kind", "schedule").or(`status.eq.proposed,period.eq.${month}`);
+    for (const spx of schedProps ?? []) if (!journalProposals.some((jp) => (jp as { id?: string }).id === spx.id)) journalProposals.push(spx);
+
+    // Asset proposals (from approved bills) + "did depreciation run?".
+    const { data: assetProps } = await supabase.from("bk_asset_proposals").select("*").eq("company_id", companyId).order("created_at", { ascending: false });
+    let faAssetsCount = 0;
+    let faTypes: Array<Record<string, unknown>> = [];
+    try {
+      const faRaw = await zohoGet(token, "fixedassets", { filter_by: "Status.Active", per_page: "200" });
+      faAssetsCount = ((faRaw.fixedassets ?? []) as Array<unknown>).length;
+      const tRaw = await zohoGet(token, "fixedassettypes");
+      faTypes = ((tRaw.fixed_asset_types ?? []) as Array<Record<string, unknown>>).map((t) => ({ fixed_asset_type_id: t.fixed_asset_type_id, name: t.fixed_asset_type_name ?? t.name }));
+    } catch { /* module off or unreachable — the create action reports Zoho's words */ }
+    const faNudge = faDepreciationNudge(faAssetsCount, posted, month);
+
     // --- Item 4: bank reconciliation at period end, per bank account.
     const reconciliations = await reconcileForAccounts(supabase, token, companyId, null, start, end, today);
 
@@ -594,6 +722,7 @@ Deno.serve(async (req) => {
       ...journalPatternNudges(enabledPatterns, postedWithFp, month),
       ...expectedBillNudges(enabled, seen, month, today),
       ...laterThanUsualNudges(enabledLtu, openDocs, today),
+      ...(faNudge ? [faNudge as Nudge] : []),
       ...reconciliations.map((r): Nudge => ({
         kind: "bank_reconciliation",
         severity: r.status === "balanced" || r.status === "no_book" ? "info" : "attention",
@@ -622,6 +751,9 @@ Deno.serve(async (req) => {
       reconciliations,
       lock,
       ct,
+      schedules,
+      asset_proposals: assetProps ?? [],
+      fixed_assets: { active_count: faAssetsCount, types: faTypes },
       warnings: warnings.length ? warnings : undefined,
       usage: meter.summary(),
     });
