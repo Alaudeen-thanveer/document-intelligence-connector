@@ -16,7 +16,10 @@ type Side = "debit" | "credit";
 type TxnKind =
   | "customer_payment" | "vendor_payment" | "expense" | "deposit" | "transfer" | "other"
   | "already_recorded" | "retainer_receipt"
-  | "creditnote_refund" | "payment_refund" | "vendorcredit_refund" | "vendorpayment_refund";
+  | "creditnote_refund" | "payment_refund" | "vendorcredit_refund" | "vendorpayment_refund"
+  | "exclude";
+
+interface ZohoMatchCandidate { transaction_id: string; transaction_type: string; date: string; amount: number; contact_name?: string | null; reference_number?: string | null }
 
 interface Allocation {
   doc_kind: "invoice" | "bill" | "retainer";
@@ -90,6 +93,9 @@ interface Line {
   zoho_txn_id: string | null;
   zoho_extra_ids: Array<{ kind: string; zoho_id: string }> | null;
   error: string | null;
+  zoho_uncategorized_id: string | null;
+  zoho_payee: string | null;
+  zoho_match_candidates: ZohoMatchCandidate[] | null;
 }
 
 interface Statement {
@@ -121,9 +127,11 @@ const KIND_LABEL: Record<TxnKind, string> = {
   payment_refund: "Refund of customer advance",
   vendorcredit_refund: "Refund of vendor credit",
   vendorpayment_refund: "Refund of vendor advance",
+  exclude: "Exclude — not a book entry",
 };
 const KINDS_IN: TxnKind[] = ["customer_payment", "retainer_receipt", "vendorcredit_refund", "vendorpayment_refund", "deposit", "transfer", "already_recorded", "other"];
 const KINDS_OUT: TxnKind[] = ["vendor_payment", "expense", "creditnote_refund", "payment_refund", "transfer", "already_recorded", "other"];
+const FEED_EXTRA: TxnKind[] = ["exclude"];
 const SOURCE_LABEL: Record<Suggestion["source"], string> = {
   already_recorded: "already posted by this app",
   open_document: "matches an open document",
@@ -299,6 +307,25 @@ export function BankPage() {
     if (data) setCurrent(data as Statement);
     setPasted("");
   }
+  /** FEED MODE: pull Zoho's own uncategorised transactions for the chosen account. */
+  async function pullFeed() {
+    if (!bankAccountId) { setError("Pick which bank account's Zoho feed to pull."); return; }
+    setBusy("feed"); setError(null); setNotice(null);
+    const res = await callEdgeFunction("bank-statement", { action: "pull_feed", bank_account_zoho_id: bankAccountId });
+    setBusy(null);
+    if (!res.ok) { setError(String(res.body.error ?? `Failed (${res.status})`)); return; }
+    if (!res.body.statement_id) { setNotice(String(res.body.note ?? "Nothing new in the Zoho feed for this account.")); return; }
+    const sug = res.body.suggestions as { suggested: number; open: number; zoho_matched?: number } | undefined;
+    setNotice(`${res.body.line_count} uncategorised lines pulled from Zoho · ${sug?.zoho_matched ?? 0} already have a matching record in Zoho · ${sug?.suggested ?? 0} with a suggestion · ${sug?.open ?? 0} open${res.body.already_pulled ? ` · ${res.body.already_pulled} pulled earlier, skipped` : ""}. Decisions here are applied IN Zoho (match / categorise / exclude).`);
+    await loadStatements();
+    const { data } = await supabase.from("bank_statements").select("*").eq("id", String(res.body.statement_id)).single();
+    if (data) setCurrent(data as Statement);
+  }
+  function pickZohoMatch(id: string, c: ZohoMatchCandidate) {
+    const kind = c.transaction_type === "customer_payment" ? "customerpayment" : c.transaction_type === "vendor_payment" ? "vendorpayment" : c.transaction_type === "expense" ? "expense" : "banktransaction";
+    setDraft(id, { txn_kind: "already_recorded" });
+    setDrafts((d) => ({ ...d, [id]: { ...(d[id] as Draft), txn_kind: "already_recorded", ref_kind: kind, ref_zoho_id: c.transaction_id, ref_number: c.reference_number ?? "" } }));
+  }
   async function onFile(file: File | null) {
     if (!file) return;
     const isPdf = /pdf|image/i.test(file.type);
@@ -376,7 +403,8 @@ export function BankPage() {
     if (!d?.txn_kind) return "choose what this is first";
     if (partyRequired(d.txn_kind) && !d.party_zoho_id) return `pick the ${partyKindFor(d.txn_kind)}`;
     if (needsAccount(d.txn_kind) && !d.account_id) return "pick the account";
-    if ((d.txn_kind === "already_recorded" || REFUND_KINDS.includes(d.txn_kind as TxnKind) || d.txn_kind === "retainer_receipt") && !d.ref_zoho_id) return "this needs the existing Zoho record it refers to — only a suggestion can supply it";
+    if (d.txn_kind === "exclude") return null;
+    if ((d.txn_kind === "already_recorded" || REFUND_KINDS.includes(d.txn_kind as TxnKind) || d.txn_kind === "retainer_receipt") && !d.ref_zoho_id) return l.zoho_match_candidates?.length ? "pick which Zoho record to match below" : "this needs the existing Zoho record it refers to — only a suggestion can supply it";
     if (isPayment(d.txn_kind)) {
       const cap = l.amount + (l.side === "credit" ? d.bank_charges : 0) + 0.005;
       if (sumAlloc(d.allocations) > cap) return `allocations (${money(sumAlloc(d.allocations))}) exceed the line`;
@@ -490,6 +518,9 @@ export function BankPage() {
             <button type="button" className="btn primary" disabled={!!busy || !pasted.trim() || !bankAccountId} onClick={() => void ingest({ source: "paste", text: pasted })}>
               {busy === "ingest" ? "Reading…" : "Read statement"}
             </button>
+            <button type="button" className="btn ghost" disabled={!!busy || !bankAccountId} onClick={() => void pullFeed()} title="Feed mode: work on the uncategorised lines Zoho already holds for this account (bank feed or a statement imported in Zoho). Decisions are applied in Zoho — match, categorise, exclude — so Zoho keeps the statement and the reconciliation.">
+              {busy === "feed" ? "Pulling…" : "Pull from Zoho feed"}
+            </button>
             <span className="muted" style={{ fontSize: ".8rem" }}>Dates are read day-first (UAE/UK). Amounts: separate debit/credit columns, a signed amount, DR/CR or brackets all work.</span>
           </div>
         </div>
@@ -554,7 +585,7 @@ export function BankPage() {
           {statements.map((s) => (
             <button key={s.id} type="button" className={`bank-stmt-chip${current?.id === s.id ? " active" : ""}`} onClick={() => setCurrent(s)}>
               <b>{s.bank_account_name ?? s.bank_account_zoho_id}</b>
-              <span>{s.period_start} → {s.period_end} · {s.line_count} lines · {s.source.replace("upload_", "")}</span>
+              <span>{s.period_start} → {s.period_end} · {s.line_count} lines · {s.source === "zoho_feed" ? "Zoho feed" : s.source.replace("upload_", "")}</span>
             </button>
           ))}
         </div>
@@ -576,7 +607,7 @@ export function BankPage() {
                 {busy === "bulk" ? "Confirming…" : `Accept all ${counts.suggested} suggested`}
               </button>
               <button type="button" className="btn primary btn-small" disabled={!!busy || counts.confirmed === 0} onClick={() => void push()}>
-                {busy === "push" ? "Posting…" : `Post ${counts.confirmed} confirmed to Zoho`}
+                {busy === "push" ? (current.source === "zoho_feed" ? "Applying in Zoho…" : "Posting…") : current.source === "zoho_feed" ? `Apply ${counts.confirmed} in Zoho (match · categorise · exclude)` : `Post ${counts.confirmed} confirmed to Zoho`}
               </button>
               <button type="button" className="btn ghost btn-small" onClick={() => setShowPosted((v) => !v)}>{showPosted ? "Hide posted" : "Show posted"}</button>
             </div>
@@ -611,7 +642,7 @@ export function BankPage() {
                         {locked ? <span>{l.chosen_txn_kind ? KIND_LABEL[l.chosen_txn_kind] : "—"}</span> : (
                           <select value={d.txn_kind} onChange={(e) => setDraft(l.id, { txn_kind: e.target.value as TxnKind })} disabled={!!busy}>
                             <option value="">— choose —</option>
-                            {(l.side === "credit" ? KINDS_IN : KINDS_OUT).map((k) => <option key={k} value={k}>{KIND_LABEL[k]}</option>)}
+                            {[...(l.side === "credit" ? KINDS_IN : KINDS_OUT), ...(l.zoho_uncategorized_id ? FEED_EXTRA : [])].map((k) => <option key={k} value={k}>{KIND_LABEL[k]}</option>)}
                           </select>
                         )}
                       </td>
@@ -629,7 +660,7 @@ export function BankPage() {
                           <span>
                             {l.chosen_allocations?.length ? l.chosen_allocations.map((a) => `${a.doc_number ?? a.doc_zoho_id} ${money(a.amount_applied)}`).join(" · ")
                               : l.chosen_ref_number || l.chosen_ref_zoho_id ? `${l.chosen_ref_kind ?? "record"} ${l.chosen_ref_number ?? l.chosen_ref_zoho_id}`
-                              : l.chosen_account_name ?? (isPayment(l.chosen_txn_kind ?? "") ? "on account (advance)" : "—")}
+                              : l.chosen_txn_kind === "exclude" ? "excluded" : l.chosen_account_name ?? (isPayment(l.chosen_txn_kind ?? "") ? "on account (advance)" : "—")}
                             {l.chosen_bank_charges ? <small className="muted"> · bank charges {money(l.chosen_bank_charges)}</small> : null}
                             {l.chosen_writeoff ? <small className="muted"> · write-off</small> : null}
                             {l.zoho_extra_ids?.length ? <small className="muted"> · also {l.zoho_extra_ids.map((x) => x.kind).join(", ")}</small> : null}
@@ -639,8 +670,18 @@ export function BankPage() {
                             <option value="">— account —</option>
                             {accounts.map((a) => <option key={a.zoho_id} value={a.zoho_id}>{a.name}</option>)}
                           </select>
+                        ) : d.txn_kind === "exclude" ? (
+                          <span className="muted">will be excluded in Zoho — no book entry</span>
                         ) : d.txn_kind === "already_recorded" ? (
-                          d.ref_zoho_id ? <span>link to {d.ref_kind} <code>{d.ref_zoho_id}</code> — nothing new is created</span> : <span className="error-text">no earlier post to link to — only a suggestion can supply one</span>
+                          <div className="bank-alloc">
+                            {d.ref_zoho_id ? <span>{l.zoho_uncategorized_id ? "match to" : "link to"} {d.ref_kind} <code>{d.ref_zoho_id}</code> — nothing new is created</span> : <span className="error-text">{l.zoho_match_candidates?.length ? "pick a Zoho record below" : "no earlier post to link to — only a suggestion can supply one"}</span>}
+                            {l.zoho_match_candidates?.length ? (
+                              <select value={d.ref_zoho_id} onChange={(e) => { const c = l.zoho_match_candidates!.find((x) => x.transaction_id === e.target.value); if (c) pickZohoMatch(l.id, c); }} disabled={!!busy}>
+                                <option value="">Zoho suggests {l.zoho_match_candidates.length} matching record{l.zoho_match_candidates.length > 1 ? "s" : ""}…</option>
+                                {l.zoho_match_candidates.map((c) => <option key={c.transaction_id} value={c.transaction_id}>{c.transaction_type.replace(/_/g, " ")} · {money(Number(c.amount))} · {c.date}{c.contact_name ? ` · ${c.contact_name}` : ""}</option>)}
+                              </select>
+                            ) : null}
+                          </div>
                         ) : REFUND_KINDS.includes(d.txn_kind as TxnKind) || d.txn_kind === "retainer_receipt" ? (
                           d.ref_zoho_id ? <span>{d.txn_kind === "retainer_receipt" ? "retainer" : "refund of"} <b>{d.ref_number || d.ref_zoho_id}</b>{s?.doc_balance != null && d.txn_kind === "retainer_receipt" ? <span className="muted"> (balance {money(s.doc_balance)})</span> : null}</span> : <span className="error-text">needs the open credit / retainer it refers to</span>
                         ) : isPayment(d.txn_kind) ? (
@@ -694,7 +735,8 @@ export function BankPage() {
                             <small className="muted">{s.reason}</small>
                           </>
                         ) : l.status === "open" ? <span className="muted">nothing suggested — your call</span> : null}
-                        {l.status === "posted" && <small className="muted">{l.chosen_txn_kind === "already_recorded" ? "linked to" : "Zoho"} {l.zoho_txn_id}{l.zoho_extra_ids?.length ? ` + ${l.zoho_extra_ids.map((x) => `${x.kind} ${x.zoho_id}`).join(", ")}` : ""}</small>}
+                        {l.status === "open" && l.zoho_match_candidates?.length && s?.source !== "already_recorded" ? <small className="muted">Zoho also lists {l.zoho_match_candidates.length} possible match{l.zoho_match_candidates.length > 1 ? "es" : ""} — choose “Already recorded — link” to pick one</small> : null}
+                        {l.status === "posted" && <small className="muted">{l.chosen_txn_kind === "already_recorded" ? (l.zoho_uncategorized_id ? "matched in Zoho to" : "linked to") : l.chosen_txn_kind === "exclude" ? "excluded in Zoho" : l.zoho_uncategorized_id ? "categorised in Zoho as" : "Zoho"} {l.zoho_txn_id}{l.zoho_extra_ids?.length ? ` + ${l.zoho_extra_ids.map((x) => `${x.kind} ${x.zoho_id}`).join(", ")}` : ""}</small>}
                         {l.status === "failed" && <small className="error-text">{l.error}</small>}
                         {l.status === "confirmed" && <small className="muted">confirmed{l.decision === "changed_suggestion" ? " (changed)" : l.decision === "filled_blank" ? " (filled by you)" : ""} · not yet posted</small>}
                       </td>

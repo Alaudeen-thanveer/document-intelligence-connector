@@ -27,7 +27,14 @@ export type BankTxnKind =
   | "expense"
   | "deposit"
   | "transfer"
-  | "other";
+  | "other"
+  | "already_recorded"
+  | "retainer_receipt"
+  | "creditnote_refund"
+  | "payment_refund"
+  | "vendorcredit_refund"
+  | "vendorpayment_refund"
+  | "exclude";
 
 export interface BankObservation {
   description: string;

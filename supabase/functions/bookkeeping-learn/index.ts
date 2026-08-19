@@ -482,9 +482,11 @@ function bankObservationsFromHistory(
         .map((x) => (x == null ? "" : String(x).trim()))
         .find(Boolean) ?? "";
       if (!description) continue;
+      // Zoho's debit_or_credit is the LEDGER view (money out of the bank =
+      // credit to the bank account); our side is the statement view.
       const side: BankSide = String(t.debit_or_credit ?? "").toLowerCase() === "credit"
-        ? "credit"
-        : "debit";
+        ? "debit"
+        : "credit";
       const kind = bankTxnKind(String(t.transaction_type ?? ""));
       const isPayment = kind === "customer_payment" || kind === "vendor_payment";
       // Category account: from detail line_items, else by offset name.
@@ -1069,6 +1071,9 @@ Deno.serve(async (req) => {
       .in("status", ["confirmed", "posted"]);
     for (const c of confirmed ?? []) {
       if (!c.chosen_txn_kind) continue;
+      // A link to an already-recorded entry says nothing about what the
+      // description usually IS; an explicit exclude does, and is learned.
+      if (c.chosen_txn_kind === "already_recorded") continue;
       bankObs.push({
         description: String(c.description ?? ""),
         side: c.side as BankSide,

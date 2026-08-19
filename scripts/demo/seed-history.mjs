@@ -204,7 +204,8 @@ function bt({ id, date, amount, side, type, payee = "", customer_id = "", descri
       banktransaction: {
         transaction_id: id, date, amount, transaction_type: type, status: "categorized",
         account_id: "demo-bank", account_name: "Emirates NBD Current",
-        debit_or_credit: side, payee, customer_id, description, reference_number: "",
+        // Zoho convention: ledger view — money OUT of the bank is "credit".
+        debit_or_credit: side === "debit" ? "credit" : "debit", payee, customer_id, description, reference_number: "",
         offset_account_name: offset ?? "", currency_code: "AED",
         ...(account_id ? { line_items: [{ account_id, account_name: offset, amount }] } : {}),
       },
