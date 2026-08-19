@@ -23,7 +23,9 @@ type EntityKind =
   | "bank_account"
   | "payment_term"
   | "item"
-  | "user";
+  | "user"
+  | "bank_rule"
+  | "purchase_order";
 
 const ALL_KINDS: EntityKind[] = [
   "account",
@@ -37,6 +39,8 @@ const ALL_KINDS: EntityKind[] = [
   "payment_term",
   "item",
   "user",
+  "bank_rule",
+  "purchase_order",
 ];
 
 interface PullInput {
@@ -230,6 +234,81 @@ async function fetchKind(
         },
       }))
       .filter((r) => r.zoho_id && r.name);
+  }
+
+  if (kind === "bank_rule") {
+    // The org's own bank rules: explicit habits the bookkeeper wrote down.
+    // Read as high-weight evidence for statement-line suggestions, and so
+    // we never propose a rule that already exists.
+    const list = await fetchAllPages(accessToken, "bankaccounts/rules", "rules");
+    // The list view omits vendor_id / customer_id / auto_categorize (verified
+    // live on the .ae DC) — enrich each rule from its detail. Rules are few.
+    const rules: Array<Record<string, unknown>> = [];
+    for (const l of list) {
+      if (!l.rule_id) continue;
+      try {
+        const res = await zohoFetch(`${apiBase()}/bankaccounts/rules/${l.rule_id}?organization_id=${encodeURIComponent(orgId())}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+        const raw = await res.json() as { rule?: Record<string, unknown> };
+        rules.push({ ...l, ...(raw.rule ?? {}) });
+      } catch {
+        rules.push(l);
+      }
+    }
+    return rules
+      .map((r) => ({
+        kind: "bank_rule" as const,
+        zoho_id: String(r.rule_id ?? ""),
+        name: String(r.rule_name ?? ""),
+        extra: {
+          rule_category: r.rule_category ?? null,
+          account_ids: r.account_ids ?? null,
+          apply_to: r.apply_to ?? null, // deposits | withdrawals
+          criteria_type: r.criteria_type ?? null, // and | or
+          criterion: r.criterion ?? r.criterions ?? [],
+          record_as: r.record_as ?? null,
+          account_id: r.account_id ?? null,
+          account_name: r.account_name ?? null,
+          customer_id: r.customer_id ?? null,
+          vendor_id: r.vendor_id ?? null,
+          auto_categorize: r.auto_categorize ?? null, // autocategorize | recognize
+          is_active: r.is_active ?? null,
+          tax_id: r.tax_id ?? null,
+        },
+      }))
+      .filter((r) => r.zoho_id && r.name);
+  }
+
+  if (kind === "purchase_order") {
+    // Open purchase orders with their lines — the "what was ordered" side of
+    // the three-way match. Only POs that can still be billed; capped.
+    const list = await fetchAllPages(accessToken, "purchaseorders", "purchaseorders");
+    const open = list.filter((p) => !/closed|cancelled|billed$/i.test(String(p.status ?? "")) && String(p.status ?? "") !== "draft").slice(0, 200);
+    const rows: EntityRow[] = [];
+    for (const p of open) {
+      const id = String(p.purchaseorder_id ?? "");
+      if (!id) continue;
+      let lines: Array<Record<string, unknown>> = [];
+      try {
+        const res = await zohoFetch(`${apiBase()}/purchaseorders/${id}?organization_id=${encodeURIComponent(orgId())}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+        const raw = await res.json();
+        lines = ((raw as { purchaseorder?: { line_items?: Array<Record<string, unknown>> } }).purchaseorder?.line_items ?? []).map((li) => ({
+          line_item_id: li.line_item_id ?? null, name: li.name ?? null, description: li.description ?? null,
+          quantity: li.quantity ?? null, quantity_billed: li.quantity_billed ?? null, quantity_cancelled: li.quantity_cancelled ?? null,
+          rate: li.rate ?? null, item_total: li.item_total ?? null, account_id: li.account_id ?? null, account_name: li.account_name ?? null, tax_id: li.tax_id ?? null,
+        }));
+      } catch { /* list row is still useful */ }
+      rows.push({
+        kind: "purchase_order",
+        zoho_id: id,
+        name: String(p.purchaseorder_number ?? id),
+        extra: {
+          vendor_id: p.vendor_id ?? null, vendor_name: p.vendor_name ?? null, date: p.date ?? null,
+          delivery_date: p.delivery_date ?? null, status: p.status ?? null, total: p.total ?? null, sub_total: p.sub_total ?? null,
+          currency_code: p.currency_code ?? null, reference_number: p.reference_number ?? null, line_items: lines,
+        },
+      });
+    }
+    return rows;
   }
 
   if (kind === "reporting_tag") {

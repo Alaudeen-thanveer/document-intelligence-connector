@@ -34,6 +34,7 @@ import {
 import { type BankPattern } from "../bookkeeping-learn/bank_patterns.ts";
 import { pushLine } from "./push.ts";
 import { buildFeedRequest, extractZohoId, suggestFromZohoMatches, uncategorizedToLines, type ZohoMatchCandidate, type ZohoUncategorizedRow } from "./feed.ts";
+import { isProposableAsZohoRule, zohoRuleBodyForPattern, type ZohoBankRule } from "./zoho_rules.ts";
 
 const DEFAULT_COMPANY = "00000000-0000-4000-8000-000000000001";
 const CORS_HEADERS: Record<string, string> = {
@@ -236,7 +237,15 @@ async function computeAndStoreSuggestions(
   } catch (err) {
     console.warn("open documents unavailable; suggesting from patterns only:", err instanceof Error ? err.message : err);
   }
-  const suggestions = suggestForLines(list, { patterns, parties, openDocs, openCredits, recorded, policies, currency, today: new Date().toISOString().slice(0, 10) });
+  // The org's own bank rules (synced as zoho_entities kind bank_rule) and feed payees.
+  const { data: ruleRows } = await supabase.from("zoho_entities").select("zoho_id, name, extra").eq("kind", "bank_rule");
+  const zohoRules: ZohoBankRule[] = (ruleRows ?? []).map((r) => {
+    const extra = (r.extra as Record<string, unknown>) ?? {};
+    return { ...extra, rule_id: String(r.zoho_id), rule_name: String(r.name), criterion: (extra.criterion as ZohoBankRule["criterion"]) ?? [] } as ZohoBankRule;
+  });
+  const { data: payeeRows } = await supabase.from("bank_statement_lines").select("line_no, zoho_payee").eq("statement_id", statementId).not("zoho_payee", "is", null);
+  const payees: Record<number, string | null> = Object.fromEntries((payeeRows ?? []).map((r) => [Number(r.line_no), (r.zoho_payee as string | null) ?? null]));
+  const suggestions = suggestForLines(list, { patterns, parties, openDocs, openCredits, recorded, policies, currency, today: new Date().toISOString().slice(0, 10), zohoRules, bankAccountId: stmt.data?.bank_account_zoho_id ? String(stmt.data.bank_account_zoho_id) : null, payees });
 
   // Feed mode: ask Zoho for its own match candidates per line — a record
   // already in the books that this line should be LINKED to, not recreated.
@@ -542,6 +551,56 @@ Deno.serve(async (req) => {
       const sug = await computeAndStoreSuggestions(supabase, meter.fetch, companyId, st.id);
       const { data: outLines } = await supabase.from("bank_statement_lines").select("*").eq("statement_id", st.id).order("line_no");
       return jsonResponse({ ok: true, statement_id: st.id, lines: outLines ?? [], line_count: lines.length, already_pulled: rows.length - fresh.length, suggestions: sug, usage: meter.summary() });
+    }
+
+    // ----------------------------------------------- rule proposals (item 3)
+    // Which learned patterns are strong enough to become a Zoho bank rule,
+    // and creating one — always "recognize" (suggest-only) mode.
+    if (action === "rule_proposals") {
+      const patterns = await loadPatterns(supabase, companyId);
+      const { data: meta } = await supabase.from("bk_bank_patterns").select("id, fingerprint, side, zoho_rule_id, suggestion_status").eq("company_id", companyId);
+      const byKey = new Map((meta ?? []).map((m) => [`${m.fingerprint}::${m.side}`, m]));
+      const out = patterns.map((p) => {
+        const m = byKey.get(`${p.fingerprint}::${p.side}`);
+        const v = isProposableAsZohoRule({ ...p, zoho_rule_id: (m?.zoho_rule_id as string | null) ?? null, suggestion_status: (m?.suggestion_status as string) ?? "proposed" });
+        return { id: m?.id, fingerprint: p.fingerprint, side: p.side, txn_kind: p.txn_kind, account_name: p.account_name, party_name: p.party_name, sample_size: p.sample_size, confidence: p.confidence, examples: p.examples, zoho_rule_id: m?.zoho_rule_id ?? null, proposable: v.ok, why: v.why, body: v.ok ? zohoRuleBodyForPattern(p) : null };
+      }).sort((a, b) => Number(b.proposable) - Number(a.proposable) || b.sample_size - a.sample_size);
+      return jsonResponse({ ok: true, proposals: out });
+    }
+    if (action === "propose_zoho_rule") {
+      const patternId = String(input.pattern_id ?? "");
+      if (!patternId) return jsonResponse({ ok: false, error: "pattern_id required" }, 400);
+      const { data: row } = await supabase.from("bk_bank_patterns").select("*").eq("id", patternId).eq("company_id", companyId).maybeSingle();
+      if (!row) return jsonResponse({ ok: false, error: "pattern not found" }, 404);
+      const p = { ...(row as unknown as BankPattern), tokens: (row.tokens as string[]) ?? [], examples: (row.examples as string[]) ?? [], confidence: Number(row.confidence), sample_size: Number(row.sample_size), share: Number(row.share) };
+      const v = isProposableAsZohoRule({ ...p, zoho_rule_id: row.zoho_rule_id as string | null, suggestion_status: row.suggestion_status as string });
+      if (!v.ok) return jsonResponse({ ok: false, error: `Not proposable as a Zoho rule: ${v.why}` }, 422);
+      const body = zohoRuleBodyForPattern(p, { bankAccountIds: Array.isArray(input.bank_account_ids) ? (input.bank_account_ids as string[]) : undefined });
+      const token = await getAccessToken(supabase);
+      const post = async (b: Record<string, unknown>) => {
+        const res = await meter.fetch(`${apiBase()}/bankaccounts/rules?organization_id=${encodeURIComponent(requireEnv("ZOHO_ORGANIZATION_ID"))}`, { method: "POST", headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+        const raw = await res.json().catch(() => ({})) as Record<string, unknown>;
+        return { ok: res.ok && (raw.code == null || raw.code === 0), status: res.status, raw };
+      };
+      let sent = body;
+      let out = await post(sent);
+      // UAE orgs refuse an expense rule without a VAT treatment (code 111865,
+      // verified live). Retry once with the org's standard-rate tax.
+      if (!out.ok && Number(out.raw.code) === 111865) {
+        const { data: taxes } = await supabase.from("zoho_entities").select("zoho_id, name, extra").eq("kind", "tax");
+        const std = (taxes ?? []).find((t) => Number((t.extra as Record<string, unknown>)?.percentage ?? (t.extra as Record<string, unknown>)?.tax_percentage) > 0) ?? (taxes ?? [])[0];
+        if (std) {
+          sent = { ...body, tax_treatment: "vat_registered", tax_id: String(std.zoho_id) };
+          out = await post(sent);
+        }
+      }
+      const raw = out.raw;
+      if (!out.ok) return jsonResponse({ ok: false, error: `Zoho rejected the rule: ${raw.message ?? out.status}`, body: sent }, 502);
+      const rule = (raw.rule ?? raw.bank_rule ?? {}) as Record<string, unknown>;
+      const ruleId = rule.rule_id ? String(rule.rule_id) : null;
+      await supabase.from("bk_bank_patterns").update({ zoho_rule_id: ruleId ?? "created", zoho_rule_created_at: new Date().toISOString(), zoho_rule_created_by: actor }).eq("id", patternId);
+      if (ruleId) await supabase.from("zoho_entities").upsert({ company_id: companyId, kind: "bank_rule", zoho_id: ruleId, name: String(rule.rule_name ?? sent.rule_name), extra: { ...sent, rule_id: ruleId, is_active: true } }, { onConflict: "company_id,kind,zoho_id" });
+      return jsonResponse({ ok: true, zoho_rule_id: ruleId, rule, body: sent, usage: meter.summary() });
     }
 
     // ------------------------------------------------------ party_credits

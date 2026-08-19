@@ -10,6 +10,7 @@
  * Input: { document_id: string }
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { matchPurchaseOrder, type PurchaseOrder, type PoMatchResult } from "./po_match.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import {
   checkAmountAboveThresholdNoPo,
@@ -84,7 +85,7 @@ async function loadContext(
 
   const { data: extracted, error: extError } = await supabase
     .from("extracted_fields")
-    .select("vendor_raw, total_amount, invoice_date, po_number")
+    .select("id, vendor_raw, total_amount, invoice_date, po_number, tax_amount")
     .eq("document_id", documentId)
     .order("id", { ascending: false })
     .limit(1)
@@ -100,7 +101,7 @@ async function loadContext(
   const companyId = (doc.company_id as string) || DEFAULT_COMPANY_ID;
   const { data: config } = await supabase
     .from("company_config")
-    .select("duplicate_check_days, amount_requires_po_threshold")
+    .select("duplicate_check_days, amount_requires_po_threshold, po_variance_pct, po_variance_amount")
     .eq("company_id", companyId)
     .maybeSingle();
 
@@ -120,11 +121,39 @@ async function loadContext(
     invoice_date: toDateOnly(extracted.invoice_date),
     has_supporting_document: Boolean(doc.has_supporting_document),
     po_number: (extracted.po_number as string | null) ?? null,
+    tax_amount: parseAmount(extracted.tax_amount),
+    extracted_fields_id: String(extracted.id),
+    po_variance_pct: Number(config?.po_variance_pct ?? 2),
+    po_variance_amount: Number(config?.po_variance_amount ?? 10),
     duplicate_check_days: Number.isFinite(days)
       ? Math.max(0, Math.floor(days))
       : DEFAULT_DUPLICATE_DAYS,
     amount_requires_po_threshold: threshold,
   };
+}
+
+/**
+ * Purchase-order three-way match (item 7). Uses the POs synced into
+ * zoho_entities (kind purchase_order) and the bill's extracted lines.
+ */
+async function checkPurchaseOrderMatch(
+  supabase: SupabaseClient,
+  ctx: { company_id: string; po_number: string | null; vendor_raw: string | null; total_amount: number | null; tax_amount: number | null; extracted_fields_id: string; po_variance_pct: number; po_variance_amount: number },
+  vendorZohoId: string | null,
+): Promise<{ result: CheckResult; detail: PoMatchResult }> {
+  const { data: poRows } = await supabase.from("zoho_entities").select("zoho_id, name, extra").eq("kind", "purchase_order");
+  const pos: PurchaseOrder[] = (poRows ?? []).map((r) => {
+    const e = (r.extra as Record<string, unknown>) ?? {};
+    return {
+      zoho_id: String(r.zoho_id), number: String(r.name), reference: e.reference_number != null ? String(e.reference_number) : null, vendor_id: e.vendor_id != null ? String(e.vendor_id) : null, vendor_name: e.vendor_name != null ? String(e.vendor_name) : null,
+      date: e.date != null ? String(e.date) : null, status: e.status != null ? String(e.status) : null, total: Number(e.total ?? 0) || 0,
+      line_items: ((e.line_items as Array<Record<string, unknown>>) ?? []).map((l) => ({ line_item_id: l.line_item_id != null ? String(l.line_item_id) : null, name: l.name != null ? String(l.name) : null, description: l.description != null ? String(l.description) : null, quantity: Number(l.quantity ?? 0) || 0, quantity_billed: Number(l.quantity_billed ?? 0) || 0, rate: Number(l.rate ?? 0) || 0, item_total: Number(l.item_total ?? 0) || 0 })),
+    };
+  });
+  const { data: lineRows } = await supabase.from("extracted_line_items").select("line_no, description, quantity, rate, amount").eq("extracted_fields_id", ctx.extracted_fields_id).order("line_no");
+  const lines = (lineRows ?? []).map((l) => ({ line_no: Number(l.line_no), description: (l.description as string | null) ?? null, quantity: l.quantity == null ? null : Number(l.quantity), rate: l.rate == null ? null : Number(l.rate), amount: l.amount == null ? null : Number(l.amount) }));
+  const detail = matchPurchaseOrder({ po_number: ctx.po_number, vendor_raw: ctx.vendor_raw, vendor_zoho_id: vendorZohoId, total_amount: ctx.total_amount, tax_amount: ctx.tax_amount, lines }, pos, { pct: ctx.po_variance_pct, amount: ctx.po_variance_amount });
+  return { result: { passed: detail.passed, reason: detail.reason }, detail };
 }
 
 /** Same normalization the review UI uses to match vendor names (lib/zoho.ts). */
@@ -316,10 +345,13 @@ Deno.serve(async (req) => {
       if (overridden) supporting = overridden;
     }
 
+    const poMatch = await checkPurchaseOrderMatch(supabase, ctx, vendor?.zoho_id ?? null);
+
     const packaged = [
       { rule_name: JUDGMENT_CHECK_NAMES.duplicate, result: duplicate },
       { rule_name: JUDGMENT_CHECK_NAMES.supporting, result: supporting },
       { rule_name: JUDGMENT_CHECK_NAMES.amountPo, result: amountPo },
+      { rule_name: "po_match", result: poMatch.result },
     ];
 
     const learnedApplied: string[] = [];
@@ -365,6 +397,7 @@ Deno.serve(async (req) => {
       document_id: input.document_id,
       company_id: ctx.company_id,
       all_passed: allPassed,
+      po_match: poMatch.detail,
       config: {
         duplicate_check_days: ctx.duplicate_check_days,
         amount_requires_po_threshold: ctx.amount_requires_po_threshold,

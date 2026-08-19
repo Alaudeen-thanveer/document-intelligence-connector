@@ -48,7 +48,8 @@ export type NudgeKind =
   | "recurring_journal_posted"
   | "expected_bill_missing"
   | "expected_bill_arrived"
-  | "later_than_usual";
+  | "later_than_usual"
+  | "bank_reconciliation";
 
 export interface Nudge {
   kind: NudgeKind;

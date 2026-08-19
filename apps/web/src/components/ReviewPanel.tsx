@@ -460,6 +460,8 @@ export function ReviewPanel({
   )?.label;
 
   const failedRules = judgments.filter((j) => !j.passed);
+  // Latest PO three-way match result (shown whether it passed or not — "matches PO X" is useful news too).
+  const poMatch = judgments.find((j) => j.rule_name === "po_match") ?? null;
   const entityUnresolvedHint =
     isFlaggedStatus(document.status) &&
     failedRules.length === 0 &&
@@ -950,6 +952,11 @@ export function ReviewPanel({
               </li>
             ))}
           </ul>
+        )}
+        {poMatch && (
+          <p className={poMatch.passed ? "muted" : "warn-banner"} style={{ marginTop: 8 }}>
+            <strong>Purchase order:</strong> {poMatch.notes || (poMatch.passed ? "matches" : "does not match")}
+          </p>
         )}
         {entityUnresolvedHint && (
           <p className="warn-banner">
