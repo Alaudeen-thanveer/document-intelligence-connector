@@ -35,6 +35,7 @@ import { type BankPattern } from "../bookkeeping-learn/bank_patterns.ts";
 import { pushLine } from "./push.ts";
 import { buildFeedRequest, extractZohoId, suggestFromZohoMatches, uncategorizedToLines, type ZohoMatchCandidate, type ZohoUncategorizedRow } from "./feed.ts";
 import { isProposableAsZohoRule, zohoRuleBodyForPattern, type ZohoBankRule } from "./zoho_rules.ts";
+import { attachTargetFor, buildLineEvidence, textToPdf } from "./evidence.ts";
 
 const DEFAULT_COMPANY = "00000000-0000-4000-8000-000000000001";
 const CORS_HEADERS: Record<string, string> = {
@@ -218,6 +219,61 @@ async function loadRecorded(supabase: SupabaseClient, companyId: string, stateme
     });
   }
   return out.filter((r) => r.zoho_id);
+}
+
+/**
+ * Attach the statement evidence to a record just created from a line: the
+ * uploaded statement file when one exists, else a text note carrying the
+ * line and its context. Best effort — never undoes the record.
+ */
+async function attachStatementEvidence(
+  supabase: SupabaseClient,
+  zohoFetch: typeof fetch,
+  token: string,
+  line: { line_no: number; txn_date: string; description: string; reference: string | null; side: "debit" | "credit"; amount: number },
+  stmt: { bank_account_name: string | null; bank_account_zoho_id: string; period_start: string | null; period_end: string | null; source: string; original_name: string | null; currency: string | null; file_url: string | null },
+  kind: string,
+  zohoId: string,
+  actor: string,
+): Promise<{ attached: boolean; filename?: string; error?: string }> {
+  const target = attachTargetFor(kind, zohoId);
+  if (!target) return { attached: false, error: "no attachment slot for this record kind" };
+  const upload = async (bytes: Uint8Array, contentType: string, filename: string) => {
+    const form = new FormData();
+    form.append(target.field, new Blob([bytes as BlobPart], { type: contentType }), filename);
+    const res = await zohoFetch(`${apiBase()}/${target.path}?organization_id=${encodeURIComponent(requireEnv("ZOHO_ORGANIZATION_ID"))}`, {
+      method: "POST", headers: { Authorization: `Zoho-oauthtoken ${token}` }, body: form,
+    });
+    const raw = await res.json().catch(() => ({})) as Record<string, unknown>;
+    return { ok: res.ok && (raw.code == null || raw.code === 0), message: String(raw.message ?? res.status) };
+  };
+  const pdfNote = () => {
+    const ev = buildLineEvidence(line, stmt, actor);
+    return { bytes: textToPdf(ev.text), filename: ev.filename };
+  };
+  try {
+    // The statement file itself when there is one; ANY failure on that path
+    // (missing object, refused extension) falls back to the PDF note — the
+    // evidence must not vanish because the file could not travel.
+    if (stmt.file_url && stmt.file_url.startsWith("storage://invoices/")) {
+      try {
+        const path = stmt.file_url.slice("storage://invoices/".length);
+        const { data, error } = await supabase.storage.from("invoices").download(path);
+        if (error || !data) throw new Error(`storage download failed: ${error?.message ?? "no data"}`);
+        const filename = stmt.original_name ?? path.split("/").pop() ?? "statement";
+        const first = await upload(new Uint8Array(await data.arrayBuffer()), data.type || "application/octet-stream", filename);
+        if (first.ok) return { attached: true, filename };
+        console.warn(`statement file not attachable (${first.message}) — PDF note instead`);
+      } catch (err) {
+        console.warn(`statement file unavailable (${err instanceof Error ? err.message : String(err)}) — PDF note instead`);
+      }
+    }
+    const note = pdfNote();
+    const second = await upload(note.bytes, "application/pdf", note.filename);
+    return second.ok ? { attached: true, filename: note.filename } : { attached: false, filename: note.filename, error: second.message };
+  } catch (err) {
+    return { attached: false, error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 async function computeAndStoreSuggestions(
@@ -511,8 +567,21 @@ Deno.serve(async (req) => {
           } else {
             r = await pushLine(meter.fetch, apiBase(), requireEnv("ZOHO_ORGANIZATION_ID"), token, line as never, st.bank_account_zoho_id, { bankChargesAccountId: feeAcct?.zoho_id ? String(feeAcct.zoho_id) : null });
           }
+          // The statement is the evidence — attach it (file, else a text
+          // note with the line) to the record just created. Feed-mode lines
+          // already live in Zoho with the bank feed as their source.
+          let attach: { attached: boolean; filename?: string; error?: string } | null = null;
+          if (!(line as { zoho_uncategorized_id?: string | null }).zoho_uncategorized_id && r.zoho_id && (line as { chosen_txn_kind?: string }).chosen_txn_kind !== "already_recorded") {
+            const { data: stmtRow } = await supabase.from("bank_statements").select("bank_account_name, bank_account_zoho_id, period_start, period_end, source, original_name, currency, file_url").eq("id", String((line as { statement_id: string }).statement_id)).maybeSingle();
+            if (stmtRow) {
+              attach = await attachStatementEvidence(supabase, meter.fetch, token,
+                { line_no: Number(line.line_no), txn_date: String(line.txn_date), description: String(line.description ?? ""), reference: (line.reference as string | null) ?? null, side: line.side as "debit" | "credit", amount: Number(line.amount) },
+                { bank_account_name: (stmtRow.bank_account_name as string | null) ?? null, bank_account_zoho_id: String(stmtRow.bank_account_zoho_id), period_start: (stmtRow.period_start as string | null) ?? null, period_end: (stmtRow.period_end as string | null) ?? null, source: String(stmtRow.source), original_name: (stmtRow.original_name as string | null) ?? null, currency: (stmtRow.currency as string | null) ?? null, file_url: (stmtRow.file_url as string | null) ?? null },
+                String((line as { chosen_txn_kind?: string }).chosen_txn_kind ?? r.kind), r.zoho_id, actor);
+            }
+          }
           await supabase.from("bank_statement_lines").update({ status: "posted", zoho_txn_id: r.zoho_id, zoho_payload: r.payload, zoho_extra_ids: r.extra, posted_at: new Date().toISOString(), error: null }).eq("id", line.id);
-          results.push({ line_id: line.id, line_no: line.line_no, ok: true, zoho_id: r.zoho_id, kind: r.kind, extra: r.extra });
+          results.push({ line_id: line.id, line_no: line.line_no, ok: true, zoho_id: r.zoho_id, kind: r.kind, extra: r.extra, attached: attach?.attached ?? null, attach_error: attach && !attach.attached ? attach.error ?? null : null });
           pushed++;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
