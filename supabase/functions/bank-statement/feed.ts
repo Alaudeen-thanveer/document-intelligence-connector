@@ -6,13 +6,16 @@
  * pull them, suggest with the same engine, and act with Zoho's own verbs:
  *
  *   match      POST /banktransactions/uncategorized/{id}/match
- *              { transactions: [{ transaction_id, transaction_type }] }
+ *              { transactions_to_be_matched: [{ transaction_id, transaction_type }] }
+ *              (verified live — the docs say "transactions"; Zoho rejects that)
  *   categorize POST /banktransactions/uncategorized/{id}/categorize/{kind}
  *              (customerpayments · vendorpayments · expenses ·
  *               creditnoterefunds · vendorcreditrefunds · paymentrefunds ·
  *               vendorpaymentrefunds) or the generic …/categorize for
  *              deposits / transfers / other income
  *   exclude    POST /banktransactions/uncategorized/{id}/exclude
+ *              (Zoho then lists the line under filter_by=Status.Excluded with
+ *              status "deleted" — it is out of the books but not gone)
  *
  * Zoho keeps the statement and the reconciliation; nothing is created
  * standalone, so there is exactly one copy of every line.
@@ -41,6 +44,10 @@ export interface ZohoMatchCandidate {
   contact_name?: string | null;
   reference_number?: string | null;
   debit_or_credit?: string | null;
+  /** Zoho's own ranking flags on match candidates. */
+  is_best_match?: boolean;
+  is_exact_match?: boolean;
+  transaction_number?: string | null;
 }
 
 export interface FeedLine {
@@ -70,7 +77,10 @@ export function uncategorizedToLines(rows: ZohoUncategorizedRow[]): FeedLine[] {
         value_date: null,
         description,
         reference: r.reference_number ? String(r.reference_number).trim() || null : null,
-        side: String(r.debit_or_credit ?? "").toLowerCase() === "credit" ? "credit" : "debit",
+        // Zoho reports debit_or_credit from the LEDGER's view: money leaving
+        // the bank is a CREDIT to the bank account. Our side is the
+        // statement's view: money out = debit. Invert.
+        side: String(r.debit_or_credit ?? "").toLowerCase() === "credit" ? "debit" : "credit",
         amount: r2(Math.abs(Number(r.amount) || 0)),
         balance: null,
         zoho_uncategorized_id: String(r.transaction_id),
@@ -102,19 +112,31 @@ export function zohoTypeForRefKind(k: string | null | undefined, fallback = "exp
  * takes precedence over creating anything — it is the duplicate control
  * in feed mode.
  */
+/** Zoho match candidates that are RECORDED MONEY (not open documents — those are "apply to", handled by allocation). */
+const MONEY_TYPES = new Set(["customer_payment", "vendor_payment", "expense", "transfer_fund", "card_payment", "deposit", "refund", "sales_without_invoices", "expense_refund", "owner_contribution", "owner_drawings", "interest_income", "other_income", "journal", "retainer_payment"]);
+
 export function suggestFromZohoMatches(
   line: { txn_date: string; amount: number; side: "debit" | "credit" },
   candidates: ZohoMatchCandidate[],
   windowDays: number,
 ): Suggestion | null {
   const day = (d: string) => new Date(d + "T00:00:00Z").getTime();
-  const fits = candidates.filter((c) => Math.abs((Number(c.amount) || 0) - line.amount) <= 0.05)
-    .filter((c) => !c.debit_or_credit || String(c.debit_or_credit).toLowerCase() === line.side)
-    .filter((c) => !c.date || Math.abs(day(String(c.date).slice(0, 10)) - day(line.txn_date)) / 86_400_000 <= Math.max(windowDays, 7));
+  const ageDays = (c: ZohoMatchCandidate) => c.date ? Math.abs(day(String(c.date).slice(0, 10)) - day(line.txn_date)) / 86_400_000 : 0;
+  // Payments are dated when made and can reach the statement weeks later;
+  // an expense or transfer of the same amount a month apart is far more
+  // likely a DIFFERENT, recurring item (this month's bank fee vs last).
+  const windowFor = (c: ZohoMatchCandidate) => /payment/.test(c.transaction_type) ? Math.max(windowDays, 30) : Math.max(windowDays, 7);
+  const fits = candidates
+    .filter((c) => MONEY_TYPES.has(String(c.transaction_type).toLowerCase()))
+    .filter((c) => Math.abs((Number(c.amount) || 0) - line.amount) <= 0.05)
+    .filter((c) => ageDays(c) <= windowFor(c))
+    // Zoho's own ranking first (exact, then best match), then nearest date.
+    .sort((a, b) => Number(Boolean(b.is_exact_match)) - Number(Boolean(a.is_exact_match)) || Number(Boolean(b.is_best_match)) - Number(Boolean(a.is_best_match)) || ageDays(a) - ageDays(b));
   if (!fits.length) return null;
   const c = fits[0];
   const kind = refKindForZohoType(c.transaction_type);
   const label = c.transaction_type.replace(/_/g, " ");
+  const amountOnly = !c.contact_name && !c.reference_number && !c.is_exact_match;
   return {
     txn_kind: "already_recorded",
     party_kind: kind === "customerpayment" ? "customer" : kind === "vendorpayment" || kind === "expense" ? "vendor" : null,
@@ -125,9 +147,9 @@ export function suggestFromZohoMatches(
     allocations: [], advance_amount: 0, bank_charges: 0, residual: 0, writeoff: null,
     ref_kind: kind, ref_zoho_id: String(c.transaction_id), ref_number: c.reference_number ?? null,
     candidates: [],
-    confidence: fits.length === 1 ? 0.95 : 0.85,
+    confidence: amountOnly ? 0.7 : fits.length === 1 ? 0.95 : 0.85,
     source: "already_recorded",
-    reason: `Zoho Books already holds a ${label} of ${line.amount.toFixed(2)}${c.contact_name ? ` for ${c.contact_name}` : ""}${c.date ? ` dated ${String(c.date).slice(0, 10)}` : ""} — match this line to it, don't create another${fits.length > 1 ? ` (${fits.length} candidates; first shown)` : ""}`,
+    reason: `Zoho Books already holds a ${label} of ${line.amount.toFixed(2)}${c.contact_name ? ` for ${c.contact_name}` : ""}${c.date ? ` dated ${String(c.date).slice(0, 10)}` : ""} — match this line to it, don't create another${amountOnly ? " (amount and date only — check it is the same item, not a recurring one)" : ""}${fits.length > 1 ? ` (${fits.length} candidates; nearest date shown)` : ""}`,
   };
 }
 
@@ -177,7 +199,7 @@ export function buildFeedRequest(line: FeedConfirmed, bankAccountId: string, tax
   if (kind === "already_recorded") {
     if (!line.chosen_ref_zoho_id) throw new Error("match needs the Zoho transaction to match");
     const type = line.matched_transaction_type || zohoTypeForRefKind(line.chosen_ref_kind);
-    return { path: `${base}/match`, body: { transactions: [{ transaction_id: line.chosen_ref_zoho_id, transaction_type: type }] }, kind: "match" };
+    return { path: `${base}/match`, body: { transactions_to_be_matched: [{ transaction_id: line.chosen_ref_zoho_id, transaction_type: type }] }, kind: "match" };
   }
 
   if (kind === "customer_payment" || kind === "retainer_receipt") {

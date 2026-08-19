@@ -482,9 +482,11 @@ function bankObservationsFromHistory(
         .map((x) => (x == null ? "" : String(x).trim()))
         .find(Boolean) ?? "";
       if (!description) continue;
+      // Zoho's debit_or_credit is the LEDGER view (money out of the bank =
+      // credit to the bank account); our side is the statement view.
       const side: BankSide = String(t.debit_or_credit ?? "").toLowerCase() === "credit"
-        ? "credit"
-        : "debit";
+        ? "debit"
+        : "credit";
       const kind = bankTxnKind(String(t.transaction_type ?? ""));
       const isPayment = kind === "customer_payment" || kind === "vendor_payment";
       // Category account: from detail line_items, else by offset name.

@@ -14,24 +14,29 @@ function check(name, cond, detail = "") { const ok = Boolean(cond); console.log(
 
 console.log("— uncategorised rows → lines —");
 const rows = [
-  { transaction_id: "U1", date: "2026-08-25", amount: "300.00", debit_or_credit: "debit", payee: "T1 Gulf Stationery LLC", description: "TRF T1 GULF STATIONERY LLC T1-BILL-0002", reference_number: "T1F001", status: "uncategorized" },
-  { transaction_id: "U2", date: "2026-08-26", amount: 400, debit_or_credit: "credit", payee: "", description: "", reference_number: "T1F002", status: "uncategorized" },
+  // Zoho speaks from the LEDGER: money OUT of the bank = "credit", money IN = "debit".
+  { transaction_id: "U1", date: "2026-08-25", amount: "300.00", debit_or_credit: "credit", payee: "T1 Gulf Stationery LLC", description: "TRF T1 GULF STATIONERY LLC T1-BILL-0002", reference_number: "T1F001", status: "uncategorized" },
+  { transaction_id: "U2", date: "2026-08-26", amount: 400, debit_or_credit: "debit", payee: "", description: "", reference_number: "T1F002", status: "uncategorized" },
   { transaction_id: "U3", date: "2026-08-27", amount: 0, debit_or_credit: "debit", description: "zero line" },
   { transaction_id: "", date: "2026-08-27", amount: 5, debit_or_credit: "debit", description: "no id" },
 ];
 const lines = uncategorizedToLines(rows);
 check("2 usable lines (zero-amount and id-less rows dropped)", lines.length === 2, JSON.stringify(lines.map((l) => [l.line_no, l.zoho_uncategorized_id, l.side, l.amount])));
+check("Zoho ledger sides inverted to statement sides: a Zoho credit is money OUT (our debit)", lines[0].side === "debit" && lines[1].side === "credit");
 check("description from Zoho description; payee kept separately", lines[0].description.startsWith("TRF T1 GULF") && lines[0].zoho_payee === "T1 Gulf Stationery LLC");
 check("empty description falls back to reference", lines[1].description === "T1F002" && lines[1].side === "credit" && lines[1].amount === 400);
 
 console.log("\n— Zoho match candidates → already recorded —");
 const cands = [
-  { transaction_id: "P9", transaction_type: "vendor_payment", date: "2026-08-24", amount: 300, contact_name: "T1 Gulf Stationery LLC" },
+  { transaction_id: "B1", transaction_type: "bill", date: "2026-08-20", amount: 300, contact_name: "T1 Gulf Stationery LLC" },
+  { transaction_id: "P9", transaction_type: "vendor_payment", date: "2026-08-05", amount: 300, contact_name: "T1 Gulf Stationery LLC", is_best_match: true },
   { transaction_id: "E1", transaction_type: "expense", date: "2026-07-01", amount: 300, contact_name: null },
 ];
 const m = suggestFromZohoMatches({ txn_date: "2026-08-25", amount: 300, side: "debit" }, cands, 3);
-check("amount-equal candidate within the window → already_recorded with ref to the Zoho payment", m && m.txn_kind === "already_recorded" && m.ref_zoho_id === "P9" && m.ref_kind === "vendorpayment", m?.reason);
-check("the stale July candidate is not preferred (outside window)", m && m.ref_zoho_id !== "E1");
+check("an open BILL candidate is ignored (that is 'apply to', not 'already recorded'); the recorded vendor payment 20 days back is matched (payments get a 30-day window)", m && m.txn_kind === "already_recorded" && m.ref_zoho_id === "P9" && m.ref_kind === "vendorpayment", m?.reason);
+check("the July expense is not preferred (expenses get a 7-day window — same amount a month apart is a recurring item)", m && m.ref_zoho_id !== "E1");
+const amtOnly = suggestFromZohoMatches({ txn_date: "2026-08-25", amount: 25, side: "debit" }, [{ transaction_id: "E2", transaction_type: "expense", date: "2026-08-22", amount: 25 }], 3);
+check("an amount-and-date-only expense match is offered at 0.7 with a 'check it is the same item' warning", amtOnly && amtOnly.confidence === 0.7 && /recurring/.test(amtOnly.reason), amtOnly?.reason);
 check("no candidate fits → null", suggestFromZohoMatches({ txn_date: "2026-08-25", amount: 301, side: "debit" }, cands, 3) === null);
 check("ref kind round-trips", refKindForZohoType("customer_payment") === "customerpayment" && zohoTypeForRefKind("customerpayment") === "customer_payment" && refKindForZohoType("transfer_fund") === "banktransaction");
 
@@ -41,7 +46,7 @@ const BANK = "BANK1";
 let r = buildFeedRequest({ ...base, chosen_txn_kind: "exclude" }, BANK);
 check("exclude → POST …/U1/exclude with no body", r.path === "banktransactions/uncategorized/U1/exclude" && r.body === null);
 r = buildFeedRequest({ ...base, chosen_txn_kind: "already_recorded", chosen_ref_kind: "vendorpayment", chosen_ref_zoho_id: "P9", matched_transaction_type: "vendor_payment" }, BANK);
-check("match → POST …/U1/match { transactions:[{transaction_id:P9, transaction_type:vendor_payment}] }", r.path.endsWith("/U1/match") && r.body.transactions[0].transaction_id === "P9" && r.body.transactions[0].transaction_type === "vendor_payment");
+check("match → POST …/U1/match { transactions_to_be_matched:[{transaction_id:P9, transaction_type:vendor_payment}] } (key verified live)", r.path.endsWith("/U1/match") && r.body.transactions_to_be_matched[0].transaction_id === "P9" && r.body.transactions_to_be_matched[0].transaction_type === "vendor_payment");
 r = buildFeedRequest({ ...base, chosen_txn_kind: "vendor_payment", chosen_party_kind: "vendor", chosen_party_zoho_id: "V1", chosen_allocations: [{ doc_kind: "bill", doc_zoho_id: "B2", amount_applied: 300 }] }, BANK);
 check("vendor payment → …/categorize/vendorpayments with bills[] and paid_through = the bank", r.path.endsWith("/categorize/vendorpayments") && r.body.vendor_id === "V1" && r.body.bills[0].bill_id === "B2" && r.body.paid_through_account_id === BANK && r.body.amount === 300);
 r = buildFeedRequest({ ...base, side: "credit", amount: 2096, chosen_txn_kind: "customer_payment", chosen_party_kind: "customer", chosen_party_zoho_id: "C1", chosen_bank_charges: 4, chosen_allocations: [{ doc_kind: "invoice", doc_zoho_id: "I1", amount_applied: 2100 }] }, BANK);
