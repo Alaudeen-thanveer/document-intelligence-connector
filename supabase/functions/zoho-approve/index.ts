@@ -58,6 +58,12 @@ interface ApproveInput {
   override_reconciliation?: boolean;
   /** UAE VAT: emirate code for sales invoices; defaults to the customer's place_of_contact. */
   place_of_supply?: string | null;
+  /**
+   * Purchase order to link the bill to (Zoho purchaseorder_id). When absent
+   * the PO is resolved from the bill's extracted PO number against the
+   * synced open POs; "" / null disables linking.
+   */
+  purchaseorder_id?: string | null;
 }
 
 interface ApproveResult {
@@ -65,6 +71,7 @@ interface ApproveResult {
   zoho_bill_id?: string;
   error?: string;
   credits_applied?: { applied: number; ok: boolean; response?: unknown } | null;
+  purchase_order?: { zoho_id: string; number: string; how: "input" | "po_number" } | null;
   failed_checks?: Array<{ rule_name: string; notes: string | null }>;
   reconciliation?: Reconciliation;
   money?: { tax_id: string | null; tax_name: string | null; currency_id: string | null; notes: string[] };
@@ -636,7 +643,7 @@ Deno.serve(async (req) => {
     const { data: extracted, error: extractedError } = await supabase
       .from("extracted_fields")
       .select(
-        "id, document_id, vendor_raw, total_amount, invoice_date, currency, tax_amount, invoice_number, due_date",
+        "id, document_id, vendor_raw, total_amount, invoice_date, currency, tax_amount, invoice_number, due_date, po_number",
       )
       .eq("document_id", invoiceId)
       .order("id", { ascending: false })
@@ -663,6 +670,7 @@ Deno.serve(async (req) => {
       lineRows,
     );
     const postAs: PostAs = input.post_as ?? "bill";
+    let purchaseOrder: ApproveResult["purchase_order"] = null;
 
     // Money: resolve VAT → tax_id and currency; reconcile lines vs total.
     const documentTotal = Number(extracted.total_amount ?? 0) || 0;
@@ -889,9 +897,24 @@ Deno.serve(async (req) => {
 
       const billNumber = mapped.invoice_number?.trim() ||
         `DIC-${invoiceId.replace(/-/g, "").slice(0, 12)}`;
+      // Purchase order link (item 7): explicit from review, else by the PO
+      // number read off the bill against the synced open POs.
+      if (input.purchaseorder_id === undefined) {
+        const wantPo = String((extracted as { po_number?: string | null }).po_number ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+        if (wantPo.length >= 3) {
+          const { data: poRows } = await supabase.from("zoho_entities").select("zoho_id, name, extra").eq("kind", "purchase_order");
+          const normPo = (v: unknown) => String(v ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+          const hit = (poRows ?? []).find((r) => normPo(r.name) === wantPo || normPo((r.extra as Record<string, unknown>)?.reference_number) === wantPo);
+          if (hit) purchaseOrder = { zoho_id: String(hit.zoho_id), number: String(hit.name), how: "po_number" };
+        }
+      } else if (input.purchaseorder_id) {
+        const { data: poRow } = await supabase.from("zoho_entities").select("zoho_id, name").eq("kind", "purchase_order").eq("zoho_id", input.purchaseorder_id).maybeSingle();
+        purchaseOrder = { zoho_id: input.purchaseorder_id, number: poRow ? String(poRow.name) : input.purchaseorder_id, how: "input" };
+      }
       const created = await zohoCreate("bills", {
         vendor_id: matched.bill.vendor_id,
         bill_number: billNumber,
+        ...(purchaseOrder ? { purchaseorder_ids: [purchaseOrder.zoho_id] } : {}),
         date: mapped.date,
         ...(money.currencyId ? { currency_id: money.currencyId } : {}),
         ...(mapped.due_date ? { due_date: mapped.due_date } : {}),
@@ -960,7 +983,7 @@ Deno.serve(async (req) => {
       actor_id: user.id,
       action: "zoho_synced",
       detail: {
-        zoho_bill_id: zohoId, post_as: postAs, credits_applied: creditsApplied?.applied ?? 0,
+        zoho_bill_id: zohoId, post_as: postAs, credits_applied: creditsApplied?.applied ?? 0, purchase_order: purchaseOrder?.number ?? null,
         reconciliation: recon.mode, tax: money.taxName, attachment: attachment.uploaded,
         ...(failedChecks.length ? { override_reason: input.override_reason, overridden_checks: failedChecks.map((f) => f.rule_name) } : {}),
         ...(recon.message.startsWith("override") ? { reconciliation_override: recon.message } : {}),
@@ -968,7 +991,7 @@ Deno.serve(async (req) => {
     });
 
     return jsonResponse({
-      success: true, zoho_bill_id: zohoId ?? undefined, credits_applied: creditsApplied,
+      success: true, zoho_bill_id: zohoId ?? undefined, credits_applied: creditsApplied, purchase_order: purchaseOrder,
       reconciliation: recon, money: { tax_id: money.taxId, tax_name: money.taxName, currency_id: money.currencyId, notes: money.notes }, attachment,
     });
   } catch (err) {

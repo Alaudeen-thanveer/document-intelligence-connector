@@ -51,7 +51,7 @@ interface Suggestion {
   ref_number: string | null;
   candidates: Allocation[];
   confidence: number;
-  source: "already_recorded" | "open_document" | "open_credit" | "learned" | "accepted_rule" | "party_name";
+  source: "already_recorded" | "open_document" | "open_credit" | "zoho_rule" | "learned" | "accepted_rule" | "party_name";
   reason: string;
 }
 
@@ -132,11 +132,27 @@ const KIND_LABEL: Record<TxnKind, string> = {
 const KINDS_IN: TxnKind[] = ["customer_payment", "retainer_receipt", "vendorcredit_refund", "vendorpayment_refund", "deposit", "transfer", "already_recorded", "other"];
 const KINDS_OUT: TxnKind[] = ["vendor_payment", "expense", "creditnote_refund", "payment_refund", "transfer", "already_recorded", "other"];
 const FEED_EXTRA: TxnKind[] = ["exclude"];
+interface RuleProposal {
+  id?: string;
+  fingerprint: string;
+  side: "debit" | "credit";
+  txn_kind: string;
+  account_name: string | null;
+  party_name: string | null;
+  sample_size: number;
+  confidence: number;
+  examples?: string[];
+  zoho_rule_id: string | null;
+  proposable: boolean;
+  why: string;
+}
+
 const SOURCE_LABEL: Record<Suggestion["source"], string> = {
   already_recorded: "already posted by this app",
   open_document: "matches an open document",
   open_credit: "matches an open credit",
   accepted_rule: "your rule",
+  zoho_rule: "your Zoho bank rule",
   learned: "learned from history",
   party_name: "name only",
 };
@@ -223,6 +239,25 @@ export function BankPage() {
   const [policies, setPolicies] = useState<Policies | null>(null);
   const [policyDraft, setPolicyDraft] = useState<{ window: string; aed: string; usd: string; woDays: string; woAmount: string; woNote: string } | null>(null);
   const [showPolicies, setShowPolicies] = useState(false);
+  const [ruleProposals, setRuleProposals] = useState<RuleProposal[] | null>(null);
+  const [showRules, setShowRules] = useState(false);
+
+  const loadRuleProposals = useCallback(async () => {
+    const res = await callEdgeFunction("bank-statement", { action: "rule_proposals" });
+    const body = res.body as { ok?: boolean; proposals?: RuleProposal[] };
+    setRuleProposals(body.ok ? (body.proposals ?? []) : []);
+  }, []);
+
+  async function proposeRule(p: RuleProposal) {
+    if (!p.id) return;
+    setBusy(`rule:${p.id}`); setError(null); setNotice(null);
+    const res = await callEdgeFunction("bank-statement", { action: "propose_zoho_rule", pattern_id: p.id });
+    const body = res.body as { ok?: boolean; error?: string; zoho_rule_id?: string | null };
+    if (!body.ok) setError(body.error ?? `Zoho rule not created (${res.status})`);
+    else setNotice(`Created in Zoho Books as a suggest-only rule${body.zoho_rule_id ? ` (${body.zoho_rule_id})` : ""}. Zoho's own banking screen will now suggest the same thing; nothing is auto-posted.`);
+    setBusy(null);
+    await loadRuleProposals();
+  }
 
   const loadPolicies = useCallback(async () => {
     const { data } = await supabase.from("company_config").select("already_recorded_window_days, bank_charge_tolerance, writeoff_after_days, writeoff_max_amount, writeoff_policy_note").limit(1).maybeSingle();
@@ -289,7 +324,7 @@ export function BankPage() {
     });
   }, []);
 
-  useEffect(() => { void loadMasters(); void loadStatements(); void loadPolicies(); }, [loadMasters, loadStatements, loadPolicies]);
+  useEffect(() => { void loadMasters(); void loadStatements(); void loadPolicies(); void loadRuleProposals(); }, [loadMasters, loadStatements, loadPolicies, loadRuleProposals]);
   useEffect(() => { if (bankAccounts.length && !bankAccountId) setBankAccountId(bankAccounts[0].zoho_id); }, [bankAccounts, bankAccountId]);
   useEffect(() => { if (current) void loadLines(current.id); }, [current, loadLines]);
 
@@ -575,6 +610,41 @@ export function BankPage() {
           </div>
         )}
       </section>
+
+      {/* ------------------------------------------------- Zoho rule proposals */}
+      {ruleProposals && ruleProposals.length > 0 && (
+        <section className="panel connection-card bank-policies">
+          <header className="panel-header">
+            <div>
+              <p className="eyebrow">Zoho bank rules</p>
+              <p className="muted">
+                {ruleProposals.filter((p) => p.proposable).length} learned pattern{ruleProposals.filter((p) => p.proposable).length === 1 ? "" : "s"} strong enough to become a rule in Zoho Books (≥ 90% confidence, ≥ 12 lines) ·
+                {" "}{ruleProposals.filter((p) => p.zoho_rule_id).length} already proposed. Rules are created suggest-only — Zoho shows them, a human still clicks.
+              </p>
+            </div>
+            <button type="button" className="btn ghost btn-small" onClick={() => setShowRules((v) => !v)}>{showRules ? "Close" : "Show"}</button>
+          </header>
+          {showRules && (
+            <table className="data-table" style={{ marginTop: 10 }}>
+              <thead><tr><th>Lines like</th><th>Record as</th><th>Evidence</th><th></th></tr></thead>
+              <tbody>
+                {ruleProposals.map((p) => (
+                  <tr key={`${p.fingerprint}:${p.side}`}>
+                    <td><code>{p.fingerprint}</code> <span className="muted">({p.side === "debit" ? "money out" : "money in"})</span>{p.examples?.[0] && <div className="muted"><small>e.g. {p.examples[0]}</small></div>}</td>
+                    <td>{p.txn_kind.replace(/_/g, " ")}{p.account_name ? ` → ${p.account_name}` : ""}{p.party_name ? ` · ${p.party_name}` : ""}</td>
+                    <td>{p.sample_size} lines · {Math.round(p.confidence * 100)}%</td>
+                    <td style={{ textAlign: "right" }}>
+                      {p.zoho_rule_id ? <span className="status-pill status-synced">in Zoho</span>
+                        : p.proposable ? <button type="button" className="btn btn-small" disabled={!!busy} onClick={() => void proposeRule(p)}>{busy === `rule:${p.id}` ? "Creating…" : "Create in Zoho (suggest-only)"}</button>
+                        : <span className="muted"><small>{p.why}</small></span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </section>
+      )}
 
       {error && <p className="error-text">{error}</p>}
       {notice && <p className="muted bank-notice">{notice}</p>}

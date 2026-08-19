@@ -1062,6 +1062,7 @@ button.linkish {
 .bank-src { font-size: 0.68rem; }
 .bank-src-open_document { color: var(--accent); }
 .bank-src-accepted_rule { color: var(--accent); }
+.bank-src-zoho_rule { color: var(--accent); }
 .bank-src-learned { color: #9dc4ff; }
 .bank-src-party_name { color: var(--warn); }
 @media (max-width: 800px) { .bank-intake { grid-template-columns: 1fr; } }

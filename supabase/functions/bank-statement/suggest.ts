@@ -38,6 +38,7 @@ import {
   matchBankPattern,
   tokenizeDescription,
 } from "../bookkeeping-learn/bank_patterns.ts";
+import { suggestFromZohoRules, type ZohoBankRule } from "./zoho_rules.ts";
 
 export interface LineForSuggest {
   line_no: number;
@@ -154,7 +155,7 @@ export interface Suggestion {
    *  re-allocate without another Zoho call. */
   candidates: Allocation[];
   confidence: number;
-  source: "already_recorded" | "open_document" | "open_credit" | "learned" | "accepted_rule" | "party_name";
+  source: "already_recorded" | "open_document" | "open_credit" | "zoho_rule" | "learned" | "accepted_rule" | "party_name";
   reason: string;
 }
 
@@ -239,6 +240,11 @@ export interface SuggestContext {
   currency?: string | null;
   /** Today, for the write-off age test (yyyy-mm-dd). */
   today?: string;
+  /** The org's own Zoho bank rules (explicit habits) and the bank account of this statement. */
+  zohoRules?: ZohoBankRule[];
+  bankAccountId?: string | null;
+  /** Payee from the feed, when Zoho supplies one separately (by line_no). */
+  payees?: Record<number, string | null>;
 }
 
 export function suggestForLines(lines: LineForSuggest[], ctx: SuggestContext): Array<Suggestion | null> {
@@ -290,6 +296,18 @@ export function suggestForLines(lines: LineForSuggest[], ctx: SuggestContext): A
         continue;
       }
     }
+
+    // The org's own Zoho bank rule for this line, if any (used at 3b, and
+    // preferred over a vague "hold as advance" when a party is named but
+    // nothing is open — an explicit habit beats a guess).
+    const ruleHit = ctx.zohoRules?.length
+      ? suggestFromZohoRules({ description: line.description, reference: line.reference, payee: ctx.payees?.[line.line_no] ?? null, side: line.side, amount: line.amount }, ctx.zohoRules, ctx.bankAccountId ?? null)
+      : null;
+    const ruleSuggestion = (): Suggestion | null => {
+      if (!ruleHit) return null;
+      const known = ruleHit.party_kind && ruleHit.party_zoho_id ? partyById.get(`${ruleHit.party_kind}:${ruleHit.party_zoho_id}`) : null;
+      return { ...ruleHit, party_name: known?.name ?? null };
+    };
 
     // ---------------------------------------------------- 3. open documents
     const wantKind = line.side === "credit" ? "invoice" : "bill";
@@ -409,7 +427,10 @@ export function suggestForLines(lines: LineForSuggest[], ctx: SuggestContext): A
         continue;
       }
 
-      // Party known, nothing open → advance / on account.
+      // Party known, nothing open → advance / on account — unless the org's
+      // own bank rule says what this line is.
+      const viaRule = ruleSuggestion();
+      if (viaRule) { out.push(viaRule); continue; }
       out.push({
         ...blank(), txn_kind: wantKind === "invoice" ? "customer_payment" : "vendor_payment",
         party_kind: pk, party_zoho_id: party.zoho_id, party_name: party.name,
@@ -418,6 +439,12 @@ export function suggestForLines(lines: LineForSuggest[], ctx: SuggestContext): A
         reason: `${howParty}; no open ${wantKind} for ${party.name} — hold ${fmt(line.amount)} as an advance on their account (unused credit)`,
       });
       continue;
+    }
+
+    // ------------------------------------------- 3b. the org's own bank rule
+    {
+      const viaRule = ruleSuggestion();
+      if (viaRule) { out.push(viaRule); continue; }
     }
 
     // -------------------------------------------------- 4. learned pattern

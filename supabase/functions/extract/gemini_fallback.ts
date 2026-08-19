@@ -12,7 +12,8 @@ export type ExtractableField =
   | "tax_amount"
   | "invoice_number"
   | "due_date"
-  | "customer_raw";
+  | "customer_raw"
+  | "po_number";
 
 /** One invoice line as Gemini reports it (all fields nullable). */
 export interface GeminiLineItem {
@@ -136,6 +137,8 @@ const FIELD_INSTRUCTIONS: Record<ExtractableField, string> = {
     'Extract only the payment due date as YYYY-MM-DD. If no due date is printed, return null. Return JSON only: {"value": string|null, "confidence": number between 0 and 1}',
   customer_raw:
     'Extract only the BILL-TO / customer name — the party this invoice is addressed to, NOT the issuer. If there is no bill-to party, return null. Return JSON only: {"value": string|null, "confidence": number between 0 and 1}',
+  po_number:
+    'Extract only the purchase order number referenced on the document (labels like "PO Number", "PO No", "Purchase Order", "Your order", "Order ref"). Return it as printed. If no PO number is printed, return null. Return JSON only: {"value": string|null, "confidence": number between 0 and 1}',
 };
 
 export async function reExtractFieldWithGemini(
