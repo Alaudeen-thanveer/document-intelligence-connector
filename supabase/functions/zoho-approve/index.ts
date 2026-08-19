@@ -4,6 +4,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { checkEInvoiceReadiness, type EInvoiceFinding } from "./einvoice.ts";
 import { creditCheck, type CreditCheckResult } from "../cashflow/cash.ts";
+import { detectFollowups, type Followups } from "../month-end/schedules.ts";
 import { createClient, type SupabaseClient, type User } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import {
@@ -78,6 +79,8 @@ interface ApproveResult {
   einvoice?: { findings: EInvoiceFinding[]; ready: boolean } | null;
   /** Credit control (sales invoices only): exposure vs limit. */
   credit?: CreditCheckResult | null;
+  /** Bill lines that deserve a follow-up: an asset record / a prepayment schedule. */
+  followups?: Followups | null;
   failed_checks?: Array<{ rule_name: string; notes: string | null }>;
   reconciliation?: Reconciliation;
   money?: { tax_id: string | null; tax_name: string | null; currency_id: string | null; notes: string[] };
@@ -694,6 +697,8 @@ Deno.serve(async (req) => {
     let purchaseOrder: ApproveResult["purchase_order"] = null;
     let einvoice: ApproveResult["einvoice"] = null;
     let creditResult: CreditCheckResult | null = null;
+    /** Snapshot of the created bill's lines, for follow-up detection. */
+    let billLineSnapshot: Array<{ description: string | null; amount: number; account_id: string | null }> = [];
 
     // Period lock (item 10): nothing posts into a locked period through this
     // app. Hard refusal — no override; unlock the period (audited) to change
@@ -1035,6 +1040,46 @@ Deno.serve(async (req) => {
         });
       }
       zohoId = created.id;
+      billLineSnapshot = matched.bill.line_items.map((li) => ({ description: li.description ?? null, amount: Math.round(Number(li.rate) * Number(li.quantity) * 100) / 100, account_id: li.account_id ?? null }));
+    }
+
+    // Follow-ups from the bill's lines (item 16): a line on a fixed-asset
+    // account proposes an asset record; a line on a "Prepaid …" account
+    // proposes a prepayment schedule. Proposals only — a human confirms
+    // each on the Month-end page; nothing is created in Zoho here.
+    let followups: Followups | null = null;
+    if (postAs === "bill" && zohoId) {
+      try {
+        const accountIds = [...new Set(billLineSnapshot.map((li) => li.account_id).filter(Boolean))] as string[];
+        const { data: accRows } = accountIds.length
+          ? await supabase.from("zoho_entities").select("zoho_id, name, extra").eq("kind", "account").in("zoho_id", accountIds)
+          : { data: [] as Array<Record<string, unknown>> };
+        const accMap = new Map((accRows ?? []).map((a) => [String(a.zoho_id), { name: String(a.name), account_type: String(((a.extra as Record<string, unknown>) ?? {}).account_type ?? "") }]));
+        followups = detectFollowups(billLineSnapshot, accMap);
+        const billNo = mapped.invoice_number?.trim() || zohoId;
+        for (const a of followups.assets) {
+          await supabase.from("bk_asset_proposals").upsert({
+            company_id: companyId, document_id: invoiceId, bill_zoho_id: zohoId, bill_number: billNo,
+            line_description: a.description, amount: a.amount, asset_account_id: a.account_id, asset_account_name: a.account_name,
+            purchase_date: mapped.date ?? null, status: "proposed",
+          }, { onConflict: "company_id,bill_zoho_id,line_description", ignoreDuplicates: true });
+        }
+        for (const pnew of followups.prepayments) {
+          const startPeriod = String(mapped.date ?? new Date().toISOString().slice(0, 10)).slice(0, 7);
+          const { data: existing } = await supabase.from("bk_schedules").select("id").eq("company_id", companyId).eq("source_zoho_id", zohoId).eq("label", pnew.description).maybeSingle();
+          if (existing) continue;
+          await supabase.from("bk_schedules").insert({
+            company_id: companyId, kind: "prepayment", label: pnew.description, source_kind: "bill", source_zoho_id: zohoId, source_number: billNo,
+            bs_account_id: pnew.account_id, bs_account_name: pnew.account_name,
+            // The P&L side is the reviewer's choice — left empty on purpose;
+            // the schedule stays "proposed" until they pick it and activate.
+            pl_account_id: "", pl_account_name: null,
+            total: pnew.amount, months: 12, start_period: startPeriod, status: "proposed", created_by: user.email ?? "reviewer",
+          });
+        }
+      } catch (err) {
+        console.warn("followup detection failed:", err instanceof Error ? err.message : String(err));
+      }
     }
 
     await markDocument(supabase, invoiceId, companyId, {
@@ -1086,7 +1131,7 @@ Deno.serve(async (req) => {
     });
 
     return jsonResponse({
-      success: true, zoho_bill_id: zohoId ?? undefined, credits_applied: creditsApplied, purchase_order: purchaseOrder, einvoice, credit: creditResult,
+      success: true, zoho_bill_id: zohoId ?? undefined, credits_applied: creditsApplied, purchase_order: purchaseOrder, einvoice, credit: creditResult, followups,
       reconciliation: recon, money: { tax_id: money.taxId, tax_name: money.taxName, currency_id: money.currencyId, notes: money.notes }, attachment,
     });
   } catch (err) {
