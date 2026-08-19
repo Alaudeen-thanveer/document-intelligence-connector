@@ -49,7 +49,9 @@ export type NudgeKind =
   | "expected_bill_missing"
   | "expected_bill_arrived"
   | "later_than_usual"
-  | "bank_reconciliation";
+  | "bank_reconciliation"
+  | "fa_depreciation"
+  | "suspense_balance";
 
 export interface Nudge {
   kind: NudgeKind;

@@ -31,6 +31,7 @@ import { buildJournalProposal, journalBody, type PatternForProposal, type Propos
 import { computeCtProvision, fiscalYearStart, netProfitFromReport } from "./ct_provision.ts";
 import { bcaBody, bcaParams, parseBcaAccounts, validateRate } from "./fx_reval.ts";
 import { dueScheduleEntries, faDepreciationNudge, validateSchedule, type ScheduleRow } from "./schedules.ts";
+import { findDuplicateAccounts, findDuplicateContacts, findMissingTrns, findSuspenseBalances, unusedAccountCandidates, type HygieneAccount, type HygieneContact } from "./hygiene.ts";
 
 /** Same fingerprint as bookkeeping-learn/journal_patterns.ts. */
 function fingerprintLines(
@@ -714,6 +715,52 @@ Deno.serve(async (req) => {
     } catch { /* module off or unreachable — the create action reports Zoho's words */ }
     const faNudge = faDepreciationNudge(faAssetsCount, posted, month);
 
+    // --- Books hygiene: suspense balances, duplicate/TRN-less contacts,
+    // duplicate/unused accounts. Lists with plain-English notes; a human
+    // tidies in Zoho. Only the suspense balances get an attention nudge.
+    let hygiene: Record<string, unknown> = {};
+    let suspenseNudges: Nudge[] = [];
+    try {
+      const coaRaw = await zohoGet(token, "chartofaccounts", { showbalance: "true", per_page: "200" });
+      const accounts: HygieneAccount[] = ((coaRaw.chartofaccounts ?? []) as Array<Record<string, unknown>>).map((a) => ({
+        account_id: String(a.account_id ?? ""), account_name: String(a.account_name ?? ""), account_type: String(a.account_type ?? ""),
+        current_balance: Number(a.current_balance ?? 0) || 0, is_active: Boolean(a.is_active ?? true),
+        is_user_created: Boolean(a.is_user_created ?? false), is_system_account: Boolean(a.is_system_account ?? false),
+      }));
+      const { data: partyRows } = await supabase.from("zoho_entities").select("kind, zoho_id, name, extra").in("kind", ["vendor", "customer"]);
+      const contacts: HygieneContact[] = (partyRows ?? []).map((r) => {
+        const e = (r.extra as Record<string, unknown>) ?? {};
+        return { zoho_id: String(r.zoho_id), name: String(r.name), kind: r.kind as "vendor" | "customer", trn: (e.tax_reg_no as string | null) ?? null, tax_treatment: (e.tax_treatment as string | null) ?? null, status: (e.status as string | null) ?? null };
+      });
+      const suspense = findSuspenseBalances(accounts);
+      // "Unused" is only claimed after Zoho confirms no transactions ever —
+      // a zero balance alone can just mean fully settled. Capped politely.
+      const candidates = unusedAccountCandidates(accounts).slice(0, 30);
+      const unused: Array<{ account_id: string; account_name: string; note: string }> = [];
+      for (const c of candidates) {
+        try {
+          const txRaw = await zohoGet(token, "chartofaccounts/transactions", { account_id: c.account_id, per_page: "1" });
+          const any = (((txRaw.transactions ?? []) as Array<unknown>).length) > 0;
+          if (!any) unused.push({ account_id: c.account_id, account_name: c.account_name, note: `${c.account_name} has never been posted to — deactivate it in Zoho if it was created by mistake.` });
+        } catch { break; /* endpoint unavailable — say nothing rather than guess */ }
+      }
+      hygiene = {
+        suspense,
+        duplicate_contacts: findDuplicateContacts(contacts),
+        missing_trns: findMissingTrns(contacts),
+        duplicate_accounts: findDuplicateAccounts(accounts),
+        unused_accounts: unused,
+        unused_checked: candidates.length,
+      };
+      suspenseNudges = suspense.map((sr): Nudge => ({
+        kind: "suspense_balance" as Nudge["kind"], severity: "attention",
+        title: `${sr.account_name} — ${sr.balance.toFixed(2)} parked at month-end`,
+        detail: sr.note, key: `hyg:suspense:${sr.account_id}:${month}`, ref: { account_id: sr.account_id, balance: sr.balance },
+      }));
+    } catch (err) {
+      hygiene = { error: `Hygiene checks unavailable: ${err instanceof Error ? err.message : String(err)}` };
+    }
+
     // --- Item 4: bank reconciliation at period end, per bank account.
     const reconciliations = await reconcileForAccounts(supabase, token, companyId, null, start, end, today);
 
@@ -734,6 +781,7 @@ Deno.serve(async (req) => {
       ...expectedBillNudges(enabled, seen, month, today),
       ...laterThanUsualNudges(enabledLtu, openDocs, today),
       ...(faNudge ? [faNudge as Nudge] : []),
+      ...suspenseNudges,
       ...reconciliations.map((r): Nudge => ({
         kind: "bank_reconciliation",
         severity: r.status === "balanced" || r.status === "no_book" ? "info" : "attention",
@@ -765,6 +813,7 @@ Deno.serve(async (req) => {
       schedules,
       asset_proposals: assetProps ?? [],
       fixed_assets: { active_count: faAssetsCount, types: faTypes },
+      hygiene,
       warnings: warnings.length ? warnings : undefined,
       usage: meter.summary(),
     });

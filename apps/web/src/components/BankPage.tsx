@@ -498,9 +498,12 @@ export function BankPage() {
     setBusy("push"); setError(null);
     const res = await callEdgeFunction("bank-statement", { action: "push", statement_id: current.id });
     setBusy(null);
-    const b = res.body as { pushed?: number; failed?: number; error?: string };
+    const b = res.body as { pushed?: number; failed?: number; error?: string; results?: Array<{ attached?: boolean | null }> };
     if (b.error && !b.pushed) setError(String(b.error));
-    else setNotice(`Posted ${b.pushed ?? 0} to Zoho Books${b.failed ? ` · ${b.failed} failed — see the line for why` : ""}.`);
+    else {
+      const attached = (b.results ?? []).filter((r) => r.attached === true).length;
+      setNotice(`Posted ${b.pushed ?? 0} to Zoho Books${attached ? ` — statement evidence attached to ${attached}` : ""}${b.failed ? ` — ${b.failed} failed — see the line for why` : ""}.`);
+    }
     await loadLines(current.id);
   }
 

@@ -81,6 +81,15 @@ interface AssetProposalUi {
   asset_account_name: string | null; purchase_date: string | null; status: "proposed" | "created" | "dismissed"; zoho_asset_id: string | null;
 }
 interface AccountOption { zoho_id: string; name: string }
+interface Hygiene {
+  suspense?: Array<{ account_id: string; account_name: string; balance: number; note: string }>;
+  duplicate_contacts?: Array<{ kind: string; reason: string; names: string[]; note: string }>;
+  missing_trns?: Array<{ kind: string; zoho_id: string; name: string; note: string }>;
+  duplicate_accounts?: Array<{ names: string[]; note: string }>;
+  unused_accounts?: Array<{ account_id: string; account_name: string; note: string }>;
+  unused_checked?: number;
+  error?: string;
+}
 
 interface MonthEndResult {
   ok: boolean;
@@ -101,6 +110,7 @@ interface MonthEndResult {
   ct?: CtInfo | null;
   schedules?: ScheduleRowUi[];
   asset_proposals?: AssetProposalUi[];
+  hygiene?: Hygiene;
   fixed_assets?: { active_count: number; types: Array<{ fixed_asset_type_id: string; name: string }> };
   warnings?: string[];
   error?: string;
@@ -627,6 +637,65 @@ export function MonthEndPage() {
             <button type="button" className="btn ghost btn-small" style={{ marginTop: 10 }} onClick={() => setManualSched({ kind: "accrual", label: "", bs_account_id: "", pl_account_id: "", total: "", months: "12", start_period: month })}>
               + Add an accrual / prepayment by hand
             </button>
+          )}
+        </section>
+      )}
+
+      {result && result.hygiene && !result.hygiene.error && (
+        <section className="panel connection-card">
+          <h3>Books hygiene</h3>
+          <p className="muted">
+            Tidiness before closing: parked balances, doubled-up contacts and accounts, missing TRNs.
+            Nothing here changes anything — each row says what to fix in Zoho Books.
+          </p>
+          {(result.hygiene.suspense ?? []).length > 0 && (
+            <>
+              <h4 style={{ marginTop: 10 }}>Suspense / uncategorised balances</h4>
+              <ul className="conn-entity-list">
+                {(result.hygiene.suspense ?? []).map((r) => (
+                  <li key={r.account_id}>
+                    <div><strong>{r.account_name} · {money(r.balance)}</strong><div className="muted">{r.note}</div></div>
+                    <span className="status-pill status-needs_review">parked</span>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          {(result.hygiene.duplicate_contacts ?? []).length > 0 && (
+            <>
+              <h4 style={{ marginTop: 10 }}>Doubled-up vendors / customers</h4>
+              <ul className="conn-entity-list">
+                {(result.hygiene.duplicate_contacts ?? []).map((r, i) => (
+                  <li key={`dc${i}`}><div><strong>{r.names.join(" ↔ ")}</strong><div className="muted">{r.note}</div></div></li>
+                ))}
+              </ul>
+            </>
+          )}
+          {(result.hygiene.missing_trns ?? []).length > 0 && (
+            <>
+              <h4 style={{ marginTop: 10 }}>Missing TRNs</h4>
+              <ul className="conn-entity-list">
+                {(result.hygiene.missing_trns ?? []).map((r) => (
+                  <li key={r.zoho_id}><div><strong>{r.name}</strong> <span className="muted">({r.kind})</span><div className="muted">{r.note}</div></div></li>
+                ))}
+              </ul>
+            </>
+          )}
+          {((result.hygiene.duplicate_accounts ?? []).length > 0 || (result.hygiene.unused_accounts ?? []).length > 0) && (
+            <>
+              <h4 style={{ marginTop: 10 }}>Chart of accounts</h4>
+              <ul className="conn-entity-list">
+                {(result.hygiene.duplicate_accounts ?? []).map((r, i) => (
+                  <li key={`da${i}`}><div><strong>{r.names.join(" ↔ ")}</strong><div className="muted">{r.note}</div></div></li>
+                ))}
+                {(result.hygiene.unused_accounts ?? []).map((r) => (
+                  <li key={r.account_id}><div><strong>{r.account_name}</strong><div className="muted">{r.note}</div></div><span className="status-pill status-pending">never used</span></li>
+                ))}
+              </ul>
+            </>
+          )}
+          {(result.hygiene.suspense ?? []).length === 0 && (result.hygiene.duplicate_contacts ?? []).length === 0 && (result.hygiene.missing_trns ?? []).length === 0 && (result.hygiene.duplicate_accounts ?? []).length === 0 && (result.hygiene.unused_accounts ?? []).length === 0 && (
+            <p className="muted">Nothing to tidy — no parked balances, no doubles, every VAT-registered contact has its TRN.</p>
           )}
         </section>
       )}
