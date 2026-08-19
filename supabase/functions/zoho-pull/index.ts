@@ -505,6 +505,20 @@ async function fetchKind(
     "contacts",
     `&contact_type=${kind}`,
   );
+  // The list view has tax_treatment but NOT the TRN (tax_reg_no) — that
+  // lives only in the contact detail (verified on the .ae DC). The TRN is
+  // needed for the e-invoice readiness check (buyer TRN on B2B) and the
+  // Form 201 review, so enrich a bounded number of contacts per sync.
+  const trnByContact = new Map<string, string | null>();
+  for (const c of contacts.slice(0, 300)) {
+    const id = String(c.contact_id ?? "");
+    if (!id) continue;
+    try {
+      const res = await zohoFetch(`${apiBase()}/contacts/${id}?organization_id=${encodeURIComponent(orgId())}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+      const raw = await res.json() as { contact?: Record<string, unknown> };
+      trnByContact.set(id, (raw.contact?.tax_reg_no as string | undefined) || null);
+    } catch { /* TRN stays unknown for this contact */ }
+  }
   return contacts
     .map((c) => ({
       kind,
@@ -519,6 +533,8 @@ async function fetchKind(
         // UAE VAT: Zoho requires place_of_supply on sales invoices; the
         // contact's emirate (place_of_contact) is the default source.
         place_of_contact: c.place_of_contact || null,
+        // TRN (15 digits when real); null when not registered / not entered.
+        tax_reg_no: trnByContact.get(String(c.contact_id ?? "")) ?? null,
       },
     }))
     .filter((r) => r.zoho_id && r.name);

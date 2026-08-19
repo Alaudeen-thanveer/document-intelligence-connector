@@ -469,11 +469,18 @@ Deno.serve(async (req) => {
       if (!lines?.length) return jsonResponse({ ok: true, pushed: 0, failed: 0, results: [], note: "no confirmed lines to push" });
       const token = await getAccessToken(supabase);
       const { data: feeAcct } = await supabase.from("zoho_entities").select("zoho_id").eq("kind", "account").ilike("name", "bank fees%").limit(1).maybeSingle();
+      // Period lock (item 10): a line dated inside a locked period must not
+      // create anything in the books. Hard per-line refusal; unlock to change.
+      const { data: lockRow } = await supabase.from("company_config").select("locked_until").eq("company_id", companyId).maybeSingle();
+      const lockedUntil = lockRow?.locked_until ? String(lockRow.locked_until) : null;
       const results: Array<Record<string, unknown>> = [];
       let pushed = 0, failed = 0;
       for (const line of lines) {
         const st = (line as { bank_statements: { bank_account_zoho_id: string; currency: string | null } }).bank_statements;
         try {
+          if (lockedUntil && String(line.txn_date) <= lockedUntil && (line as { chosen_txn_kind?: string }).chosen_txn_kind !== "already_recorded") {
+            throw new Error(`the books are locked through ${lockedUntil} — this line is dated ${line.txn_date}. Unlock the period to post it.`);
+          }
           let r: { zoho_id: string; payload: Record<string, unknown>; extra: Array<{ kind: string; zoho_id: string }>; kind: string };
           if ((line as { zoho_uncategorized_id?: string | null }).zoho_uncategorized_id) {
             // FEED MODE: the line already exists in Zoho — match / categorize / exclude it there.

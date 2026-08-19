@@ -808,6 +808,7 @@ export function ReviewPanel({
         money?: { tax_name: string | null; notes: string[] };
         attachment?: { uploaded: boolean; error?: string };
         already_synced?: boolean;
+        einvoice?: { findings: Array<{ level: string; field: string; message: string }>; ready: boolean } | null;
       };
       // Non-2xx bodies (409 failed checks, 422 reconciliation) arrive on error.context.
       let result = (data ?? {}) as ApproveResp;
@@ -844,6 +845,7 @@ export function ReviewPanel({
           result.money?.tax_name ? `VAT as ${result.money.tax_name}` : (result.money?.notes?.[0] ?? null),
           result.attachment ? (result.attachment.uploaded ? "document attached" : `attachment not uploaded${result.attachment.error ? ` (${result.attachment.error})` : ""}`) : null,
           result.reconciliation && result.reconciliation.mode !== "net" ? `lines: ${result.reconciliation.message}` : null,
+          result.einvoice ? (result.einvoice.ready && !result.einvoice.findings.length ? "e-invoice fields ready" : `e-invoice fields: ${result.einvoice.findings.map((f) => `${f.level === "error" ? "⚠" : "•"} ${f.message}`).join(" ")}`) : null,
         ].filter(Boolean).join(" · ");
         setActionMsg(
           `Pushed to Zoho. ${label} ${result.zoho_bill_id ?? ""}.${bits ? ` ${bits}.` : ""}`,

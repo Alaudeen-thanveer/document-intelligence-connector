@@ -108,6 +108,26 @@ Below the gate, or nothing at all → the line stays **open**; the reviewer fill
 
 `zoho-pull` syncs open POs with their lines (kind `purchase_order`; ordered qty, `quantity_billed`, rate). Extraction reads the PO number off the bill (`po_number`, Mindee + Gemini fallback). The judgment check `po_match` then compares ordered vs billed vs already-billed: PO found by number **or reference** (orgs with auto-numbering keep the human tag in `reference_number`), else same vendor + total within tolerance when unique; totals within `max(po_variance_pct %, po_variance_amount)` (company settings, default 2% / 10); per-line rate within the percentage, quantity within what remains unbilled; a bill line not on the PO is named. No PO referenced and none found → not applicable (the amount-above-threshold check owns the missing-PO policy). On approve, the bill carries `purchaseorder_ids` — Zoho links it, consumes quantities and closes the PO. `judgment/po_match.ts`; test `po-match-accuracy`; verified live both ways (matching bill passes and links; over-billed bill fails with "billed 14 but only 10 of 10 remain unbilled").
 
+### 3.13 VAT return (Form 201) pre-filing review — built
+
+`vat-review` recomputes the period's boxes from the actual documents (invoices/credit notes → outputs per emirate by `place_of_supply`; bills/expenses/vendor credits → recoverable inputs; reverse charge mirrored as box 3/10) and runs the pre-filing checks: output VAT ties (5% of net per doc, ±0.05, offenders named), input VAT ties, reverse charge present on overseas-vendor bills, place of supply present, no VAT on zero-rated/exempt/out-of-scope docs, designated-zone counterparties listed for a human eye, org TRN on file (from `organization.tax_settings.tax_reg_no`). Filing due `vat_filing_due_days` (28) after period end; period shape from `vat_period_months` / `vat_period_anchor_month` (default quarterly, Mar/Jun/Sep/Dec). Reviews only — filing stays in the FTA portal. Zoho exposes no Form-201 API on the .ae DC (probed); document lists are detail-enriched (list views omit tax_total/place_of_supply). `vat-review/form201.ts`; test `vat-form201-accuracy`; verified live (RC-less import bill caught and named).
+
+### 3.14 UAE e-invoicing field readiness — built
+
+Before `zoho-approve` creates a SALES invoice it checks what the PINT AE e-invoice will need: seller TRN present and 15 digits, buyer TRN on B2B (buyer `tax_treatment` vat_registered/dz/gcc ⇒ TRN required+valid), tax category per line, valid emirate, date/currency. Findings (error/warning) ride on the approve response and inform the reviewer — the invoice is still created in Zoho Books; issuance and transmission stay with Zoho and the MoF-accredited service provider. This tool never issues a sales invoice. Timeline (verified Aug 2026): pilot/voluntary 1 Jul 2026; mandatory ≥AED 50m 1 Jan 2027, others 1 Jul 2027, government 1 Oct 2027. Contact TRNs are cached by `zoho-pull` (detail-enriched — list views omit `tax_reg_no`). `zoho-approve/einvoice.ts`; test `einvoice-lock-fx-ct-accuracy`.
+
+### 3.15 Period lock — built
+
+Zoho's .ae API exposes no transaction-locking endpoint (probed), so the lock is the app's: `company_config.locked_until`. Month-end's last step: when the period has ended, reconciliations are settled and proposals decided, `lock_period` sets the date (blockers refuse it; `force` locks anyway, audited with the open items). The lock is HARD in every posting path — `zoho-approve` (document date ≤ lock → refused, no override), bank-statement `push` (per-line), month-end `post_journal`/`post_bca` — each refusal saying the date and the way out. `unlock_period` clears it, audited. Verified live across all three guards.
+
+### 3.16 Multi-currency revaluation — built
+
+Zoho computes the revaluation (base currency adjustment); the reviewer owns the period-end rate (a policy choice — never invented). Month-end actions: `fx_exposure` (currency + rate → Zoho's affected accounts with per-account unrealised gain/loss) and `post_bca`. Verified live on the .ae DC: `GET/POST /basecurrencyadjustment` — the POST wants the entity JSON in the body and `account_ids` as a CSV in the QUERY string (the only accepted combination); DELETE undoes. `month-end/fx_reval.ts`; live: USD invoice at 3.6725 revalued at 3.70 → 27.50 gain posted and audited.
+
+### 3.17 Corporate tax provision — built
+
+Schedule-driven journal proposal (kind `ct_provision` on the proposal machinery): provision-to-date = `ct_rate` (9%) × max(0, FY-to-date net profit − `ct_threshold` (375,000)); the proposal is the TOP-UP over what was already posted this fiscal year. Net profit from Zoho's own `GET /reports/profitandloss` ("Net Profit/Loss" node); fiscal year from the org's `fiscal_year_start_month`. Nothing is proposed until the company chooses its two accounts (`ct_expense_account_id` / `ct_payable_account_id`); a loss or sub-threshold profit reports why and proposes nothing; the note says accounting profit is a proxy for taxable income. Rides on `post_journal` (same validation, same lock guard, can never post twice). `month-end/ct_provision.ts`; live shows the honest loss path on the test org.
+
 ## 4. Knowledge base shape
 
 Three layers, every entry carrying `sample_size`, `confidence`, and `last_seen`.
