@@ -359,22 +359,33 @@ Deno.serve(async (req) => {
       if (!prop) return jsonResponse({ ok: false, error: "proposal not found" }, 404);
       if (prop.status === "created") return jsonResponse({ ok: false, error: `Already created as Zoho asset ${prop.zoho_asset_id}.` }, 409);
       const purchaseDate = prop.purchase_date ? String(prop.purchase_date) : today;
+      // Field names per the Fixed Assets API (total_life is MONTHS); the
+      // asset type supplies the depreciation defaults.
       const body: Record<string, unknown> = {
         asset_name: String(prop.line_description).slice(0, 100),
         asset_account_id: String(prop.asset_account_id),
-        purchase_price: Number(prop.amount),
+        asset_cost: Number(prop.amount),
         dep_start_value: Number(prop.amount),
-        purchase_date: purchaseDate,
-        dep_start_date: purchaseDate,
+        asset_purchase_date: purchaseDate,
+        depreciation_start_date: purchaseDate,
         ...(input.fixed_asset_type_id ? { fixed_asset_type_id: String(input.fixed_asset_type_id) } : {}),
+        notes: `Created by the connector from bill ${prop.bill_number ?? prop.bill_zoho_id}; confirmed by ${actor}.`,
       };
       const res = await zohoPost(token, "fixedassets", body);
       if (!res.ok) return jsonResponse({ ok: false, error: `Zoho did not create the asset: ${res.raw.message ?? res.status}`, body }, 502);
       const asset = (res.raw.fixed_asset ?? res.raw.fixedasset ?? {}) as Record<string, unknown>;
       const assetId = asset.fixed_asset_id ? String(asset.fixed_asset_id) : null;
+      // Zoho creates the asset as a draft; the reviewer's click IS the
+      // confirmation, so activate it (verified live: POST …/status/active).
+      // Best effort — a draft asset is still a created asset.
+      let activated = false;
+      if (assetId) {
+        const act = await zohoPost(token, `fixedassets/${assetId}/status/active`, {});
+        activated = act.ok;
+      }
       await supabase.from("bk_asset_proposals").update({ status: "created", zoho_asset_id: assetId, decided_by: actor, decided_at: new Date().toISOString() }).eq("id", pid);
-      await audit("fixed_asset_created", { proposal_id: pid, zoho_asset_id: assetId, asset_name: body.asset_name, amount: prop.amount });
-      return jsonResponse({ ok: true, zoho_asset_id: assetId, asset, usage: meter.summary() });
+      await audit("fixed_asset_created", { proposal_id: pid, zoho_asset_id: assetId, asset_name: body.asset_name, amount: prop.amount, activated });
+      return jsonResponse({ ok: true, zoho_asset_id: assetId, activated, asset, usage: meter.summary() });
     }
     if (action === "dismiss_asset") {
       const pid = String(input.asset_proposal_id ?? "");
