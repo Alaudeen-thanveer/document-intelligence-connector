@@ -1069,6 +1069,9 @@ Deno.serve(async (req) => {
       .in("status", ["confirmed", "posted"]);
     for (const c of confirmed ?? []) {
       if (!c.chosen_txn_kind) continue;
+      // A link to an already-recorded entry says nothing about what the
+      // description usually IS; an explicit exclude does, and is learned.
+      if (c.chosen_txn_kind === "already_recorded") continue;
       bankObs.push({
         description: String(c.description ?? ""),
         side: c.side as BankSide,

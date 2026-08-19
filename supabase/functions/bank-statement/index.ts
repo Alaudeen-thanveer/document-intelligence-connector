@@ -12,6 +12,12 @@
 //                                  goes to Zoho here.
 //   push     { statement_id | line_ids } Post confirmed lines to Zoho Books.
 //   party_credits { party_kind, party_zoho_id } Unused credit a party holds.
+//   pull_feed { bank_account_zoho_id, date_start? }
+//            FEED MODE: pull Zoho's own uncategorised transactions for a
+//            bank account into a statement (source zoho_feed), suggest per
+//            line (Zoho's match candidates first), and on push act with
+//            Zoho's verbs — match / categorize / exclude — so Zoho keeps the
+//            statement and the reconciliation.
 //
 // The email path calls `ingest` with source 'email' and the body/attachment
 // text — same code, different tag.
@@ -27,6 +33,7 @@ import {
 } from "./suggest.ts";
 import { type BankPattern } from "../bookkeeping-learn/bank_patterns.ts";
 import { pushLine } from "./push.ts";
+import { buildFeedRequest, extractZohoId, suggestFromZohoMatches, uncategorizedToLines, type ZohoMatchCandidate, type ZohoUncategorizedRow } from "./feed.ts";
 
 const DEFAULT_COMPANY = "00000000-0000-4000-8000-000000000001";
 const CORS_HEADERS: Record<string, string> = {
@@ -201,7 +208,7 @@ async function loadRecorded(supabase: SupabaseClient, companyId: string, stateme
 
 async function computeAndStoreSuggestions(
   supabase: SupabaseClient, zohoFetch: typeof fetch, companyId: string, statementId: string,
-): Promise<{ suggested: number; open: number; open_docs: number }> {
+): Promise<{ suggested: number; open: number; open_docs: number; zoho_matched?: number }> {
   const { data: lines } = await supabase.from("bank_statement_lines")
     .select("id, line_no, txn_date, description, reference, side, amount").eq("statement_id", statementId).eq("status", "open").order("line_no");
   const list = (lines ?? []) as Array<LineForSuggest & { id: string }>;
@@ -230,13 +237,44 @@ async function computeAndStoreSuggestions(
     console.warn("open documents unavailable; suggesting from patterns only:", err instanceof Error ? err.message : err);
   }
   const suggestions = suggestForLines(list, { patterns, parties, openDocs, openCredits, recorded, policies, currency, today: new Date().toISOString().slice(0, 10) });
+
+  // Feed mode: ask Zoho for its own match candidates per line — a record
+  // already in the books that this line should be LINKED to, not recreated.
+  // That is the duplicate control when the statement lives in Zoho, so it
+  // outranks everything except our own already-recorded link.
+  const { data: feedRows } = await supabase.from("bank_statement_lines").select("id, zoho_uncategorized_id")
+    .eq("statement_id", statementId).not("zoho_uncategorized_id", "is", null);
+  const feedIds = new Map((feedRows ?? []).map((r) => [String(r.id), String(r.zoho_uncategorized_id)]));
+  let zohoMatched = 0;
+  if (feedIds.size) {
+    let token: string | null = null;
+    try { token = await getAccessToken(supabase); } catch { token = null; }
+    const org = Deno.env.get("ZOHO_ORGANIZATION_ID")?.trim() ?? "";
+    for (let i = 0; i < list.length && token; i++) {
+      const uncatId = feedIds.get(String(list[i].id));
+      if (!uncatId) continue;
+      try {
+        const res = await zohoFetch(`${apiBase()}/banktransactions/uncategorized/${encodeURIComponent(uncatId)}/match?organization_id=${encodeURIComponent(org)}`, { headers: { Authorization: `Zoho-oauthtoken ${token}` } });
+        const j = await res.json().catch(() => ({}));
+        const cands = ((j as { matching_transactions?: ZohoMatchCandidate[] }).matching_transactions ?? []).slice(0, 10);
+        await supabase.from("bank_statement_lines").update({ zoho_match_candidates: cands }).eq("id", list[i].id);
+        if (cands.length && suggestions[i]?.source !== "already_recorded") {
+          const m = suggestFromZohoMatches(list[i], cands, policies.already_recorded_window_days);
+          if (m) { suggestions[i] = m; zohoMatched++; }
+        }
+      } catch (err) {
+        console.warn("zoho match lookup failed:", err instanceof Error ? err.message : err);
+      }
+    }
+  }
+
   let suggested = 0;
   for (let i = 0; i < list.length; i++) {
     const s: Suggestion | null = suggestions[i];
     await supabase.from("bank_statement_lines").update({ suggestion: s }).eq("id", list[i].id);
     if (s) suggested++;
   }
-  return { suggested, open: list.length - suggested, open_docs: openDocs.length };
+  return { suggested, open: list.length - suggested, open_docs: openDocs.length, zoho_matched: zohoMatched };
 }
 
 // ------------------------------------------------------------------ main
@@ -350,6 +388,11 @@ Deno.serve(async (req) => {
       }
       const kind = String(input.chosen_txn_kind ?? "");
       if (!kind) return jsonResponse({ ok: false, error: "chosen_txn_kind required" }, 400);
+      if (kind === "exclude" && !line.zoho_uncategorized_id) {
+        // File mode has nothing in Zoho to exclude: an excluded line is simply skipped here.
+        await supabase.from("bank_statement_lines").update({ status: "skipped", chosen_txn_kind: "exclude", decided_by: actor, decided_at: new Date().toISOString() }).eq("id", lineId);
+        return jsonResponse({ ok: true, line_id: lineId, status: "skipped", decision: "filled_blank" });
+      }
       const s = (line.suggestion ?? null) as Suggestion | null;
       const rawAlloc = Array.isArray(input.chosen_allocations) ? (input.chosen_allocations as Array<Record<string, unknown>>) : null;
       const allocations = rawAlloc
@@ -422,7 +465,23 @@ Deno.serve(async (req) => {
       for (const line of lines) {
         const st = (line as { bank_statements: { bank_account_zoho_id: string; currency: string | null } }).bank_statements;
         try {
-          const r = await pushLine(meter.fetch, apiBase(), requireEnv("ZOHO_ORGANIZATION_ID"), token, line as never, st.bank_account_zoho_id, { bankChargesAccountId: feeAcct?.zoho_id ? String(feeAcct.zoho_id) : null });
+          let r: { zoho_id: string; payload: Record<string, unknown>; extra: Array<{ kind: string; zoho_id: string }>; kind: string };
+          if ((line as { zoho_uncategorized_id?: string | null }).zoho_uncategorized_id) {
+            // FEED MODE: the line already exists in Zoho — match / categorize / exclude it there.
+            const sug = (line.suggestion ?? null) as (Suggestion & { ref_zoho_id?: string | null }) | null;
+            const cands = ((line as { zoho_match_candidates?: ZohoMatchCandidate[] | null }).zoho_match_candidates ?? []);
+            const matchedType = cands.find((c) => String(c.transaction_id) === String(line.chosen_ref_zoho_id))?.transaction_type ?? null;
+            const req = buildFeedRequest({ ...(line as never), matched_transaction_type: matchedType }, st.bank_account_zoho_id, null);
+            const res = await meter.fetch(`${apiBase()}/${req.path}?organization_id=${encodeURIComponent(requireEnv("ZOHO_ORGANIZATION_ID"))}`, {
+              method: "POST", headers: { Authorization: `Zoho-oauthtoken ${token}`, ...(req.body ? { "Content-Type": "application/json" } : {}) }, body: req.body ? JSON.stringify(req.body) : undefined,
+            });
+            const raw = await res.json().catch(() => ({})) as Record<string, unknown>;
+            if (!res.ok || (raw.code != null && raw.code !== 0)) throw new Error(`Zoho ${req.path.split("/").slice(-1)[0]} rejected: ${raw.message ?? res.status}${raw.code != null ? ` (code ${raw.code})` : ""}`);
+            r = { zoho_id: extractZohoId(raw) ?? (req.kind === "match" ? String(line.chosen_ref_zoho_id) : String((line as { zoho_uncategorized_id: string }).zoho_uncategorized_id)), payload: raw, extra: [], kind: req.kind };
+            void sug;
+          } else {
+            r = await pushLine(meter.fetch, apiBase(), requireEnv("ZOHO_ORGANIZATION_ID"), token, line as never, st.bank_account_zoho_id, { bankChargesAccountId: feeAcct?.zoho_id ? String(feeAcct.zoho_id) : null });
+          }
           await supabase.from("bank_statement_lines").update({ status: "posted", zoho_txn_id: r.zoho_id, zoho_payload: r.payload, zoho_extra_ids: r.extra, posted_at: new Date().toISOString(), error: null }).eq("id", line.id);
           results.push({ line_id: line.id, line_no: line.line_no, ok: true, zoho_id: r.zoho_id, kind: r.kind, extra: r.extra });
           pushed++;
@@ -434,6 +493,55 @@ Deno.serve(async (req) => {
         }
       }
       return jsonResponse({ ok: failed === 0, pushed, failed, results, usage: meter.summary() });
+    }
+
+    // ---------------------------------------------------------- pull_feed
+    if (action === "pull_feed") {
+      const bankAccountId = String(input.bank_account_zoho_id ?? "").trim();
+      if (!bankAccountId) return jsonResponse({ ok: false, error: "bank_account_zoho_id is required — pick the bank account whose Zoho feed to pull" }, 400);
+      const token = await getAccessToken(supabase);
+      const org = requireEnv("ZOHO_ORGANIZATION_ID");
+      const rows: ZohoUncategorizedRow[] = [];
+      let page = 1;
+      while (page <= 10) {
+        const qs = new URLSearchParams({ organization_id: org, account_id: bankAccountId, per_page: "200", page: String(page), ...(input.date_start ? { date_start: String(input.date_start) } : {}) });
+        const res = await meter.fetch(`${apiBase()}/banktransactions/uncategorized?${qs}`, { headers: { Authorization: `Zoho-oauthtoken ${token}` } });
+        const j = await res.json().catch(() => ({}));
+        if (!res.ok || (j.code != null && j.code !== 0)) return jsonResponse({ ok: false, error: `Zoho uncategorised list failed: ${j.message ?? res.status}` }, 502);
+        rows.push(...(((j as Record<string, unknown>).transactions as ZohoUncategorizedRow[]) ?? []));
+        if (!(j as { page_context?: { has_more_page?: boolean } }).page_context?.has_more_page) break;
+        page++;
+      }
+      // Only lines we have not pulled before (any statement, this company).
+      const ids = rows.map((r) => String(r.transaction_id));
+      const { data: have } = ids.length
+        ? await supabase.from("bank_statement_lines").select("zoho_uncategorized_id").eq("company_id", companyId).in("zoho_uncategorized_id", ids)
+        : { data: [] };
+      const haveSet = new Set((have ?? []).map((h) => String(h.zoho_uncategorized_id)));
+      const fresh = rows.filter((r) => !haveSet.has(String(r.transaction_id)));
+      const lines = uncategorizedToLines(fresh);
+      if (!lines.length) {
+        return jsonResponse({ ok: true, statement_id: null, lines: [], line_count: 0, already_pulled: rows.length, note: rows.length ? `all ${rows.length} uncategorised lines were already pulled` : "no uncategorised transactions on this account in Zoho", usage: meter.summary() });
+      }
+      const { data: acct } = await supabase.from("zoho_entities").select("name, extra").eq("kind", "bank_account").eq("zoho_id", bankAccountId).maybeSingle();
+      const dates = lines.map((l) => l.txn_date).sort();
+      const { data: st, error: stErr } = await supabase.from("bank_statements").insert({
+        company_id: companyId, bank_account_zoho_id: bankAccountId, bank_account_name: acct?.name ?? null,
+        source: "zoho_feed", currency: ((acct?.extra as Record<string, unknown> | null)?.currency_code as string | undefined) ?? null,
+        period_start: dates[0], period_end: dates[dates.length - 1], line_count: lines.length,
+        skipped_rows: [], parse_info: { source: "zoho_feed", pulled: rows.length, new: lines.length, already_pulled: rows.length - fresh.length },
+        created_by: actor,
+      }).select("id").single();
+      if (stErr || !st) throw new Error(`could not save statement: ${stErr?.message}`);
+      const { error: lErr } = await supabase.from("bank_statement_lines").insert(lines.map((l) => ({
+        statement_id: st.id, company_id: companyId, line_no: l.line_no, txn_date: l.txn_date, value_date: null,
+        description: l.description, reference: l.reference, side: l.side, amount: l.amount, balance: null,
+        zoho_uncategorized_id: l.zoho_uncategorized_id, zoho_payee: l.zoho_payee,
+      })));
+      if (lErr) throw new Error(`could not save lines: ${lErr.message}`);
+      const sug = await computeAndStoreSuggestions(supabase, meter.fetch, companyId, st.id);
+      const { data: outLines } = await supabase.from("bank_statement_lines").select("*").eq("statement_id", st.id).order("line_no");
+      return jsonResponse({ ok: true, statement_id: st.id, lines: outLines ?? [], line_count: lines.length, already_pulled: rows.length - fresh.length, suggestions: sug, usage: meter.summary() });
     }
 
     // ------------------------------------------------------ party_credits
@@ -449,7 +557,7 @@ Deno.serve(async (req) => {
       return jsonResponse({ ok: true, credits, total: credits.reduce((t, c) => t + c.balance, 0), usage: meter.summary() });
     }
 
-    return jsonResponse({ ok: false, error: `unknown action '${action}' — use ingest | suggest | confirm | push | party_credits` }, 400);
+    return jsonResponse({ ok: false, error: `unknown action '${action}' — use ingest | pull_feed | suggest | confirm | push | party_credits` }, 400);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("bank-statement failed:", message);

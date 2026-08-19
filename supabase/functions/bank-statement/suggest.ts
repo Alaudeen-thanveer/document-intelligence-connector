@@ -111,7 +111,8 @@ export const DEFAULT_POLICIES: Policies = {
 export type SuggestKind =
   | "customer_payment" | "vendor_payment" | "expense" | "deposit" | "transfer" | "other"
   | "already_recorded" | "retainer_receipt"
-  | "creditnote_refund" | "payment_refund" | "vendorcredit_refund" | "vendorpayment_refund";
+  | "creditnote_refund" | "payment_refund" | "vendorcredit_refund" | "vendorpayment_refund"
+  | "exclude";
 
 export interface Allocation {
   doc_kind: "invoice" | "bill" | "retainer";
@@ -509,6 +510,7 @@ function describe(p: BankPattern): string {
     case "expense": return `booked to ${p.account_name ?? "an expense account"}${who}`;
     case "deposit": return `booked as deposits to ${p.account_name ?? "an income account"}${who}`;
     case "transfer": return `transfers to ${p.account_name ?? "another account"}`;
+    case "exclude": return "excluded from the books (not a book entry)";
     default: return `categorised${who}`;
   }
 }
