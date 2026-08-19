@@ -28,6 +28,8 @@ import {
 import { type Nudge } from "./nudges.ts";
 import { reconcileAccount, type ReconResult, type ReconStatementLine, type ReconZohoTxn } from "./reconciliation.ts";
 import { buildJournalProposal, journalBody, type PatternForProposal, type ProposalLine } from "./journal_proposals.ts";
+import { computeCtProvision, fiscalYearStart, netProfitFromReport } from "./ct_provision.ts";
+import { bcaBody, bcaParams, parseBcaAccounts, validateRate } from "./fx_reval.ts";
 
 /** Same fingerprint as bookkeeping-learn/journal_patterns.ts. */
 function fingerprintLines(
@@ -195,11 +197,18 @@ Deno.serve(async (req) => {
 
   let input: {
     month?: string; company_id?: string;
-    action?: "nudges" | "reconcile" | "post_journal" | "dismiss_journal";
+    action?: "nudges" | "reconcile" | "post_journal" | "dismiss_journal" | "lock_period" | "unlock_period" | "fx_exposure" | "post_bca";
     bank_account_zoho_id?: string;
     proposal_id?: string;
     journal_date?: string; notes?: string | null; reference_number?: string | null;
     lines?: ProposalLine[];
+    /** lock_period: lock despite blockers (audited with them). */
+    force?: boolean;
+    /** fx_exposure / post_bca. */
+    currency_id?: string;
+    exchange_rate?: number | string;
+    adjustment_date?: string;
+    account_ids?: string[];
   } = {};
   try {
     const text = await req.text();
@@ -222,6 +231,78 @@ Deno.serve(async (req) => {
     const token = await getAccessToken(supabase);
     const actor = (auth.user?.email as string | undefined) ?? "reviewer";
     const action = input.action ?? "nudges";
+    const { data: cfg } = await supabase.from("company_config")
+      .select("locked_until, ct_rate, ct_threshold, ct_expense_account_id, ct_payable_account_id")
+      .eq("company_id", companyId).maybeSingle();
+    const lockedUntil: string | null = cfg?.locked_until ? String(cfg.locked_until) : null;
+    const audit = (act: string, detail: Record<string, unknown>) =>
+      supabase.from("audit_log").insert({ company_id: companyId, actor_type: "human", actor_id: auth.user?.id ?? null, action: act, detail: { ...detail, actor } }).then(() => {}, () => {});
+
+    // ------------------------------------------- period lock (item 10)
+    // Zoho's .ae API exposes no transaction-locking endpoint (verified), so
+    // the lock is the app's: nothing may post into the books on or before
+    // locked_until through this app. The lock is hard — no per-action
+    // override; unlock (audited) to change history.
+    if (action === "lock_period") {
+      const recons = await reconcileForAccounts(supabase, token, companyId, null, start, end, today);
+      const blockers: string[] = [];
+      if (end >= today) blockers.push(`the period ${month} has not ended yet`);
+      for (const r of recons) {
+        if (r.status === "differs") blockers.push(`${r.account.name}: statement and books differ by ${r.difference?.toFixed(2)}`);
+        if (r.status === "pending") blockers.push(`${r.account.name}: ${r.unposted_lines + r.uncategorised_in_zoho} line(s) still pending`);
+        if (r.status === "no_statement" && r.unposted_lines > 0) blockers.push(`${r.account.name}: ${r.unposted_lines} statement line(s) not yet posted`);
+      }
+      const { data: openProps } = await supabase.from("bk_journal_proposals").select("id").eq("company_id", companyId).eq("period", month).eq("status", "proposed");
+      if (openProps?.length) blockers.push(`${openProps.length} journal proposal(s) still awaiting a decision`);
+      if (blockers.length && !input.force) {
+        return jsonResponse({ ok: false, error: "Not everything is settled — lock anyway with force, or finish these first.", blockers }, 409);
+      }
+      if (lockedUntil && lockedUntil >= end) return jsonResponse({ ok: false, error: `Already locked through ${lockedUntil}.` }, 409);
+      await supabase.from("company_config").update({ locked_until: end }).eq("company_id", companyId);
+      await audit("period_locked", { locked_until: end, period: month, forced: Boolean(input.force && blockers.length), blockers });
+      return jsonResponse({ ok: true, locked_until: end, forced: Boolean(input.force && blockers.length), blockers });
+    }
+    if (action === "unlock_period") {
+      if (!lockedUntil) return jsonResponse({ ok: false, error: "Nothing is locked." }, 409);
+      await supabase.from("company_config").update({ locked_until: null }).eq("company_id", companyId);
+      await audit("period_unlocked", { was_locked_until: lockedUntil });
+      return jsonResponse({ ok: true, was_locked_until: lockedUntil });
+    }
+
+    // --------------------------------- multi-currency revaluation (item 11)
+    // Zoho computes the revaluation; the reviewer owns the period-end rate.
+    if (action === "fx_exposure" || action === "post_bca") {
+      const currencyId = String(input.currency_id ?? "");
+      if (!currencyId) return jsonResponse({ ok: false, error: "currency_id required" }, 400);
+      const rateCheck = validateRate(input.exchange_rate);
+      if (!rateCheck.ok) return jsonResponse({ ok: false, error: rateCheck.error }, 400);
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(input.adjustment_date ?? "") ? String(input.adjustment_date) : (end <= today ? end : today);
+      if (lockedUntil && date <= lockedUntil) return jsonResponse({ ok: false, error: `The books are locked through ${lockedUntil} — an adjustment dated ${date} cannot go in.` }, 409);
+      const curRaw = await zohoGet(token, "settings/currencies");
+      const cur = ((curRaw.currencies ?? []) as Array<Record<string, unknown>>).find((c) => String(c.currency_id) === currencyId);
+      if (!cur) return jsonResponse({ ok: false, error: "Unknown currency." }, 404);
+      if (cur.is_base_currency) return jsonResponse({ ok: false, error: "That is the base currency — nothing to revalue." }, 400);
+      const params = bcaParams(currencyId, date, rateCheck.rate, `Period-end revaluation ${month} via connector`);
+      const accRaw = await zohoGet(token, "basecurrencyadjustment/accounts", params);
+      const exposure = parseBcaAccounts(currencyId, String(cur.currency_code ?? ""), Number(cur.exchange_rate ?? 0) || null, accRaw);
+      if (action === "fx_exposure") {
+        return jsonResponse({ ok: true, exposure, adjustment_date: date, exchange_rate: rateCheck.rate, usage: meter.summary() });
+      }
+      // post_bca: only accounts Zoho itself listed (optionally narrowed by the reviewer).
+      const eligible = exposure.accounts.map((a) => a.account_id);
+      const chosen = Array.isArray(input.account_ids) && input.account_ids.length ? input.account_ids.filter((id) => eligible.includes(String(id))) : eligible;
+      if (!chosen.length) return jsonResponse({ ok: false, error: `Zoho reports no accounts to revalue for ${exposure.currency_code} at ${rateCheck.rate} on ${date}.`, exposure }, 409);
+      // Verified live on the .ae DC: the entity goes in the JSON body and
+      // account_ids goes in the QUERY string (comma-separated) — the only
+      // combination Zoho accepts.
+      const qs = new URLSearchParams({ organization_id: requireEnv("ZOHO_ORGANIZATION_ID"), ...bcaBody(chosen) as Record<string, string> });
+      const res = await zohoFetch(`${apiBase()}/basecurrencyadjustment?${qs}`, { method: "POST", headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ currency_id: currencyId, adjustment_date: date, exchange_rate: rateCheck.rate, notes: params.notes }) });
+      const raw = await res.json().catch(() => ({})) as Record<string, unknown>;
+      if (!res.ok || (raw.code != null && raw.code !== 0)) return jsonResponse({ ok: false, error: `Zoho refused the adjustment: ${raw.message ?? res.status}`, exposure }, 502);
+      const bca = (raw.base_currency_adjustment ?? raw.data ?? {}) as Record<string, unknown>;
+      await audit("fx_revaluation_posted", { currency: exposure.currency_code, exchange_rate: rateCheck.rate, adjustment_date: date, accounts: chosen.length, zoho_id: bca.base_currency_adjustment_id ?? null });
+      return jsonResponse({ ok: true, zoho: bca, exposure, usage: meter.summary() });
+    }
 
     // ----------------------------------------------------------- actions
     // Reconcile one bank account in Zoho — only what the nudge proposed
@@ -252,6 +333,9 @@ Deno.serve(async (req) => {
       const lines = (Array.isArray(input.lines) && input.lines.length ? input.lines : (prop.lines as ProposalLine[])).map((l) => ({ ...l, amount: Number(l.amount) }));
       const built = journalBody({ journal_date: input.journal_date ?? String(prop.journal_date), reference_number: input.reference_number === undefined ? (prop.reference_number as string | null) : input.reference_number, notes: input.notes === undefined ? (prop.notes as string | null) : input.notes, lines });
       if (!built.ok) return jsonResponse({ ok: false, error: built.error }, 400);
+      if (lockedUntil && String(built.body.journal_date) <= lockedUntil) {
+        return jsonResponse({ ok: false, error: `The books are locked through ${lockedUntil} — a journal dated ${built.body.journal_date} cannot go in. Date it later, or unlock the period first.` }, 409);
+      }
       const res = await zohoPost(token, "journals", built.body);
       if (!res.ok) return jsonResponse({ ok: false, error: `Zoho refused the journal: ${res.raw.message ?? res.status}`, body: built.body }, 502);
       const journal = (res.raw.journal ?? {}) as Record<string, unknown>;
@@ -454,8 +538,56 @@ Deno.serve(async (req) => {
       if (ins) journalProposals.push(ins);
     }
 
+    // --- Item 12: corporate tax provision — schedule-driven, rides on the
+    // journal-proposal machinery (kind ct_provision). Proposed only when the
+    // company chose its two accounts; a loss or sub-threshold profit reports
+    // why and proposes nothing.
+    let ct: Record<string, unknown> | null = null;
+    if (cfg?.ct_expense_account_id && cfg?.ct_payable_account_id) {
+      try {
+        const orgRaw = await zohoGet(token, `organizations/${requireEnv("ZOHO_ORGANIZATION_ID")}`);
+        const fyName = String(((orgRaw.organization ?? {}) as Record<string, unknown>).fiscal_year_start_month ?? "january").toLowerCase();
+        const fyMonth = ["january","february","march","april","may","june","july","august","september","october","november","december"].indexOf(fyName) + 1;
+        const fyStart = fiscalYearStart(end, fyMonth || 1);
+        const plRaw = await zohoGet(token, "reports/profitandloss", { from_date: fyStart, to_date: end <= today ? end : today });
+        const netProfit = netProfitFromReport((plRaw.profit_and_loss ?? []) as Array<{ name?: string; total?: number }>);
+        const { data: acctRows } = await supabase.from("zoho_entities").select("zoho_id, name").eq("kind", "account").in("zoho_id", [cfg.ct_expense_account_id, cfg.ct_payable_account_id]);
+        const acctName = (id: string) => (acctRows ?? []).find((a) => String(a.zoho_id) === id)?.name ?? null;
+        const { data: provided } = await supabase.from("bk_journal_proposals").select("total, period").eq("company_id", companyId).eq("kind", "ct_provision").eq("status", "posted").gte("period", fyStart.slice(0, 7));
+        const already = (provided ?? []).filter((r) => String(r.period) !== month).reduce((t, r) => t + Number(r.total ?? 0), 0);
+        const result = computeCtProvision({
+          settings: { rate: Number(cfg.ct_rate ?? 9), threshold: Number(cfg.ct_threshold ?? 375000), expense_account_id: String(cfg.ct_expense_account_id), payable_account_id: String(cfg.ct_payable_account_id), expense_account_name: acctName(String(cfg.ct_expense_account_id)), payable_account_name: acctName(String(cfg.ct_payable_account_id)) },
+          net_profit_ytd: netProfit ?? 0, already_provided: already, period: month, fy_start: fyStart,
+        });
+        ct = { ...result, fy_start: fyStart, net_profit_source: netProfit == null ? "not found in the P&L report" : "Zoho P&L report" };
+        const { data: existingCt } = await supabase.from("bk_journal_proposals").select("*").eq("company_id", companyId).eq("kind", "ct_provision").eq("period", month).maybeSingle();
+        if (existingCt) journalProposals.push(existingCt);
+        else if (result.lines && result.top_up > 0) {
+          const { data: ins } = await supabase.from("bk_journal_proposals").insert({
+            company_id: companyId, pattern_id: null, kind: "ct_provision", period: month,
+            journal_date: end <= today ? end : today, reference_number: `DIC-CT-${month}`,
+            notes: result.notes, lines: result.lines, total: result.top_up, status: "proposed",
+          }).select("*").maybeSingle();
+          if (ins) journalProposals.push(ins);
+        }
+      } catch (err) {
+        ct = { applicable: false, reason: `Corporate tax check unavailable: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+
     // --- Item 4: bank reconciliation at period end, per bank account.
     const reconciliations = await reconcileForAccounts(supabase, token, companyId, null, start, end, today);
+
+    // --- Item 10: lock status for the month (informational; the actions do the work).
+    const lockBlockers: string[] = [];
+    if (end >= today) lockBlockers.push(`the period ${month} has not ended yet`);
+    for (const r of reconciliations) {
+      if (r.status === "differs") lockBlockers.push(`${r.account.name}: statement and books differ by ${r.difference?.toFixed(2)}`);
+      if (r.status === "pending") lockBlockers.push(`${r.account.name}: ${r.unposted_lines + r.uncategorised_in_zoho} line(s) still pending`);
+      if (r.status === "no_statement" && r.unposted_lines > 0) lockBlockers.push(`${r.account.name}: ${r.unposted_lines} statement line(s) not yet posted`);
+    }
+    if (journalProposals.some((p) => (p as { status?: string }).status === "proposed")) lockBlockers.push(`${journalProposals.filter((p) => (p as { status?: string }).status === "proposed").length} journal proposal(s) still awaiting a decision`);
+    const lock = { locked_until: lockedUntil, already_locked: Boolean(lockedUntil && lockedUntil >= end), ready: lockBlockers.length === 0, blockers: lockBlockers };
 
     const nudges: Nudge[] = [
       ...recurringJournalNudges(defs, posted, month),
@@ -488,6 +620,8 @@ Deno.serve(async (req) => {
       nudges,
       journal_proposals: journalProposals,
       reconciliations,
+      lock,
+      ct,
       warnings: warnings.length ? warnings : undefined,
       usage: meter.summary(),
     });

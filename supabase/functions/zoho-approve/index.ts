@@ -2,6 +2,7 @@
 // Secrets come from Deno.env (local --env-file / hosted supabase secrets).
 // Never returns a Zoho token. Always scopes the invoice by the caller's company.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { checkEInvoiceReadiness, type EInvoiceFinding } from "./einvoice.ts";
 import { createClient, type SupabaseClient, type User } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import {
@@ -72,6 +73,8 @@ interface ApproveResult {
   error?: string;
   credits_applied?: { applied: number; ok: boolean; response?: unknown } | null;
   purchase_order?: { zoho_id: string; number: string; how: "input" | "po_number" } | null;
+  /** UAE e-invoice field readiness (sales invoices only) — informs, never issues. */
+  einvoice?: { findings: EInvoiceFinding[]; ready: boolean } | null;
   failed_checks?: Array<{ rule_name: string; notes: string | null }>;
   reconciliation?: Reconciliation;
   money?: { tax_id: string | null; tax_name: string | null; currency_id: string | null; notes: string[] };
@@ -287,6 +290,17 @@ async function withZohoRetry(
     result = await call(token);
   }
   return result;
+}
+
+/** Organisation detail (for the seller TRN), through the metered fetch. */
+async function zohoGetJsonForOrg(): Promise<Record<string, unknown>> {
+  return await withZohoRetry(async (accessToken) => {
+    const res = await zohoFetch(`${apiBase()}/organizations/${encodeURIComponent(orgId())}?organization_id=${encodeURIComponent(orgId())}`, {
+      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    });
+    const raw = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, raw };
+  }).then((r) => (r.raw ?? {}) as Record<string, unknown>);
 }
 
 async function zohoCreate(
@@ -671,6 +685,22 @@ Deno.serve(async (req) => {
     );
     const postAs: PostAs = input.post_as ?? "bill";
     let purchaseOrder: ApproveResult["purchase_order"] = null;
+    let einvoice: ApproveResult["einvoice"] = null;
+
+    // Period lock (item 10): nothing posts into a locked period through this
+    // app. Hard refusal — no override; unlock the period (audited) to change
+    // history. The document can still be posted DATED AFTER the lock.
+    {
+      const { data: lockRow } = await supabase.from("company_config").select("locked_until").eq("company_id", companyId).maybeSingle();
+      const lockedUntil = lockRow?.locked_until ? String(lockRow.locked_until) : null;
+      const docDate = (extracted.invoice_date as string | null) ?? null;
+      if (lockedUntil && docDate && docDate <= lockedUntil) {
+        return await fail(
+          `The books are locked through ${lockedUntil} — this document is dated ${docDate} and cannot be posted into a filed period. Unlock the period first, or post it dated after the lock.`,
+          { locked_until: lockedUntil, document_date: docDate },
+        );
+      }
+    }
 
     // Money: resolve VAT → tax_id and currency; reconcile lines vs total.
     const documentTotal = Number(extracted.total_amount ?? 0) || 0;
@@ -721,6 +751,28 @@ Deno.serve(async (req) => {
       if (!pos) {
         return await fail("Zoho needs a place of supply for this customer (UAE VAT). Set the emirate on the customer in Zoho Books and sync, or pass place_of_supply.");
       }
+      // UAE e-invoice field readiness (item 9): verify what the PINT AE
+      // e-invoice will need BEFORE the invoice exists in Zoho. Informs the
+      // reviewer; issuance stays with Zoho and the accredited provider —
+      // this tool never issues a sales invoice.
+      {
+        const { data: custRow } = await supabase.from("zoho_entities").select("name, extra").eq("kind", "customer").eq("zoho_id", customerId).maybeSingle();
+        const custExtra = (custRow?.extra as Record<string, unknown>) ?? {};
+        let sellerTrn: string | null = null;
+        try {
+          const orgRaw = await zohoGetJsonForOrg();
+          sellerTrn = (((orgRaw.organization as Record<string, unknown> | undefined)?.tax_settings ?? {}) as Record<string, unknown>).tax_reg_no as string | undefined || null;
+        } catch { /* reported as missing */ }
+        einvoice = checkEInvoiceReadiness({
+          seller_trn: sellerTrn,
+          buyer: { name: (custRow?.name as string | undefined) ?? null, trn: (custExtra.tax_reg_no as string | undefined) || null, tax_treatment: (custExtra.tax_treatment as string | undefined) || null },
+          place_of_supply: pos,
+          date: mapped.date ?? null,
+          currency: (extracted.currency as string | null) ?? "AED",
+          lines: mapped.line_items.map((li) => ({ description: li.description ?? null, tax_id: li.tax_id ?? null })),
+        });
+      }
+
       const created = await zohoCreate("invoices", {
         customer_id: customerId,
         date: mapped.date,
@@ -991,7 +1043,7 @@ Deno.serve(async (req) => {
     });
 
     return jsonResponse({
-      success: true, zoho_bill_id: zohoId ?? undefined, credits_applied: creditsApplied, purchase_order: purchaseOrder,
+      success: true, zoho_bill_id: zohoId ?? undefined, credits_applied: creditsApplied, purchase_order: purchaseOrder, einvoice,
       reconciliation: recon, money: { tax_id: money.taxId, tax_name: money.taxName, currency_id: money.currencyId, notes: money.notes }, attachment,
     });
   } catch (err) {
