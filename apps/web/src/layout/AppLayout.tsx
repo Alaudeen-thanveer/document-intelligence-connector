@@ -1,19 +1,11 @@
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import type { Session } from "@supabase/supabase-js";
 import { useEffect, useState } from "react";
+import { ModeToggle } from "../components/ModeToggle";
 import { useMonthEndAttention } from "../hooks/useMonthEndAttention";
+import { NAV, sectionFor } from "../nav";
 import { setActor } from "../lib/functions";
 import { supabase } from "../lib/supabase";
-import { useTheme } from "../theme/ThemeProvider";
-
-const SECTIONS: Record<string, string> = {
-  "/": "Documents",
-  "/month-end": "Month-end",
-  "/cash": "Cash",
-  "/connections": "Connections",
-  "/rules": "Rules",
-  "/api-usage": "API usage",
-};
 
 export interface AppOutletContext {
   reviewerName: string;
@@ -27,7 +19,7 @@ export function AppLayout({ session }: { session: Session }) {
   );
   const location = useLocation();
   const monthEndAttention = useMonthEndAttention();
-  const section = SECTIONS[location.pathname] ?? "Documents";
+  const section = sectionFor(location.pathname);
   const initials = reviewerName.trim().slice(0, 1).toUpperCase() || "R";
 
   useEffect(() => {
@@ -42,27 +34,19 @@ export function AppLayout({ session }: { session: Session }) {
         </div>
 
         <div className="rail-group">
-          <RailLink to="/" label="Documents" icon="▤" />
-          <RailLink
-            to="/month-end"
-            label={
-              monthEndAttention
-                ? "Month-end · needs attention"
-                : "Month-end"
-            }
-            icon="◔"
-            dot={monthEndAttention}
-          />
-        </div>
-
-        <div className="rail-divider" />
-
-        <div className="rail-group">
-          <RailLink to="/bank" label="Bank" icon="⌸" />
-          <RailLink to="/cash" label="Cash" icon="◈" />
-          <RailLink to="/connections" label="Connections" icon="⇄" />
-          <RailLink to="/rules" label="Rules" icon="§" />
-          <RailLink to="/api-usage" label="API usage" icon="▦" />
+          {NAV.map((item) => (
+            <RailLink
+              key={item.path}
+              to={item.path}
+              label={
+                item.path === "/month-end" && monthEndAttention
+                  ? "Month-end · needs attention"
+                  : item.label
+              }
+              icon={item.icon}
+              dot={item.path === "/month-end" && monthEndAttention}
+            />
+          ))}
         </div>
 
         <div className="rail-spacer" />
@@ -101,23 +85,6 @@ export function AppLayout({ session }: { session: Session }) {
         <Outlet context={{ reviewerName, session } satisfies AppOutletContext} />
       </div>
     </div>
-  );
-}
-
-function ModeToggle() {
-  const { theme, setTheme } = useTheme();
-  const isDark = theme === "ink";
-  return (
-    <button
-      type="button"
-      className={`mode-toggle${isDark ? " dark" : ""}`}
-      aria-pressed={isDark}
-      aria-label={isDark ? "Switch to light mode" : "Switch to dark mode"}
-      onClick={() => setTheme(isDark ? "chalk" : "ink")}
-    >
-      <span className="mode-toggle-switch" aria-hidden="true" />
-      <span>{isDark ? "Dark" : "Light"}</span>
-    </button>
   );
 }
 

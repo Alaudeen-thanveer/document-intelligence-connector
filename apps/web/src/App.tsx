@@ -9,16 +9,9 @@ import { MonthEndPage } from "./components/MonthEndPage";
 import { SignInPage } from "./components/SignInPage";
 import { AppLayout } from "./layout/AppLayout";
 import { supabase } from "./lib/supabase";
+import { LEGACY_HASH } from "./nav";
 import { DocumentsPage } from "./pages/DocumentsPage";
 import { RulesPage } from "./pages/RulesPage";
-
-const LEGACY_HASH: Record<string, string> = {
-  connections: "/connections",
-  "month-end": "/month-end",
-  "api-usage": "/api-usage",
-  rules: "/rules",
-  bank: "/bank",
-};
 
 export default function App() {
   const [session, setSession] = useState<Session | null | undefined>(undefined);
