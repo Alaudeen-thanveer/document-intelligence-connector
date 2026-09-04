@@ -132,9 +132,19 @@ function parseDraft(
 interface EditState {
   id: string;
   field: EditableField;
+  /**
+   * What the cell held when the editor opened. Two things depend on it:
+   * "did the reviewer change anything" must be asked against this, not
+   * against the row's value now — the row can change underneath — and if the
+   * row HAS changed underneath, the save must be refused rather than putting
+   * a stale number back.
+   */
+  original: string;
   draft: string;
   saving: boolean;
   error: string | null;
+  /** Identifies this editor, so a save that lands late cannot close a later one. */
+  token: number;
 }
 
 interface Props {
@@ -168,6 +178,7 @@ export function DocumentGrid({
   const [stage, setStage] = useState<Stage>("prepare");
   const [query, setQuery] = useState("");
   const [edit, setEdit] = useState<EditState | null>(null);
+  const editToken = useRef(0);
   const [readyBusy, setReadyBusy] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const noteTimer = useRef<number | null>(null);
@@ -229,21 +240,39 @@ export function DocumentGrid({
 
   function openEditor(row: DocumentRow, field: EditableField) {
     if (!row.extracted_fields_id) return;
+    const opened = draftOf(row, field);
     setEdit({
       id: row.id,
       field,
-      draft: draftOf(row, field),
+      original: opened,
+      draft: opened,
       saving: false,
       error: null,
+      token: ++editToken.current,
     });
   }
 
   async function commit(row: DocumentRow) {
     if (!edit || edit.saving) return;
-    const { field, draft } = edit;
+    const { field, draft, original, token } = edit;
 
-    if (draft === draftOf(row, field)) {
-      setEdit(null);
+    /** Only touch the editor if it is still the one this save belongs to. */
+    const ifStillMine = (next: EditState | null) =>
+      setEdit((cur) => (cur && cur.token !== token ? cur : next));
+
+    if (draft === original) {
+      ifStillMine(null);
+      return;
+    }
+
+    // The row moved under the editor — a re-extraction, or a colleague in
+    // another tab. Writing the draft now would put the older value back, and
+    // merely opening a cell and clicking away would be enough to do it.
+    if (draftOf(row, field) !== original) {
+      setEdit({
+        ...edit,
+        error: "This changed elsewhere while you had it open. Close and look again.",
+      });
       return;
     }
 
@@ -256,14 +285,11 @@ export function DocumentGrid({
     setEdit({ ...edit, saving: true, error: null });
     try {
       await onSaveField(row, field, parsed.value);
-      setEdit(null);
+      ifStillMine(null);
       say(`Saved the ${FIELD_LABEL[field]}.`);
     } catch (e) {
-      setEdit({
-        ...edit,
-        saving: false,
-        error: e instanceof Error ? e.message : "Could not save that.",
-      });
+      const why = e instanceof Error ? e.message : "Could not save that.";
+      ifStillMine({ ...edit, saving: false, error: why });
     }
   }
 
@@ -430,7 +456,16 @@ export function DocumentGrid({
                     onClick={() => onOpen(d.id)}
                   >
                     <td className="dg-k-doc">
-                      <span className="dg-doc">
+                      {/* The row's onClick is for the mouse; this is the only
+                          way a keyboard reaches the document. */}
+                      <button
+                        type="button"
+                        className="dg-doc"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onOpen(d.id);
+                        }}
+                      >
                         <span className="dg-mark" aria-hidden="true">
                           {initials(party(d))}
                         </span>
@@ -441,7 +476,7 @@ export function DocumentGrid({
                             {d.doc_type ?? "untyped"}
                           </span>
                         </span>
-                      </span>
+                      </button>
                     </td>
                     {cell(d, "invoice_date", shortDate(d.invoice_date), "dg-k-date")}
                     {cell(

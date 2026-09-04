@@ -17,7 +17,19 @@ export function asLocalDate(value: string): Date {
   const m = BARE.exec(value);
   if (!m) return new Date(value);
   // Local midnight, so no zone shift can move the day.
-  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  // new Date(26, ...) means 1926: the two-argument-plus form maps years 0-99
+  // into the 1900s. A year like 0026 out of a bad read would then print as
+  // "26" beside every real 2026 date and look right.
+  d.setFullYear(Number(m[1]));
+  return d;
+}
+
+/** Today, in the reader's own calendar — never the UTC day. */
+export function todayLocalISO(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
 /** "19 Aug 26" — a calendar date, never shifted by the reader's zone. */

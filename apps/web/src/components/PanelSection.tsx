@@ -31,14 +31,17 @@ function readOpenMap(): OpenMap {
   }
 }
 
-function writeOpen(id: string, open: boolean): void {
+/** True if the habit was actually recorded. */
+function writeOpen(id: string, open: boolean): boolean {
   try {
     localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({ ...readOpenMap(), [id]: open }),
     );
+    return true;
   } catch {
     /* the habit is a convenience; never let it break the panel */
+    return false;
   }
 }
 
@@ -82,8 +85,11 @@ export function PanelSection({
   function toggle() {
     const next = !open;
     setOpen(next);
-    writeOpen(id, next);
-    window.dispatchEvent(new Event(CHANGED));
+    // Only tell the others if the write landed. Where storage is refused — a
+    // private window, site data blocked — announcing it made every listener
+    // re-read the OLD value and set it straight back, so no band could be
+    // collapsed at all.
+    if (writeOpen(id, next)) window.dispatchEvent(new Event(CHANGED));
   }
 
   return (

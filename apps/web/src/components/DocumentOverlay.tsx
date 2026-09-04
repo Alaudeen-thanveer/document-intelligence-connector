@@ -65,6 +65,20 @@ export function DocumentOverlay({
     return () => document.removeEventListener("keydown", onKey);
   }, [open, onClose, onStep]);
 
+  /**
+   * The overlay covers the grid but did not disable it: Tab walked straight
+   * through the scrim into the rows behind, and Space on a Ready tick the
+   * reviewer could not see wrote ready_at. The app root goes inert while the
+   * overlay is up — the overlay itself is portalled to <body>, outside it.
+   */
+  useEffect(() => {
+    if (!open) return;
+    const root = document.getElementById("root");
+    if (!root) return;
+    root.setAttribute("inert", "");
+    return () => root.removeAttribute("inert");
+  }, [open]);
+
   return createPortal(
     <>
       <div
@@ -79,40 +93,52 @@ export function DocumentOverlay({
         inert={!open || undefined}
       >
         <div className="dgov-page">
-          <div className="dgov-page-top">
-            <button
-              type="button"
-              className="btn btn-small ghost"
-              onClick={() => setPageHidden((v) => !v)}
-            >
-              {pageHidden ? "Show the page" : "Hide the page"}
-            </button>
-          </div>
           <DocumentViewer fileUrl={fileUrl} hidden={pageHidden} />
         </div>
 
         <div className="dgov-detail">
           <header className="dgov-head">
+            {/* Chevrons, not words: three buttons and a vendor name do not fit
+                in 468px, and the name is the identifying fact on this header.
+                The arrow keys do the same job and the labels say so. */}
             <button
               type="button"
-              className="btn btn-small ghost"
+              className="btn btn-small ghost dgov-step"
               onClick={() => onStep(-1)}
               disabled={!hasPrev}
+              aria-label="Previous document (left arrow)"
+              title="Previous document (left arrow)"
             >
-              Prev
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M12.5 4l-5 6 5 6" />
+              </svg>
             </button>
             <button
               type="button"
-              className="btn btn-small ghost"
+              className="btn btn-small ghost dgov-step"
               onClick={() => onStep(1)}
               disabled={!hasNext}
+              aria-label="Next document (right arrow)"
+              title="Next document (right arrow)"
             >
-              Next
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M7.5 4l5 6-5 6" />
+              </svg>
             </button>
             <span className="dgov-title">
-              <span className="dgov-1">{title}</span>
+              <span className="dgov-1" title={title}>{title}</span>
               {subtitle ? <span className="dgov-2">{subtitle}</span> : null}
             </span>
+            {/* This lives in the detail header, not in the pane it hides:
+                inside, hiding the pane took the only way back with it. */}
+            <button
+              type="button"
+              className="btn btn-small ghost dgov-pagetoggle"
+              aria-pressed={pageHidden}
+              onClick={() => setPageHidden((v) => !v)}
+            >
+              {pageHidden ? "Show the page" : "Hide the page"}
+            </button>
             <button
               type="button"
               className="dgov-x"

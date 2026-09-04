@@ -1719,10 +1719,25 @@ a {
   z-index: 6;
 }
 
+/* A real button, because the row's onClick is mouse-only and this is the
+   keyboard's way into a document. It must not look like a button. */
 .dg-doc {
   display: flex;
   align-items: center;
   gap: 10px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.dg-doc:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 8px;
 }
 .dg-mark {
   width: 32px;
@@ -1885,6 +1900,38 @@ a {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  /* The document's name matters more than the buttons around it, so it takes
+     the slack rather than being squeezed by them. */
+  flex: 1 1 auto;
+}
+/* Three buttons and a name in 468px: the buttons hold their line and the
+   name gives way, rather than the header growing to two rows. */
+.dgov-head .btn {
+  white-space: nowrap;
+  flex: none;
+  padding-left: 10px;
+  padding-right: 10px;
+}
+.dgov-step {
+  width: 30px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
+.dgov-step svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.dgov-1,
+.dgov-2 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .dgov-1 {
   font-size: 15px;

@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from "react";
 import { callEdgeFunction } from "../lib/functions";
+import { todayLocalISO } from "../lib/dates";
 import { PanelSection } from "./PanelSection";
 import { supabase } from "../lib/supabase";
 import { entityAccountType, findByName } from "../lib/zoho";
@@ -172,7 +173,12 @@ export function ReviewPanel({
     setPaidThroughId("");
     setPartyRule(null);
     setAccountTouched(false);
-  }, [extracted, document?.id]);
+    // Keyed on the extraction's IDENTITY, not the object. useDocumentDetail
+    // builds a fresh object on every refetch, and DocumentsPage refetches on
+    // any judgment_results event for ANY document in the company — so this
+    // used to wipe the reviewer's typed corrections while they were still
+    // typing, with no message, and Approve then wrote back the stored values.
+  }, [extracted?.id, document?.id]);
 
   // Per-party default account rule (vendor for bills/expenses, customer for
   // invoices): prefill the account when the party is chosen, unless the
@@ -690,9 +696,11 @@ export function ReviewPanel({
     setBusy("approve");
     setActionMsg(null);
     const name = reviewerName.trim() || "reviewer";
-    // Zoho bill mapping requires a date; default to today when OCR left it blank.
-    const dateForPush =
-      invoiceDate.trim() || new Date().toISOString().slice(0, 10);
+    // Zoho bill mapping requires a date; default to today when OCR left it
+    // blank. toISOString() is the UTC day, which for part of every day is the
+    // wrong calendar date for the reviewer — and at a month boundary that is
+    // the wrong VAT period.
+    const dateForPush = invoiceDate.trim() || todayLocalISO();
 
     // Persist form values before push — zoho-push reads DB, not the UI inputs.
     const saveError = await saveExtractedEdits({ invoice_date: dateForPush });

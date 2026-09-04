@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useOutletContext } from "react-router-dom";
 import { DocumentGrid } from "../components/DocumentGrid";
 import type { EditableField } from "../components/DocumentGrid";
@@ -122,10 +122,26 @@ export function DocumentsPage() {
   }
 
   // Prev/Next walks the queue the user is looking at, not every document.
+  //
+  // The document can leave that queue while it is open — approving it moves it
+  // to Posted, ticking it ready moves it to Ready to post — and then its index
+  // is -1 and both buttons go dead, stranding the reviewer mid-pile. So the
+  // last place it held is remembered, and stepping continues from there.
   const at = selectedId ? visibleIds.indexOf(selectedId) : -1;
+  const lastAt = useRef(0);
+  if (at >= 0) lastAt.current = at;
+  const from = at >= 0 ? at : Math.min(lastAt.current, visibleIds.length - 1);
+  const canPrev = visibleIds.length > 0 && (at > 0 || (at < 0 && from >= 0));
+  const canNext =
+    visibleIds.length > 0 &&
+    (at >= 0 ? at < visibleIds.length - 1 : from < visibleIds.length);
+
   function step(delta: number) {
-    if (at < 0) return;
-    const to = at + delta;
+    if (visibleIds.length === 0) return;
+    // When the open document has left the list, the row that slid into its
+    // place is the natural "next", so stepping forward stays put and
+    // stepping back goes to the one before.
+    const to = at >= 0 ? at + delta : delta > 0 ? from : from - 1;
     if (to < 0 || to >= visibleIds.length) return;
     setSelectedId(visibleIds[to]);
   }
@@ -187,8 +203,8 @@ export function DocumentsPage() {
         }
         fileUrl={selected?.file_url}
         state={state}
-        hasPrev={at > 0}
-        hasNext={at >= 0 && at < visibleIds.length - 1}
+        hasPrev={canPrev}
+        hasNext={canNext}
         onStep={step}
         onClose={() => setSelectedId(null)}
       >

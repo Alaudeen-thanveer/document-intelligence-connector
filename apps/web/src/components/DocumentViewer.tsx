@@ -36,14 +36,18 @@ export function DocumentViewer({
   const [error, setError] = useState<string | null>(null);
   const [zoom, setZoom] = useState(100);
   const signedAt = useRef(0);
-  const signing = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
+    // Per-run, NOT a component-level ref. A component-level guard meant that
+    // switching documents while a signature was in flight made the new run
+    // bail, the old run return on its own cancelled flag, and the pane sit on
+    // "Opening the page…" for ever. StrictMode reproduced it every time.
+    let inFlight = false;
 
     async function sign() {
-      if (signing.current) return;
-      signing.current = true;
+      if (inFlight) return;
+      inFlight = true;
       try {
         setError(null);
         if (!fileUrl) {
@@ -73,7 +77,7 @@ export function DocumentViewer({
         signedAt.current = Date.now();
         setUrl(data.signedUrl);
       } finally {
-        signing.current = false;
+        inFlight = false;
       }
     }
 
