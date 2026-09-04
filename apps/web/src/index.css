@@ -267,15 +267,23 @@ a {
 }
 
 .status-pill {
-  display: inline-flex;
-  align-items: center;
-  padding: 3px 8px;
+  /* inline-block, not inline-flex, so ::first-letter applies — a flex
+     container is not a block container and the pseudo-element is ignored. */
+  display: inline-block;
+  padding: 3px 9px;
   border-radius: 999px;
   font-size: 0.7rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  font-weight: 600;
+  letter-spacing: 0.01em;
   background: var(--bg-panel-2);
   color: var(--text-dim);
+  /* Was uppercase, which shouted NEEDS_REVIEW at every row. Lowercasing in
+     CSS is not an option — "in Zoho" would become "in zoho" — so the text
+     is written as it should read and only the first letter is raised. */
+  text-transform: none;
+}
+.status-pill::first-letter {
+  text-transform: uppercase;
 }
 
 .status-needs_review,
@@ -1587,11 +1595,11 @@ a {
   scrollbar-width: none;
   flex: none;
 }
-/* Pushes the page's own controls to the right of the stage row, which is
-   where the upload button now lives — the band above it said the page's name
-   back to the reader and explained a button that explains itself. */
+/* Separates the tabs from the search and the upload button, which share the
+   stage row — the two bands above it said the page's name back to the reader
+   and explained a button that explains itself. */
 .dg-stages-sp {
-  margin-left: auto;
+  flex: 0 0 18px;
 }
 .dg-stages > .btn {
   align-self: center;
@@ -1644,13 +1652,7 @@ a {
   color: var(--danger);
 }
 
-.dg-tools {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 12px 18px;
-  flex: none;
-}
+/* The search sits with the tabs now; this row is gone. */
 .dg-tools-sp {
   margin-left: auto;
 }
@@ -1661,9 +1663,14 @@ a {
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: 12px;
-  padding: 7px 12px;
+  padding: 6px 12px;
   color: var(--text-faint);
-  min-width: 280px;
+  /* Takes what the tabs and the button leave, rather than a fixed width that
+     would push one of them off the line. */
+  flex: 1 1 220px;
+  min-width: 160px;
+  max-width: 420px;
+  margin-bottom: 12px;
 }
 .dg-seek svg {
   width: 15px;
@@ -1709,7 +1716,7 @@ a {
   top: 0;
   z-index: 5;
   background: var(--bg-panel-2);
-  text-align: left;
+  text-align: center;
   white-space: nowrap;
   font-size: 10px;
   letter-spacing: 0.09em;
@@ -1725,6 +1732,15 @@ a {
   vertical-align: middle;
   white-space: nowrap;
   background: var(--bg-panel);
+  /* Under the header, which is centred. The two exceptions below are the
+     ones where centring would cost the reader something: a column of money
+     has to line up on its decimal point, and the document's name is what
+     the eye runs down the left edge to find. */
+  text-align: center;
+}
+/* A stacked cell is a flex column, so text-align cannot reach it. */
+.dg-table td .dg-two {
+  align-items: center;
 }
 .dg-table tbody tr {
   cursor: pointer;
@@ -1739,6 +1755,10 @@ a {
 .dg-table th.n {
   text-align: right;
   font-variant-numeric: tabular-nums;
+}
+.dg-table td.dg-k-doc,
+.dg-table th.dg-k-doc {
+  text-align: left;
 }
 
 /* the two edges that never scroll away */

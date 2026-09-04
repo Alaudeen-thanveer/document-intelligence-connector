@@ -411,15 +411,7 @@ export function DocumentGrid({
             <span className="dg-n">{counts[s.key]}</span>
           </button>
         ))}
-        {actions ? (
-          <>
-            <span className="dg-stages-sp" />
-            {actions}
-          </>
-        ) : null}
-      </nav>
-
-      <div className="dg-tools">
+        <span className="dg-stages-sp" />
         <label className="dg-seek">
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <circle cx="9" cy="9" r="5.5" />
@@ -432,8 +424,8 @@ export function DocumentGrid({
             placeholder="Search by vendor, bill number or PO"
           />
         </label>
-        <span className="dg-tools-sp" />
-      </div>
+        {actions}
+      </nav>
 
       <div className="dg-card">
         <div className="dg-wrap">
@@ -527,7 +519,11 @@ export function DocumentGrid({
                     <td className={flagged ? "dg-bad" : undefined}>{checks}</td>
                     <td>
                       <span className={`status-pill status-${d.status}`}>
-                        {d.status}
+                        {/* The column stores what the pipeline did as
+                            snake_case text; the underscores are storage, not
+                            language. The capital comes from the stylesheet,
+                            so every pill in the app reads the same way. */}
+                        {d.status.replace(/_/g, " ")}
                       </span>
                     </td>
                     <td>
