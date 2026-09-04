@@ -87,6 +87,8 @@ async function loadContext(
     .from("extracted_fields")
     .select("id, vendor_raw, total_amount, invoice_date, po_number, tax_amount")
     .eq("document_id", documentId)
+    // the current extraction: newest first, id only as the tiebreak
+    .order("created_at", { ascending: false })
     .order("id", { ascending: false })
     .limit(1)
     .maybeSingle();

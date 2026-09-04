@@ -1,5 +1,11 @@
+/**
+ * A row of public.documents_grid: the document, its current extraction and
+ * its check tally. Everything the old DocumentRow had is still here, so the
+ * list and the review panel keep working while the grid is built.
+ */
 export interface DocumentRow {
   id: string;
+  company_id?: string;
   source: string;
   file_url: string;
   status: string;
@@ -7,6 +13,28 @@ export interface DocumentRow {
   doc_type: string | null;
   confidence: number | null;
   zoho_bill_id?: string | null;
+  has_supporting_document?: boolean;
+
+  /** The human signal, kept apart from the pipeline's status. */
+  ready_at?: string | null;
+  ready_by?: string | null;
+
+  /** From the current extracted_fields row; null when nothing was read yet. */
+  extracted_fields_id?: string | null;
+  vendor_raw?: string | null;
+  customer_raw?: string | null;
+  invoice_number?: string | null;
+  invoice_date?: string | null;
+  due_date?: string | null;
+  total_amount?: number | string | null;
+  tax_amount?: number | string | null;
+  currency?: string | null;
+  po_number?: string | null;
+  ai_fallback_used?: boolean | null;
+
+  /** Judgment tally, so the grid can show 5 of 6 without a second query. */
+  checks_total?: number;
+  checks_passed?: number;
 }
 
 export interface ExtractedFieldsRow {

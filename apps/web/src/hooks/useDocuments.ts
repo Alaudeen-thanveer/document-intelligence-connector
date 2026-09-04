@@ -13,8 +13,13 @@ export function useDocuments() {
     async function load() {
       setLoading(true);
       const { data, error: queryError } = await supabase
-        .from("documents")
-        .select("id, source, file_url, status, uploaded_at, doc_type, confidence, zoho_bill_id")
+        // documents_grid is documents + its current extraction + its check
+        // tally. Realtime below stays on the base table: Postgres emits no
+        // postgres_changes for a view.
+        .from("documents_grid")
+        .select(
+          "id, company_id, source, file_url, status, uploaded_at, doc_type, confidence, zoho_bill_id, has_supporting_document, ready_at, ready_by, extracted_fields_id, vendor_raw, customer_raw, invoice_number, invoice_date, due_date, total_amount, tax_amount, currency, po_number, ai_fallback_used, checks_total, checks_passed",
+        )
         .order("uploaded_at", { ascending: false });
 
       if (cancelled) return;
@@ -35,6 +40,13 @@ export function useDocuments() {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "documents" },
+        () => {
+          void load();
+        },
+      )
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "extracted_fields" },
         () => {
           void load();
         },
