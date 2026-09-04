@@ -8,7 +8,7 @@
 @font-face{font-family:'Zoho Puvi';font-style:normal;font-weight:700;font-display:swap;src:url('/fonts/Puvi-Bold.woff2') format('woff2')}
 
 :root {
-  --shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow: 0 1px 2px rgba(12, 20, 16, 0.05);
   --radius: 14px;
   --radius-sm: 9px;
   font-family: "Zoho Puvi", system-ui, "Segoe UI", Roboto, sans-serif;
@@ -47,17 +47,6 @@ a {
   color: var(--accent);
 }
 
-button.linkish {
-  border: 0;
-  background: none;
-  padding: 0;
-  color: var(--accent);
-  font: inherit;
-  cursor: pointer;
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-
 .app-shell {
   position: relative;
   min-height: 100vh;
@@ -74,14 +63,6 @@ button.linkish {
   z-index: -1;
 }
 
-.topbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: end;
-  gap: 24px;
-  margin-bottom: 28px;
-}
-
 .brand {
   margin: 0 0 4px;
   font-family: "Zoho Puvi", system-ui, "Segoe UI", Roboto, sans-serif;
@@ -92,23 +73,16 @@ button.linkish {
   line-height: 1.15;
 }
 
-.topbar h1 {
-  margin: 0;
-  font-size: 1rem;
-  font-weight: 500;
-  color: var(--muted);
-}
-
 .reviewer-field {
   display: grid;
   gap: 6px;
   font-size: 0.8rem;
-  color: var(--muted);
+  color: var(--text-dim);
 }
 
 .reviewer-field input,
 .form-grid input {
-  border: 1px solid var(--line);
+  border: 1px solid var(--border);
   background: var(--bg-input);
   color: var(--text);
   border-radius: 12px;
@@ -125,16 +99,6 @@ button.linkish {
   min-width: 0;
 }
 
-.layout {
-  display: grid;
-  grid-template-columns: minmax(280px, 360px) 1fr;
-  gap: 20px;
-  align-items: start;
-  flex: 1;
-  min-height: 0;
-}
-
-.list-pane,
 .panel,
 .card {
   background: var(--bg-panel);
@@ -178,7 +142,6 @@ button.linkish {
   border-radius: 999px;
 }
 
-.badge-live,
 .badge-ok {
   background: var(--accent-soft);
   color: var(--accent);
@@ -207,46 +170,6 @@ button.linkish {
   margin-top: 7px;
   font-size: 12.5px;
   color: var(--text-dim);
-}
-
-.list-pane {
-  display: flex;
-  flex-direction: column;
-  padding: 18px;
-  /* Keep left list viewport-bound so cards scroll inside the pane */
-  height: calc(100dvh - 140px);
-  max-height: calc(100dvh - 140px);
-  min-height: 320px;
-  overflow: hidden;
-  position: sticky;
-  top: 16px;
-}
-
-.doc-list-scroll {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  padding-right: 4px;
-  scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--accent) 45%, transparent) transparent;
-}
-
-.doc-list-scroll::-webkit-scrollbar {
-  width: 5px;
-}
-
-.doc-list-scroll::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.doc-list-scroll::-webkit-scrollbar-thumb {
-  background: color-mix(in srgb, var(--accent) 40%, transparent);
-  border-radius: 999px;
-}
-
-.doc-list-scroll::-webkit-scrollbar-thumb:hover {
-  background: color-mix(in srgb, var(--accent) 65%, transparent);
 }
 
 .pane-heading,
@@ -320,7 +243,7 @@ button.linkish {
 .upload-hint {
   margin: 4px 0 0;
   font-size: 0.78rem;
-  color: var(--muted);
+  color: var(--text-dim);
 }
 
 .upload-btn {
@@ -333,67 +256,6 @@ button.linkish {
   font-size: 0.85rem;
 }
 
-.doc-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 10px;
-}
-
-.doc-row {
-  width: 100%;
-  text-align: left;
-  border: 1px solid transparent;
-  background: var(--bg-panel-2);
-  color: inherit;
-  border-radius: 14px;
-  padding: 12px 14px;
-  cursor: pointer;
-  transition: border-color 160ms ease, transform 160ms ease, background 160ms ease;
-}
-
-.doc-row:hover {
-  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
-  transform: translateY(-1px);
-}
-
-.doc-row.selected {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-}
-
-.doc-row.flagged {
-  border-left: 3px solid var(--flag);
-}
-
-.doc-row-top,
-.doc-row-meta {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  align-items: center;
-}
-
-.doc-row-meta {
-  margin-top: 8px;
-  color: var(--muted);
-  font-size: 0.78rem;
-}
-
-.doc-id {
-  font-family: ui-monospace, "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
-  font-size: 0.85rem;
-}
-
-.flag-hint {
-  display: inline-block;
-  margin-top: 8px;
-  color: var(--warn);
-  font-size: 0.75rem;
-  font-weight: 600;
-}
-
 .status-pill {
   display: inline-flex;
   align-items: center;
@@ -403,7 +265,7 @@ button.linkish {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   background: var(--bg-panel-2);
-  color: var(--muted);
+  color: var(--text-dim);
 }
 
 .status-needs_review,
@@ -432,38 +294,14 @@ button.linkish {
 
 .eyebrow {
   margin: 0 0 4px;
-  color: var(--muted);
+  color: var(--text-dim);
   font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.08em;
 }
 
-.meta-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-  margin: 0 0 22px;
-}
-
-.meta-grid dt {
-  color: var(--muted);
-  font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-}
-
-.meta-grid dd {
-  margin: 4px 0 0;
-}
-
-.truncate {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .section {
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--border);
   padding-top: 16px;
   margin-top: 8px;
   margin-bottom: 18px;
@@ -487,7 +325,7 @@ button.linkish {
 }
 
 .rule-list span {
-  color: var(--muted);
+  color: var(--text-dim);
   font-size: 0.9rem;
 }
 
@@ -513,11 +351,11 @@ button.linkish {
   display: grid;
   gap: 6px;
   font-size: 0.8rem;
-  color: var(--muted);
+  color: var(--text-dim);
 }
 
 .form-grid select {
-  border: 1px solid var(--line);
+  border: 1px solid var(--border);
   background: var(--bg-input);
   color: var(--text);
   border-radius: 12px;
@@ -558,12 +396,12 @@ button.linkish {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--border);
   border-radius: 999px;
   padding: 6px 14px;
   cursor: pointer;
   font-size: 0.85rem;
-  color: var(--muted);
+  color: var(--text-dim);
 }
 
 .radio-pill.active {
@@ -573,12 +411,6 @@ button.linkish {
 
 .radio-pill input {
   accent-color: var(--accent);
-}
-
-.topbar-actions {
-  display: flex;
-  align-items: end;
-  gap: 14px;
 }
 
 .modal-overlay {
@@ -605,9 +437,9 @@ button.linkish {
 }
 
 .tab-btn {
-  border: 1px solid var(--line);
+  border: 1px solid var(--border);
   background: transparent;
-  color: var(--muted);
+  color: var(--text-dim);
   border-radius: 999px;
   padding: 6px 18px;
   font: inherit;
@@ -637,7 +469,7 @@ button.linkish {
 .rules-item select {
   flex: 1;
   min-width: 0;
-  border: 1px solid var(--line);
+  border: 1px solid var(--border);
   background: var(--bg-input);
   color: var(--text);
   border-radius: 12px;
@@ -674,16 +506,14 @@ button.linkish {
   font-size: 0.78rem;
 }
 
-.actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  justify-content: flex-end;
-  margin-top: 8px;
-}
-
 .btn {
-  border: 1px solid transparent;
+  /* A button with no ground and no outline is a label. The quiet surface is
+     the default; .primary and .danger override it. The outline is mixed
+     toward the text rather than using --border-soft, which sits at 1.1:1 on
+     this ground and cannot be seen. */
+  border: 1px solid color-mix(in srgb, var(--text) 48%, var(--bg-panel));
+  background: var(--bg-input);
+  color: var(--text);
   border-radius: 10px;
   padding: 9px 16px;
   font: inherit;
@@ -691,6 +521,11 @@ button.linkish {
   font-weight: 700;
   cursor: pointer;
   transition: transform 140ms ease, opacity 140ms ease, background 140ms ease;
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .btn:disabled {
@@ -704,12 +539,14 @@ button.linkish {
 
 .btn.primary {
   background: var(--accent);
+  border-color: var(--accent);
   color: var(--on-accent);
 }
 
+/* Ghost is now what the base already is; kept so the 34 call sites that
+   say "ghost" keep saying what they mean. */
 .btn.ghost {
   background: var(--bg-input);
-  border-color: var(--border-soft);
   color: var(--text);
 }
 
@@ -720,7 +557,7 @@ button.linkish {
 }
 
 .muted {
-  color: var(--muted);
+  color: var(--text-dim);
 }
 
 .error-text {
@@ -732,15 +569,8 @@ button.linkish {
   color: var(--accent);
 }
 
-.empty-state,
 .empty-panel {
-  color: var(--muted);
-}
-
-.empty-state span {
-  display: block;
-  margin-top: 6px;
-  font-size: 0.85rem;
+  color: var(--text-dim);
 }
 
 /* Suggested rules (learned from history) */
@@ -758,7 +588,7 @@ button.linkish {
   flex-direction: column;
   gap: 6px;
   padding: 10px 0;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--border);
 }
 
 .suggested-item:last-child { border-bottom: none; }
@@ -776,7 +606,7 @@ button.linkish {
 
 .suggested-evidence {
   padding: 8px 12px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--border);
   border-radius: calc(var(--radius) - 8px);
   font-size: 0.85rem;
 }
@@ -787,7 +617,7 @@ button.linkish {
   justify-content: space-between;
   gap: 12px;
   padding: 4px 0 4px 12px;
-  border-left: 2px solid var(--line);
+  border-left: 2px solid var(--border);
   font-size: 0.9rem;
 }
 
@@ -796,7 +626,7 @@ button.linkish {
 .suggested-evidence td.num {
   text-align: right;
   font-variant-numeric: tabular-nums;
-  color: var(--muted);
+  color: var(--text-dim);
 }
 
 /* Review line items. Seven columns across needed 452px of track before the
@@ -863,7 +693,7 @@ button.linkish {
 
 .li-amount {
   text-align: right;
-  color: var(--muted);
+  color: var(--text-dim);
   font-variant-numeric: tabular-nums;
 }
 
@@ -878,17 +708,17 @@ button.linkish {
 
 /* API usage page */
 .usage-meters { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 6px 0 10px; }
-.usage-meter { border: 1px solid var(--line); border-radius: calc(var(--radius) - 6px); padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+.usage-meter { border: 1px solid var(--border); border-radius: calc(var(--radius) - 6px); padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
 .usage-meter-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
-.usage-meter-head span:first-child { font-size: .72rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.usage-meter-head span:first-child { font-size: .72rem; letter-spacing: .1em; text-transform: uppercase; color: var(--text-dim); }
 .usage-meter-head strong { font-size: 1.25rem; font-variant-numeric: tabular-nums; }
 .usage-bar { height: 8px; border-radius: 999px; background: var(--bg-panel-2); overflow: hidden; }
 .usage-bar i { display: block; height: 100%; background: var(--accent); border-radius: 999px; transition: width .3s ease; }
 .usage-meter.usage-warn .usage-bar i { background: var(--warn); }
 .usage-meter.usage-crit .usage-bar i { background: var(--danger); }
 .usage-table { width: 100%; border-collapse: collapse; font-size: .88rem; }
-.usage-table th, .usage-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; }
-.usage-table th { font-size: .72rem; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+.usage-table th, .usage-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; }
+.usage-table th { font-size: .72rem; letter-spacing: .09em; text-transform: uppercase; color: var(--text-dim); }
 .usage-table tr:last-child td { border-bottom: none; }
 .usage-table .num { text-align: right; font-variant-numeric: tabular-nums; }
 .usage-two { display: grid; grid-template-columns: 1.3fr 1fr; gap: 12px; }
@@ -899,9 +729,45 @@ button.linkish {
 .usage-day-bar i.hit { background: var(--warn); }
 .usage-day-bar b { position: absolute; top: -14px; left: 0; right: 0; text-align: center; font-size: .6rem; color: var(--danger); }
 .usage-day span { font-size: .78rem; }
-.usage-day small { font-size: .66rem; color: var(--muted); }
+.usage-day small { font-size: .66rem; color: var(--text-dim); }
 .active-chip { border-color: var(--accent) !important; color: var(--accent) !important; }
 @media (max-width: 900px) { .usage-two { grid-template-columns: 1fr; } }
+
+/* A wide table scrolls inside this, rather than shoving the document
+   sideways under the sticky app bar. .tablewrap was used in two components
+   and styled in none. */
+.tablewrap {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  max-width: 100%;
+}
+
+/* .data-table was likewise used and never styled. */
+.data-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 12.5px;
+}
+.data-table th {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+.data-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: top;
+}
+.data-table tr:last-child td {
+  border-bottom: 0;
+}
 
 /* Month-end page */
 .month-nav {
@@ -911,14 +777,6 @@ button.linkish {
 }
 
 /* Connections page */
-.view-nav {
-  display: flex;
-  gap: 6px;
-  padding: 4px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-}
-
 .connections-layout {
   display: flex;
   flex-direction: column;
@@ -983,7 +841,7 @@ button.linkish {
 
 .conn-kind-label {
   font-size: 0.85rem;
-  color: var(--muted);
+  color: var(--text-dim);
 }
 
 .conn-entity-list {
@@ -1002,47 +860,36 @@ button.linkish {
   justify-content: space-between;
   gap: 12px;
   padding: 8px 4px;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--border);
 }
 
 .conn-entity-list li:last-child {
   border-bottom: none;
 }
 
-.conn-entity-list span {
-  color: var(--muted);
+/* Excluded rather than out-specified: this rule is for the trailing detail
+   text, and a status pill in the same slot must keep its own colours. */
+.conn-entity-list span:not(.status-pill) {
+  color: var(--text-dim);
   font-size: 0.85rem;
   text-align: right;
 }
 
+/* Five of this block's six declarations described the old chrome, which is
+   gone, and the sixth forced .form-grid to one column by WINDOW width — but
+   that grid now lives in a ~420px overlay column whatever the window is
+   doing, and sizes itself by its container. All that is left is the gutter. */
 @media (max-width: 900px) {
-  .layout,
-  .form-grid,
-  .meta-grid {
-    grid-template-columns: 1fr;
+  .connections-layout,
+  .rules-page {
+    padding: 16px 14px 32px;
   }
+}
 
-  .connections-layout {
-    padding: 12px;
-  }
-
-  .topbar {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .layout {
-    overflow: visible;
-  }
-
-  .list-pane {
-    position: static;
-    height: auto;
-    max-height: min(50vh, 420px);
-  }
-
-  .doc-list-scroll {
-    max-height: 100%;
+@media (max-width: 560px) {
+  .connections-layout,
+  .rules-page {
+    padding: 14px 10px 28px;
   }
 }
 
@@ -1057,15 +904,15 @@ button.linkish {
   display: grid;
   gap: 0.35rem;
   font-size: 0.82rem;
-  color: var(--muted);
+  color: var(--text-dim);
 }
 .bank-intake select,
 .bank-intake textarea,
 .bank-intake input[type="file"] {
   font: inherit;
   color: var(--text);
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--line);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
   border-radius: 10px;
   padding: 0.5rem 0.65rem;
 }
@@ -1074,6 +921,26 @@ button.linkish {
   font-size: 0.78rem;
   resize: vertical;
 }
+/* The wrapper was styled but the browser's own button inside it never was,
+   so a grey Windows control sat in the middle of the form — and on the dark
+   theme it was the one light rectangle on the page. */
+.bank-intake input[type="file"]::file-selector-button {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  margin-right: 10px;
+  padding: 5px 11px;
+  border: 1px solid color-mix(in srgb, var(--text) 48%, var(--bg-panel));
+  border-radius: 8px;
+  background: var(--bg-panel);
+  color: var(--text);
+  cursor: pointer;
+}
+.bank-intake input[type="file"]::file-selector-button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .bank-paste { grid-column: 1 / -1; }
 .bank-intake-actions {
   grid-column: 1 / -1;
@@ -1096,24 +963,33 @@ button.linkish {
   text-align: left;
   font: inherit;
   color: var(--text);
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--line);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
   border-radius: 12px;
   padding: 0.5rem 0.8rem;
   cursor: pointer;
 }
-.bank-stmt-chip span { font-size: 0.74rem; color: var(--muted); }
-.bank-stmt-chip.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(61, 190, 160, 0.18); }
+.bank-stmt-chip span { font-size: 0.74rem; color: var(--text-dim); }
+.bank-stmt-chip.active { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent); }
+.bank-stmt-chip:focus-visible,
+.bank-x:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 
 .bank-lines td, .bank-lines th { vertical-align: top; }
 .bank-lines select {
   font: inherit;
   font-size: 0.8rem;
   color: var(--text);
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid var(--line);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 0.28rem 0.4rem;
+  /* width so it fills its cell instead of sizing to its longest option, and
+     min-width so it can still be squeezed when the table scrolls. */
+  width: 100%;
+  min-width: 8rem;
   max-width: 14rem;
 }
 .bank-desc { max-width: 22rem; font-size: 0.84rem; }
@@ -1124,12 +1000,20 @@ button.linkish {
 .bank-actions .btn + .btn { margin-left: 0.3rem; }
 .bank-apply { display: inline-flex; gap: 0.35rem; align-items: baseline; font-size: 0.8rem; }
 .bank-apply input { accent-color: var(--accent); }
-.bank-line.no-suggestion td { background: rgba(224, 163, 84, 0.06); }
-.bank-line.status-confirmed td { background: rgba(61, 190, 160, 0.06); }
-.bank-line.status-posted td { opacity: 0.72; }
-.bank-line.status-skipped td { opacity: 0.5; }
-.bank-line.status-failed td { background: rgba(224, 112, 112, 0.08); }
-.bank-src { font-size: 0.68rem; }
+.bank-line.no-suggestion td { background: var(--warn-soft); }
+.bank-line.status-confirmed td { background: var(--ok-soft); }
+/* Dimming by opacity took the text under AA; a settled line should read as
+   settled, not as unreadable. */
+.bank-line.status-posted td { background: var(--bg-panel-2); color: var(--text-dim); }
+.bank-line.status-skipped td { background: var(--bg-panel-2); color: var(--text-faint); }
+.bank-line.status-failed td { background: var(--danger-soft); }
+/* It rides on .status-pill for its shape, but it carries a sentence, not a
+   status word — so it must not inherit the pill's uppercasing. */
+.bank-src {
+  font-size: 0.68rem;
+  text-transform: none;
+  letter-spacing: 0;
+}
 .bank-src-open_document { color: var(--accent); }
 .bank-src-accepted_rule { color: var(--accent); }
 .bank-src-zoho_rule { color: var(--accent); }
@@ -1138,28 +1022,28 @@ button.linkish {
 @media (max-width: 800px) { .bank-intake { grid-template-columns: 1fr; } }
 
 /* Bank — phase 1: policies + allocation editor */
-.bank-policies .panel-header h2 { font-size: 0.86rem; font-weight: 500; color: var(--muted); }
+.bank-policies .panel-header h2 { font-size: 0.86rem; font-weight: 500; color: var(--text-dim); }
 .bank-policy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 0.8rem 1.2rem; margin-top: 0.6rem; }
 .bank-policy-grid label { display: grid; gap: 0.3rem; font-size: 0.8rem; color: var(--text); }
-.bank-policy-grid input { font: inherit; color: var(--text); background: rgba(255,255,255,0.05); border: 1px solid var(--line); border-radius: 8px; padding: 0.4rem 0.55rem; }
+.bank-policy-grid input { font: inherit; color: var(--text); background: var(--bg-input); border: 1px solid var(--border); border-radius: 8px; padding: 0.4rem 0.55rem; }
 .bank-policy-grid small { font-size: 0.72rem; line-height: 1.35; }
 .bank-policy-note { grid-column: 1 / -1; }
 .bank-alloc-cell { min-width: 17rem; }
 .bank-alloc { display: grid; gap: 0.3rem; font-size: 0.8rem; }
 .bank-alloc-row { display: grid; grid-template-columns: 1fr 6.5rem auto; gap: 0.4rem; align-items: center; }
-.bank-alloc-row input, .bank-alloc-opts input[type="number"] { font: inherit; font-size: 0.8rem; color: var(--text); background: rgba(255,255,255,0.05); border: 1px solid var(--line); border-radius: 6px; padding: 0.22rem 0.4rem; width: 6.5rem; text-align: right; }
-.bank-x { background: transparent; border: 0; color: var(--muted); cursor: pointer; font-size: 0.8rem; padding: 0 0.2rem; }
+.bank-alloc-row input, .bank-alloc-opts input[type="number"] { font: inherit; font-size: 0.8rem; color: var(--text); background: var(--bg-input); border: 1px solid var(--border); border-radius: 6px; padding: 0.22rem 0.4rem; width: 6.5rem; text-align: right; }
+.bank-x { background: transparent; border: 0; color: var(--text-dim); cursor: pointer; font-size: 0.8rem; padding: 0 0.2rem; }
 .bank-x:hover { color: var(--danger); }
 .bank-alloc-sum { font-size: 0.74rem; color: var(--text); }
 .bank-adv { color: var(--warn); }
 .bank-alloc-opts { display: flex; gap: 0.8rem; flex-wrap: wrap; align-items: center; }
-.bank-alloc-opts label { display: inline-flex; gap: 0.35rem; align-items: center; font-size: 0.76rem; color: var(--muted); }
+.bank-alloc-opts label { display: inline-flex; gap: 0.35rem; align-items: center; font-size: 0.76rem; color: var(--text-dim); }
 
 /* Review — unused credit prompt */
-.unused-credit { border: 1px solid var(--line); border-left: 3px solid var(--warn); border-radius: 10px; padding: 0.7rem 0.9rem; margin: 0 0 0.9rem; display: grid; gap: 0.4rem; background: rgba(224,163,84,0.06); }
+.unused-credit { border: 1px solid var(--border); border-left: 3px solid var(--warn); border-radius: 10px; padding: 0.7rem 0.9rem; margin: 0 0 0.9rem; display: grid; gap: 0.4rem; background: var(--warn-soft); }
 .unused-credit-head { margin: 0; font-size: 0.86rem; }
 .unused-credit-row { display: grid; grid-template-columns: auto 1fr 7rem auto; gap: 0.5rem; align-items: center; font-size: 0.8rem; }
-.unused-credit-row input[type="number"] { font: inherit; font-size: 0.8rem; color: var(--text); background: rgba(255,255,255,0.05); border: 1px solid var(--line); border-radius: 6px; padding: 0.22rem 0.4rem; text-align: right; }
+.unused-credit-row input[type="number"] { font: inherit; font-size: 0.8rem; color: var(--text); background: var(--bg-input); border: 1px solid var(--border); border-radius: 6px; padding: 0.22rem 0.4rem; text-align: right; }
 .unused-credit-row input[type="checkbox"] { accent-color: var(--accent); }
 .signin-wrap {
   max-width: 420px;
@@ -1177,8 +1061,8 @@ button.linkish {
   gap: 14px;
   margin-top: 22px;
   padding: 22px;
-  background: var(--panel);
-  border: 1px solid var(--line);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
 }
@@ -1189,7 +1073,7 @@ button.linkish {
 
 .session-email {
   font-size: 0.78rem;
-  color: var(--muted);
+  color: var(--text-dim);
   max-width: 22ch;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1585,14 +1469,13 @@ button.linkish {
   min-height: 0;
 }
 
-.app-content .layout {
-  flex: 1;
-  min-height: 0;
-}
-
-.app-content .list-pane {
-  height: calc(100dvh - 130px);
-  max-height: calc(100dvh - 130px);
+/* The rules editor is a modal reused as a page. Nothing framed it, so it sat
+   flush in the window's top-left while every other page is a centred column. */
+.rules-page {
+  width: 100%;
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 20px 28px 40px;
 }
 
 .rules-page .modal-overlay {
@@ -1606,23 +1489,20 @@ button.linkish {
 
 .rules-page .modal {
   width: 100%;
-  max-width: 720px;
+  /* The page frame is the width now; a 720px cap inside a 960px column just
+     left a ragged empty third. */
+  max-width: none;
   max-height: none;
 }
 
-@media (max-width: 640px) {
-  .app-content {
-    padding: 20px 16px 28px;
-  }
-}
 
 
 /* Review — server refusals the reviewer can answer */
-.override-box { border: 1px solid var(--line); border-left: 3px solid var(--danger); border-radius: 10px; padding: 0.75rem 0.95rem; margin-top: 0.7rem; display: grid; gap: 0.5rem; background: rgba(224,112,112,0.06); }
+.override-box { border: 1px solid var(--border); border-left: 3px solid var(--danger); border-radius: 10px; padding: 0.75rem 0.95rem; margin-top: 0.7rem; display: grid; gap: 0.5rem; background: var(--danger-soft); }
 .override-head { margin: 0; font-size: 0.86rem; }
-.override-list { margin: 0; padding-left: 1.1rem; font-size: 0.8rem; color: var(--muted); }
-.override-reason { display: grid; gap: 0.3rem; font-size: 0.8rem; color: var(--muted); }
-.override-reason input { font: inherit; color: var(--text); background: rgba(255,255,255,0.05); border: 1px solid var(--line); border-radius: 8px; padding: 0.45rem 0.6rem; }
+.override-list { margin: 0; padding-left: 1.1rem; font-size: 0.8rem; color: var(--text-dim); }
+.override-reason { display: grid; gap: 0.3rem; font-size: 0.8rem; color: var(--text-dim); }
+.override-reason input { font: inherit; color: var(--text); background: var(--bg-input); border: 1px solid var(--border); border-radius: 8px; padding: 0.45rem 0.6rem; }
 .override-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 
 
@@ -2149,6 +2029,8 @@ button.linkish {
   border-radius: 4px;
   box-shadow: 0 2px 6px rgba(12, 20, 16, 0.16),
     0 18px 46px rgba(12, 20, 16, 0.18);
+  /* The only colour literal in this file, and deliberate: it is the paper
+     behind a scanned page, so it stays white in the dark theme too. */
   background: #fff;
 }
 /* The viewer's actions are links, not buttons — they open a tab. Give an
@@ -2171,14 +2053,6 @@ a.btn {
 }
 .dv-sp {
   margin-left: auto;
-}
-/* A ghost button is bg-input with a soft border; on the overlay's own panel
-   grounds that hairline is all but invisible (1.15:1), so mix the border
-   toward the text colour until the control's edge actually reads. */
-.dv-bar .btn.ghost,
-.dgov-page-top .btn.ghost,
-.dgov-head .btn.ghost {
-  border-color: color-mix(in srgb, var(--text) 50%, var(--bg-panel));
 }
 .dv-bar input[type="range"] {
   width: 110px;

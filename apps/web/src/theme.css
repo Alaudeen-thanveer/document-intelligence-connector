@@ -34,12 +34,4 @@
   --rule: rgba(21, 26, 22, 0.09);
 
   /* Legacy names used by existing screens — follow the active theme. */
-  --bg-0: var(--bg);
-  --bg-1: var(--bg);
-  --panel: var(--bg-panel);
-  --panel-solid: var(--bg-panel);
-  --line: var(--border);
-  --muted: var(--text-dim);
-  --accent-deep: var(--accent-2);
-  --flag: var(--warn);
 }
