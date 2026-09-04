@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useOutletContext } from "react-router-dom";
 import { DocumentGrid } from "../components/DocumentGrid";
+import type { EditableField } from "../components/DocumentGrid";
 import { DocumentOverlay } from "../components/DocumentOverlay";
 import { ReviewPanel } from "../components/ReviewPanel";
 import { UploadInvoice } from "../components/UploadInvoice";
@@ -8,6 +9,7 @@ import { useDocumentDetail } from "../hooks/useDocumentDetail";
 import { useDocuments } from "../hooks/useDocuments";
 import type { AppOutletContext } from "../layout/AppLayout";
 import { supabase } from "../lib/supabase";
+import type { DocumentRow } from "../types";
 
 export function DocumentsPage() {
   const { reviewerName } = useOutletContext<AppOutletContext>();
@@ -73,6 +75,52 @@ export function DocumentsPage() {
     setTick((n) => n + 1);
   }
 
+  /**
+   * A cell edit corrects what was read off the page. That is a different act
+   * from deciding the document is right, so it writes the one field on the
+   * current extraction and stops: status stays where the pipeline put it, no
+   * check is re-run, and nothing is pushed to Zoho.
+   */
+  async function saveField(
+    row: DocumentRow,
+    field: EditableField,
+    value: string | number | null,
+  ) {
+    if (!row.extracted_fields_id) {
+      throw new Error("Nothing has been read off this document yet.");
+    }
+    const { error: updateError } = await supabase
+      .from("extracted_fields")
+      .update({ [field]: value })
+      .eq("id", row.extracted_fields_id);
+
+    if (updateError) throw new Error(updateError.message);
+
+    refresh();
+    if (row.id === selectedId) setTick((n) => n + 1);
+  }
+
+  /**
+   * The ready tick is the reviewer's own decision, kept apart from what the
+   * pipeline did. It writes ready_at and ready_by and nothing else.
+   */
+  async function toggleReady(row: DocumentRow) {
+    const patch = row.ready_at
+      ? { ready_at: null, ready_by: null }
+      : {
+          ready_at: new Date().toISOString(),
+          ready_by: reviewerName.trim() || "reviewer",
+        };
+
+    const { error: updateError } = await supabase
+      .from("documents")
+      .update(patch)
+      .eq("id", row.id);
+
+    if (updateError) throw new Error(updateError.message);
+    refresh();
+  }
+
   // Prev/Next walks the queue the user is looking at, not every document.
   const at = selectedId ? visibleIds.indexOf(selectedId) : -1;
   function step(delta: number) {
@@ -123,6 +171,8 @@ export function DocumentsPage() {
         selectedId={selectedId}
         onOpen={setSelectedId}
         onVisible={setVisibleIds}
+        onSaveField={saveField}
+        onToggleReady={toggleReady}
         failedJudgmentIds={failedJudgmentIds}
         loading={loading}
       />

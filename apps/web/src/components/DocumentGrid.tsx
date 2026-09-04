@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { shortDate, shortStamp } from "../lib/dates";
 import type { DocumentRow } from "../types";
 
 /**
@@ -7,8 +8,13 @@ import type { DocumentRow } from "../types";
  * pinned to the left and the ready tick stays pinned to the right, and the
  * grid scrolls rather than the window.
  *
- * Read-only for now. The cells become editable once the overlay has taken
- * over from the old review pane, so that no capability is lost in between.
+ * Four columns are editable in place. An edit here SAVES THAT FIELD AND
+ * NOTHING ELSE: it never touches documents.status, which belongs to the
+ * pipeline, and it never runs a check. Correcting what was read off the page
+ * is not the same act as deciding the document is right.
+ *
+ * The ready tick is the decision, and it is the reviewer's alone: it writes
+ * documents.ready_at and ready_by, and nothing else.
  *
  * Only columns backed by public.documents_grid are here. The mock also shows
  * GL account, tax code and memo, which need the per-line coding and the
@@ -16,6 +22,20 @@ import type { DocumentRow } from "../types";
  * leaving them out.
  */
 export type Stage = "prepare" | "ready" | "refused" | "posted";
+
+/** The fields a cell edit may write. Deliberately a closed set. */
+export type EditableField =
+  | "invoice_date"
+  | "total_amount"
+  | "tax_amount"
+  | "po_number";
+
+const FIELD_LABEL: Record<EditableField, string> = {
+  invoice_date: "date",
+  total_amount: "amount",
+  tax_amount: "VAT",
+  po_number: "purchase order",
+};
 
 export const STAGES: { key: Stage; label: string }[] = [
   { key: "prepare", label: "Prepare" },
@@ -47,27 +67,6 @@ function money(v: number | string | null | undefined): string {
   });
 }
 
-function day(iso: string | null | undefined): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleDateString("en-GB", {
-    day: "numeric",
-    month: "short",
-    year: "2-digit",
-  });
-}
-
-function when(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString("en-GB", {
-    day: "numeric",
-    month: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
 
 function party(d: DocumentRow): string {
   return d.vendor_raw || d.customer_raw || "Not read yet";
@@ -91,12 +90,67 @@ function postsAs(d: DocumentRow): string {
   return d.doc_type === "invoice" ? "Bill" : (d.doc_type ?? "—");
 }
 
+/** What goes into the editor when a cell is opened. */
+function draftOf(d: DocumentRow, field: EditableField): string {
+  const v = d[field];
+  if (v === null || v === undefined) return "";
+  return String(v);
+}
+
+/**
+ * What gets written. Blank clears the field; a number that is not a number is
+ * refused rather than silently stored as null, because "" and "not a number"
+ * mean very different things about a document.
+ */
+function parseDraft(
+  field: EditableField,
+  raw: string,
+): { ok: true; value: string | number | null } | { ok: false; why: string } {
+  const s = raw.trim();
+  if (s === "") return { ok: true, value: null };
+
+  if (field === "total_amount" || field === "tax_amount") {
+    const n = Number(s.replace(/,/g, ""));
+    if (!Number.isFinite(n)) return { ok: false, why: "That is not a number." };
+    if (n < 0) return { ok: false, why: "That cannot be negative." };
+    return { ok: true, value: n };
+  }
+
+  if (field === "invoice_date") {
+    // <input type="date"> already gives YYYY-MM-DD; guard a typed value.
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+      return { ok: false, why: "Use a date like 2026-08-19." };
+    }
+    const t = new Date(`${s}T00:00:00Z`);
+    if (Number.isNaN(t.getTime())) return { ok: false, why: "That is not a date." };
+    return { ok: true, value: s };
+  }
+
+  return { ok: true, value: s };
+}
+
+interface EditState {
+  id: string;
+  field: EditableField;
+  draft: string;
+  saving: boolean;
+  error: string | null;
+}
+
 interface Props {
   documents: DocumentRow[];
   selectedId: string | null;
   onOpen: (id: string) => void;
   /** The filtered, sorted queue, so Prev/Next steps what is on screen. */
   onVisible: (ids: string[]) => void;
+  /** Writes one field of the current extraction. Rejects with a message. */
+  onSaveField: (
+    row: DocumentRow,
+    field: EditableField,
+    value: string | number | null,
+  ) => Promise<void>;
+  /** Sets or clears the ready decision. Never touches status. */
+  onToggleReady: (row: DocumentRow) => Promise<void>;
   failedJudgmentIds: Set<string>;
   loading: boolean;
 }
@@ -106,11 +160,17 @@ export function DocumentGrid({
   selectedId,
   onOpen,
   onVisible,
+  onSaveField,
+  onToggleReady,
   failedJudgmentIds,
   loading,
 }: Props) {
   const [stage, setStage] = useState<Stage>("prepare");
   const [query, setQuery] = useState("");
+  const [edit, setEdit] = useState<EditState | null>(null);
+  const [readyBusy, setReadyBusy] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const noteTimer = useRef<number | null>(null);
 
   const counts = useMemo(() => {
     const c: Record<Stage, number> = {
@@ -142,6 +202,151 @@ export function DocumentGrid({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visibleKey]);
 
+  useEffect(() => {
+    return () => {
+      if (noteTimer.current) window.clearTimeout(noteTimer.current);
+    };
+  }, []);
+
+  function say(message: string) {
+    setNote(message);
+    if (noteTimer.current) window.clearTimeout(noteTimer.current);
+    noteTimer.current = window.setTimeout(() => setNote(null), 4000);
+  }
+
+  function openEditor(row: DocumentRow, field: EditableField) {
+    if (!row.extracted_fields_id) return;
+    setEdit({
+      id: row.id,
+      field,
+      draft: draftOf(row, field),
+      saving: false,
+      error: null,
+    });
+  }
+
+  async function commit(row: DocumentRow) {
+    if (!edit || edit.saving) return;
+    const { field, draft } = edit;
+
+    if (draft === draftOf(row, field)) {
+      setEdit(null);
+      return;
+    }
+
+    const parsed = parseDraft(field, draft);
+    if (!parsed.ok) {
+      setEdit({ ...edit, error: parsed.why });
+      return;
+    }
+
+    setEdit({ ...edit, saving: true, error: null });
+    try {
+      await onSaveField(row, field, parsed.value);
+      setEdit(null);
+      say(`Saved the ${FIELD_LABEL[field]}.`);
+    } catch (e) {
+      setEdit({
+        ...edit,
+        saving: false,
+        error: e instanceof Error ? e.message : "Could not save that.",
+      });
+    }
+  }
+
+  async function toggleReady(row: DocumentRow) {
+    if (readyBusy) return;
+    setReadyBusy(row.id);
+    const wasReady = Boolean(row.ready_at);
+    try {
+      await onToggleReady(row);
+      say(
+        wasReady
+          ? "Ready removed — back to Prepare."
+          : stage === "prepare"
+            ? "Ticked ready — the row moved to Ready to post."
+            : "Ticked ready.",
+      );
+    } catch (e) {
+      say(e instanceof Error ? e.message : "Could not change that.");
+    } finally {
+      setReadyBusy(null);
+    }
+  }
+
+  /** One editable cell: a button until it is opened, an input after. */
+  function cell(
+    row: DocumentRow,
+    field: EditableField,
+    shown: string,
+    extraClass = "",
+  ) {
+    const open = edit?.id === row.id && edit.field === field;
+    const editable = Boolean(row.extracted_fields_id);
+
+    if (!open) {
+      return (
+        <td className={extraClass} onClick={(e) => e.stopPropagation()}>
+          <button
+            type="button"
+            className={`dg-cell${editable ? "" : " locked"}`}
+            disabled={!editable}
+            title={
+              editable
+                ? `Edit the ${FIELD_LABEL[field]}`
+                : "Nothing has been read off this document yet"
+            }
+            aria-label={`${FIELD_LABEL[field]}: ${shown}. Click to edit.`}
+            onClick={() => openEditor(row, field)}
+          >
+            {shown}
+          </button>
+        </td>
+      );
+    }
+
+    const isDate = field === "invoice_date";
+    const isNumber = field === "total_amount" || field === "tax_amount";
+
+    return (
+      <td
+        className={`${extraClass} dg-editing`.trim()}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <input
+          className={`dg-input${edit.error ? " bad" : ""}`}
+          type={isDate ? "date" : "text"}
+          {...(isDate ? {} : { size: 1 })}
+          inputMode={isNumber ? "decimal" : undefined}
+          value={edit.draft}
+          autoFocus
+          disabled={edit.saving}
+          aria-label={`Edit the ${FIELD_LABEL[field]}`}
+          aria-invalid={edit.error ? true : undefined}
+          onChange={(e) => setEdit({ ...edit, draft: e.target.value, error: null })}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              void commit(row);
+            }
+            if (e.key === "Escape") {
+              e.preventDefault();
+              e.stopPropagation();
+              setEdit(null);
+            }
+          }}
+          onBlur={() => {
+            // A failed save keeps the editor open so the reason stays on
+            // screen; blurring away from it would throw the reason away.
+            if (edit.error) return;
+            void commit(row);
+          }}
+        />
+        {edit.error ? <span className="dg-cell-bad">{edit.error}</span> : null}
+      </td>
+    );
+  }
+
   return (
     <section className="dg">
       <nav className="dg-stages" aria-label="Stage">
@@ -151,7 +356,10 @@ export function DocumentGrid({
             type="button"
             className={`dg-stage${stage === s.key ? " active" : ""}${s.key === "refused" && counts.refused > 0 ? " bad" : ""}`}
             aria-selected={stage === s.key}
-            onClick={() => setStage(s.key)}
+            onClick={() => {
+              setEdit(null);
+              setStage(s.key);
+            }}
           >
             {s.label}
             <span className="dg-n">{counts[s.key]}</span>
@@ -181,7 +389,7 @@ export function DocumentGrid({
             <thead>
               <tr>
                 <th className="dg-k-doc">Document</th>
-                <th>Date</th>
+                <th className="dg-k-date">Date</th>
                 <th className="n">Amount</th>
                 <th className="n">VAT</th>
                 <th>Posts as</th>
@@ -222,18 +430,20 @@ export function DocumentGrid({
                         </span>
                       </span>
                     </td>
-                    <td>{day(d.invoice_date)}</td>
-                    <td className="n">
-                      {d.currency ? `${d.currency} ` : ""}
-                      {money(d.total_amount)}
-                    </td>
-                    <td className="n">{money(d.tax_amount)}</td>
+                    {cell(d, "invoice_date", shortDate(d.invoice_date), "dg-k-date")}
+                    {cell(
+                      d,
+                      "total_amount",
+                      `${d.currency ? `${d.currency} ` : ""}${money(d.total_amount)}`,
+                      "n",
+                    )}
+                    {cell(d, "tax_amount", money(d.tax_amount), "n")}
                     <td>{postsAs(d)}</td>
-                    <td>{d.po_number ?? <span className="dg-none">—</span>}</td>
+                    {cell(d, "po_number", d.po_number ?? "—")}
                     <td>
                       <span className="dg-two">
                         <span className="dg-a">{d.source}</span>
-                        <span className="dg-b">{when(d.uploaded_at)}</span>
+                        <span className="dg-b">{shortStamp(d.uploaded_at)}</span>
                       </span>
                     </td>
                     <td>
@@ -266,19 +476,31 @@ export function DocumentGrid({
                         <span className="dg-none">—</span>
                       )}
                     </td>
-                    <td className="dg-k-ready">
-                      <span
+                    <td
+                      className="dg-k-ready"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <button
+                        type="button"
                         className={`dg-ready${d.ready_at ? " on" : ""}`}
+                        aria-pressed={Boolean(d.ready_at)}
+                        disabled={readyBusy === d.id}
+                        aria-label={
+                          d.ready_at
+                            ? `Ready${d.ready_by ? `, ticked by ${d.ready_by}` : ""}. Click to take it back.`
+                            : "Not ready. Click to tick it ready."
+                        }
                         title={
                           d.ready_at
                             ? `Ready${d.ready_by ? ` — ${d.ready_by}` : ""}`
                             : "Not ticked ready"
                         }
+                        onClick={() => void toggleReady(d)}
                       >
                         <svg viewBox="0 0 20 20" aria-hidden="true">
                           <path d="M5 10.5l3.5 3.5L15 6.5" />
                         </svg>
-                      </span>
+                      </button>
                     </td>
                   </tr>
                 );
@@ -300,6 +522,9 @@ export function DocumentGrid({
             {loading
               ? "Loading…"
               : `${rows.length} of ${documents.length} documents`}
+          </span>
+          <span className="dg-say" role="status" aria-live="polite">
+            {note ?? ""}
           </span>
         </div>
       </div>
