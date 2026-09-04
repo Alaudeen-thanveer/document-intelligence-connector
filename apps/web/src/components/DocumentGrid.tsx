@@ -208,6 +208,19 @@ export function DocumentGrid({
     };
   }, []);
 
+  // A background write can change a row's stage while it is being edited —
+  // the pipeline finishing an extraction, a colleague approving it. The row
+  // then leaves this list, the editor unmounts, and because unmounting fires
+  // no blur the draft goes with it. Say so rather than letting it vanish.
+  const editId = edit?.id ?? null;
+  useEffect(() => {
+    if (!editId) return;
+    if (visibleKey.split(",").includes(editId)) return;
+    setEdit(null);
+    say("That row left this list while you were editing it — nothing was saved.");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editId, visibleKey]);
+
   function say(message: string) {
     setNote(message);
     if (noteTimer.current) window.clearTimeout(noteTimer.current);

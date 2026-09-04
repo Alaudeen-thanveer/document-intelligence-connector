@@ -11,9 +11,19 @@ export function useDocuments() {
 
   useEffect(() => {
     let cancelled = false;
+    // A save fires two loads at once: the caller's own reload, and the
+    // realtime event the same UPDATE produced. Without a sequence number the
+    // older response can land last and put pre-save data back on screen — the
+    // reviewer sees their edit flash away and reads it as a lost save.
+    let seq = 0;
+    let everLoaded = false;
 
     async function load() {
-      setLoading(true);
+      const mine = ++seq;
+      // Only the first load is a real wait. Anything after it is a refresh,
+      // and flashing "Loading…" every time anything in the company changes
+      // makes the grid look broken.
+      if (!everLoaded) setLoading(true);
       const { data, error: queryError } = await supabase
         // documents_grid is documents + its current extraction + its check
         // tally. Realtime below stays on the base table: Postgres emits no
@@ -24,7 +34,8 @@ export function useDocuments() {
         )
         .order("uploaded_at", { ascending: false });
 
-      if (cancelled) return;
+      if (cancelled || mine !== seq) return;
+      everLoaded = true;
       if (queryError) {
         setError(queryError.message);
         setDocuments([]);
