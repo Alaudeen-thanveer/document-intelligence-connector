@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { callEdgeFunction } from "../lib/functions";
 import { supabase } from "../lib/supabase";
 
@@ -62,13 +63,6 @@ interface JournalProposal {
 
 interface LockInfo { locked_until: string | null; already_locked: boolean; ready: boolean; blockers: string[] }
 interface CtInfo { applicable: boolean; reason: string; net_profit_ytd?: number; provision_to_date?: number; already_provided?: number; top_up?: number; fy_start?: string }
-interface EmirateBox { amount: number; vat: number; count: number }
-interface VatForm {
-  period: { start: string; end: string };
-  boxes: { standard_by_emirate: Record<string, EmirateBox>; standard_total: EmirateBox; reverse_charge_supplies: EmirateBox; zero_rated: EmirateBox; exempt: EmirateBox; outputs_total: EmirateBox; inputs_standard: EmirateBox; inputs_reverse_charge: EmirateBox; inputs_total: EmirateBox; net_vat: number };
-  checks: Array<{ name: string; passed: boolean; note: string; docs: string[] }>;
-  due_date: string; days_left: number; ready: boolean;
-}
 interface FxAccount { account_id: string; account_name: string; gl_balance?: number | null; fcy_balance?: number | null; adjusted_balance?: number | null; gain_or_loss?: number | null }
 interface ScheduleRowUi {
   id: string; kind: "prepayment" | "accrual"; label: string; source_kind: string; source_number: string | null;
@@ -143,9 +137,6 @@ export function MonthEndPage() {
   const [message, setMessage] = useState<string | null>(null);
   // Reviewer edits to proposals, by proposal id.
   const [edits, setEdits] = useState<Record<string, { journal_date: string; lines: ProposalLine[] }>>({});
-  // VAT review (Form 201) — runs on demand; it reads many documents from Zoho.
-  const [vat, setVat] = useState<{ label: string; form: VatForm } | null>(null);
-  const [vatBusy, setVatBusy] = useState(false);
   // FX revaluation.
   const [currencies, setCurrencies] = useState<Array<{ zoho_id: string; name: string }>>([]);
   const [fxCurrency, setFxCurrency] = useState("");
@@ -197,14 +188,6 @@ export function MonthEndPage() {
     await load(month);
   }
 
-  async function runVatReview() {
-    setVatBusy(true); setMessage(null);
-    const res = await callEdgeFunction("vat-review", {});
-    const body = res.body as { ok?: boolean; error?: string; period_label?: string; form?: VatForm };
-    if (body.ok && body.form) setVat({ label: body.period_label ?? "", form: body.form });
-    else setMessage(`Not reviewed: ${body.error ?? res.status}`);
-    setVatBusy(false);
-  }
   async function lockPeriod() {
     setBusy("lock"); setMessage(null);
     const res = await callEdgeFunction("month-end", { month, action: "lock_period", ...(forceLock ? { force: true } : {}) });
@@ -444,41 +427,16 @@ export function MonthEndPage() {
 
       {result && (
         <section className="panel connection-card">
-          <h3>VAT return (Form 201) — pre-filing review</h3>
+          <h3>VAT return (Form 201)</h3>
           <p className="muted">
-            Recomputes the period's boxes from the documents in Zoho Books and lists what to look at
-            before filing in the FTA portal. This reviews — filing stays in the portal.
+            The period's boxes, recomputed from the documents in Zoho Books,
+            with what to look at before filing. It moved to its own page: it is
+            a return rather than a closing step, and it was hidden behind this
+            page's own check having run first.
           </p>
-          <button type="button" className="btn btn-small" disabled={vatBusy} onClick={() => void runVatReview()}>
-            {vatBusy ? "Reading the period's documents…" : vat ? "Re-run review" : "Run VAT review"}
-          </button>
-          {vat && (
-            <div style={{ marginTop: 10 }}>
-              <p><strong>{vat.label}</strong> · due <strong>{vat.form.due_date}</strong> ({vat.form.days_left >= 0 ? `${vat.form.days_left} days left` : `${-vat.form.days_left} days OVERDUE`}) · {vat.form.ready ? <span className="status-pill status-synced">checks pass</span> : <span className="status-pill status-needs_review">needs attention</span>}</p>
-              <table className="data-table" style={{ marginTop: 8 }}>
-                <tbody>
-                  {Object.entries(vat.form.boxes.standard_by_emirate).map(([em, b]) => (
-                    <tr key={em}><td>Standard-rated supplies — {em}</td><td style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{money(b.amount)}</td><td style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{money(b.vat)}</td></tr>
-                  ))}
-                  <tr><td>Zero-rated supplies</td><td style={{ textAlign: "right" }}>{money(vat.form.boxes.zero_rated.amount)}</td><td style={{ textAlign: "right" }}>—</td></tr>
-                  <tr><td>Exempt supplies</td><td style={{ textAlign: "right" }}>{money(vat.form.boxes.exempt.amount)}</td><td style={{ textAlign: "right" }}>—</td></tr>
-                  <tr><td>Reverse-charge supplies (imports)</td><td style={{ textAlign: "right" }}>{money(vat.form.boxes.reverse_charge_supplies.amount)}</td><td style={{ textAlign: "right" }}>{money(vat.form.boxes.reverse_charge_supplies.vat)}</td></tr>
-                  <tr><td>Standard-rated expenses (recoverable)</td><td style={{ textAlign: "right" }}>{money(vat.form.boxes.inputs_standard.amount)}</td><td style={{ textAlign: "right" }}>{money(vat.form.boxes.inputs_standard.vat)}</td></tr>
-                  <tr><td><strong>Net VAT {vat.form.boxes.net_vat >= 0 ? "payable" : "recoverable"}</strong></td><td></td><td style={{ textAlign: "right" }}><strong>{money(Math.abs(vat.form.boxes.net_vat))}</strong></td></tr>
-                </tbody>
-              </table>
-              <ul className="conn-entity-list" style={{ marginTop: 8 }}>
-                {vat.form.checks.map((c) => (
-                  <li key={c.name}>
-                    <div>
-                      <strong>{c.passed ? "✓" : "✗"} {c.name.replace(/_/g, " ")}</strong>
-                      <div className="muted">{c.note}{c.docs.length > 0 && c.docs.length <= 5 ? ` — ${c.docs.join("; ")}` : ""}</div>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
+          <Link className="btn ghost btn-small" to="/vat">
+            Open VAT
+          </Link>
         </section>
       )}
 

@@ -26,6 +26,7 @@ export const NAV: NavItem[] = [
   { path: "/bank", label: "Banking", group: "tab", icon: "⌸" },
   { path: "/month-end", label: "Month-end", group: "tab", icon: "└" },
   { path: "/cash", label: "Cash", group: "tab", icon: "◈" },
+  { path: "/vat", label: "VAT", group: "tab", icon: "%" },
   { path: "/rules", label: "Rules", group: "tab", icon: "§" },
   { path: "/connections", label: "Connections", group: "drawer", icon: "⇄" },
   { path: "/api-usage", label: "API usage", group: "drawer", icon: "▦" },
