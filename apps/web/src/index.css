@@ -1523,6 +1523,15 @@ a {
   gap: 12px;
   padding: 14px 18px 0;
   flex: none;
+  /* The upload card would otherwise push the whole page sideways on a narrow
+     window — it is the one thing on this page wide enough to do it. */
+  flex-wrap: wrap;
+}
+.dg-head .upload-box {
+  min-width: 0;
+}
+.upload-row {
+  flex-wrap: wrap;
 }
 .dg-head h2 {
   margin: 0;
