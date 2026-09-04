@@ -5,6 +5,7 @@ import type { EditableField } from "../components/DocumentGrid";
 import { DocumentOverlay } from "../components/DocumentOverlay";
 import { ReviewPanel } from "../components/ReviewPanel";
 import { UploadInvoice } from "../components/UploadInvoice";
+import type { UploadNotice } from "../components/UploadInvoice";
 import { useDocumentDetail } from "../hooks/useDocumentDetail";
 import { useDocuments } from "../hooks/useDocuments";
 import type { AppOutletContext } from "../layout/AppLayout";
@@ -21,6 +22,7 @@ export function DocumentsPage() {
   const [visibleIds, setVisibleIds] = useState<string[]>([]);
   const [tick, setTick] = useState(0);
   const [rulesVersion, setRulesVersion] = useState(0);
+  const [uploadNotice, setUploadNotice] = useState<UploadNotice | null>(null);
 
   const selected = useMemo(
     () => documents.find((d) => d.id === selectedId) ?? null,
@@ -164,18 +166,6 @@ export function DocumentsPage() {
 
   return (
     <main className="dg-page">
-      <div className="dg-head">
-        <h2>Documents</h2>
-        <span className="live-dot">Realtime</span>
-        <span className="dg-head-sp" />
-        <UploadInvoice
-          onUploaded={(documentId) => {
-            setSelectedId(documentId);
-            refresh();
-          }}
-        />
-      </div>
-
       {error && (
         <p className="error-text">
           {error}. Apply the migrations and ensure Supabase is running.
@@ -191,6 +181,16 @@ export function DocumentsPage() {
         onToggleReady={toggleReady}
         failedJudgmentIds={failedJudgmentIds}
         loading={loading}
+        notice={uploadNotice}
+        actions={
+          <UploadInvoice
+            onStatus={setUploadNotice}
+            onUploaded={(documentId) => {
+              setSelectedId(documentId);
+              refresh();
+            }}
+          />
+        }
       />
 
       <DocumentOverlay

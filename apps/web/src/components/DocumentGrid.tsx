@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { shortDate, shortStamp } from "../lib/dates";
 import type { DocumentRow } from "../types";
 
@@ -163,6 +164,10 @@ interface Props {
   onToggleReady: (row: DocumentRow) => Promise<void>;
   failedJudgmentIds: Set<string>;
   loading: boolean;
+  /** Sits at the right of the stage row — the page's own controls. */
+  actions?: ReactNode;
+  /** Something the page wants said in the status line, e.g. an upload. */
+  notice?: { text: string; tone: "ok" | "bad" } | null;
 }
 
 export function DocumentGrid({
@@ -174,6 +179,8 @@ export function DocumentGrid({
   onToggleReady,
   failedJudgmentIds,
   loading,
+  actions,
+  notice,
 }: Props) {
   const [stage, setStage] = useState<Stage>("prepare");
   const [query, setQuery] = useState("");
@@ -404,6 +411,12 @@ export function DocumentGrid({
             <span className="dg-n">{counts[s.key]}</span>
           </button>
         ))}
+        {actions ? (
+          <>
+            <span className="dg-stages-sp" />
+            {actions}
+          </>
+        ) : null}
       </nav>
 
       <div className="dg-tools">
@@ -571,8 +584,12 @@ export function DocumentGrid({
               ? "Loading…"
               : `${rows.length} of ${documents.length} documents`}
           </span>
-          <span className="dg-say" role="status" aria-live="polite">
-            {note ?? ""}
+          <span
+            className={`dg-say${!note && notice?.tone === "bad" ? " bad" : ""}`}
+            role="status"
+            aria-live="polite"
+          >
+            {note ?? notice?.text ?? ""}
           </span>
         </div>
       </div>

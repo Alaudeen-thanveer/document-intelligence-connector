@@ -1587,6 +1587,18 @@ a {
   scrollbar-width: none;
   flex: none;
 }
+/* Pushes the page's own controls to the right of the stage row, which is
+   where the upload button now lives — the band above it said the page's name
+   back to the reader and explained a button that explains itself. */
+.dg-stages-sp {
+  margin-left: auto;
+}
+.dg-stages > .btn {
+  align-self: center;
+  margin-bottom: 12px;
+  flex: none;
+  white-space: nowrap;
+}
 .dg-stages::-webkit-scrollbar {
   display: none;
 }
@@ -2428,6 +2440,10 @@ a.btn {
   margin-left: auto;
   font-weight: 600;
   color: var(--accent-2);
+  text-align: right;
+}
+.dg-say.bad {
+  color: var(--danger);
 }
 
 /* --- VAT (Form 201) ------------------------------------------------------ */
