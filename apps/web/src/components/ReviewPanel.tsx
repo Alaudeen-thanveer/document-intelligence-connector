@@ -986,6 +986,7 @@ export function ReviewPanel({
               <input
                 value={vendorRaw}
                 onChange={(e) => setVendorRaw(e.target.value)}
+                placeholder="as printed on the document"
               />
             </label>
             <label>
@@ -1027,6 +1028,7 @@ export function ReviewPanel({
                 value={totalAmount}
                 onChange={(e) => setTotalAmount(e.target.value)}
                 inputMode="decimal"
+                placeholder="0.00, including VAT"
               />
             </label>
           </div>
@@ -1094,10 +1096,18 @@ export function ReviewPanel({
               Add lines to split it.
             </p>
           )}
+          {lineItems.length > 0 && (
+            <div className="line-item-head" aria-hidden="true">
+              <span>Description</span>
+              <span>Qty</span>
+              <span>Rate</span>
+            </div>
+          )}
           {lineItems.map((li, idx) => (
             <div key={li.key} className="line-item-row">
               <input
                 className="li-desc"
+                aria-label={`Line ${idx + 1} description`}
                 value={li.description}
                 placeholder={`Line ${idx + 1} description`}
                 onChange={(e) =>
@@ -1112,6 +1122,7 @@ export function ReviewPanel({
               />
               <input
                 className="li-qty"
+                aria-label={`Line ${idx + 1} quantity`}
                 value={li.quantity}
                 inputMode="decimal"
                 placeholder="Qty"
@@ -1127,6 +1138,7 @@ export function ReviewPanel({
               />
               <input
                 className="li-rate"
+                aria-label={`Line ${idx + 1} rate`}
                 value={li.rate}
                 inputMode="decimal"
                 placeholder="Rate"
@@ -1140,6 +1152,7 @@ export function ReviewPanel({
               />
               <select
                 className="li-account"
+                aria-label={`Line ${idx + 1} account`}
                 value={li.accountId}
                 onChange={(e) =>
                   setLineItems((prev) =>
