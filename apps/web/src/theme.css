@@ -1,22 +1,37 @@
-/* Defaults = chalk (pics 1–2). ThemeProvider swaps to ink (pics 3–4). */
+/**
+ * The static default, which is what paints before ThemeProvider mounts and
+ * writes the active theme as inline style on the root element. It must stay
+ * in step with THEMES.chalk in theme/themes.ts, name for name — a token that
+ * exists only there is undefined for that first frame.
+ *
+ * Deliberately no dark block here: ThemeProvider writes inline styles, which
+ * beat any :root[data-theme] rule, so a dark block would be dead weight that
+ * only ever misled the next reader.
+ */
 :root {
-  --bg: #f8f9f8;
-  --bg-panel: #ffffff;
-  --bg-panel-2: #f3f4f3;
-  --bg-input: #ffffff;
-  --border: #e5e7eb;
-  --border-soft: #eef0ee;
-  --accent: #10b981;
-  --accent-2: #059669;
-  --accent-soft: #d1fae5;
-  --accent-dim: #a7f3d0;
-  --text: #111827;
-  --text-dim: #4b5563;
-  --text-faint: #9ca3af;
-  --warn: #f97316;
-  --warn-soft: #fff7ed;
-  --warn-border: #fdba74;
+  --bg: #eaeeea;
+  --bg-panel: #f5f8f5;
+  --bg-panel-2: #dfe5df;
+  --bg-input: #fbfcfb;
+  --border: #d2dad2;
+  --border-soft: #e3e9e3;
+  --border-strong: #bac4ba;
+  --accent: #256b45;
+  --accent-2: #1e5738;
+  --accent-soft: #d8ebdf;
+  --accent-dim: #b9dbc7;
+  --text: #151a16;
+  --text-dim: #525c54;
+  --text-faint: #575f58;
+  --ok: #0c6b5c;
+  --ok-soft: #d3ebe5;
+  --warn: #8a5a0b;
+  --warn-soft: #f4ebd6;
+  --warn-border: #d9b978;
+  --danger: #a33a2e;
+  --danger-soft: #f6e3dd;
   --on-accent: #ffffff;
+  --rule: rgba(21, 26, 22, 0.09);
 
   /* Legacy names used by existing screens — follow the active theme. */
   --bg-0: var(--bg);
