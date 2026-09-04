@@ -1,4 +1,17 @@
-/** Chalk = pics 1–2 (cool white + emerald). Ink = pics 3–4 (indigo + violet). */
+/**
+ * The palette, as two halves of one design.
+ *
+ * Ground is Mist — a green-grey half white, never a flat white, so a screen
+ * full of ledger rows does not glare. Accent is Forest.
+ *
+ * Because the accent is green, "success" cannot also be plain green or the
+ * two stop being tellable apart (they measured 6 degrees of hue apart), so
+ * success is a teal-green a clear 23 degrees off the accent.
+ *
+ * Every text pair here clears WCAG AA (4.5:1) against every surface it can
+ * land on, including the selection tint — that last one is easy to forget
+ * and is where the dark theme failed first.
+ */
 
 export const THEME_VAR_KEYS = [
   "bg",
@@ -7,6 +20,7 @@ export const THEME_VAR_KEYS = [
   "bg-input",
   "border",
   "border-soft",
+  "border-strong",
   "accent",
   "accent-2",
   "accent-soft",
@@ -14,10 +28,15 @@ export const THEME_VAR_KEYS = [
   "text",
   "text-dim",
   "text-faint",
+  "ok",
+  "ok-soft",
   "warn",
   "warn-soft",
   "warn-border",
+  "danger",
+  "danger-soft",
   "on-accent",
+  "rule",
 ] as const;
 
 export type ThemeVarKey = (typeof THEME_VAR_KEYS)[number];
@@ -35,46 +54,58 @@ export const THEMES = {
     label: "Light",
     group: "light",
     vars: {
-      bg: "#f8f9f8",
-      "bg-panel": "#ffffff",
-      "bg-panel-2": "#f3f4f3",
-      "bg-input": "#ffffff",
-      border: "#e5e7eb",
-      "border-soft": "#eef0ee",
-      accent: "#10b981",
-      "accent-2": "#059669",
-      "accent-soft": "#d1fae5",
-      "accent-dim": "#a7f3d0",
-      text: "#111827",
-      "text-dim": "#4b5563",
-      "text-faint": "#9ca3af",
-      warn: "#f97316",
-      "warn-soft": "#fff7ed",
-      "warn-border": "#fdba74",
+      bg: "#eaeeea",
+      "bg-panel": "#f5f8f5",
+      "bg-panel-2": "#dfe5df",
+      "bg-input": "#fbfcfb",
+      border: "#d2dad2",
+      "border-soft": "#e3e9e3",
+      "border-strong": "#bac4ba",
+      accent: "#256b45",
+      "accent-2": "#1e5738",
+      "accent-soft": "#d8ebdf",
+      "accent-dim": "#b9dbc7",
+      text: "#151a16",
+      "text-dim": "#525c54",
+      "text-faint": "#575f58",
+      ok: "#0c6b5c",
+      "ok-soft": "#d3ebe5",
+      warn: "#8a5a0b",
+      "warn-soft": "#f4ebd6",
+      "warn-border": "#d9b978",
+      danger: "#a33a2e",
+      "danger-soft": "#f6e3dd",
       "on-accent": "#ffffff",
+      rule: "rgba(21, 26, 22, 0.09)",
     },
   },
   ink: {
     label: "Dark",
     group: "dark",
     vars: {
-      bg: "#0c0c1a",
-      "bg-panel": "#161625",
-      "bg-panel-2": "#1c1c32",
-      "bg-input": "#12122a",
-      border: "#2a2a4a",
-      "border-soft": "#22223c",
-      accent: "#7c7cfc",
-      "accent-2": "#5b5bd6",
-      "accent-soft": "#24244a",
-      "accent-dim": "#32326a",
-      text: "#f4f2ff",
-      "text-dim": "#a8a3c9",
-      "text-faint": "#6e6a93",
-      warn: "#f59e0b",
-      "warn-soft": "#3a2a12",
-      "warn-border": "#6b4e1c",
-      "on-accent": "#0a0620",
+      bg: "#151815",
+      "bg-panel": "#1d211d",
+      "bg-panel-2": "#101310",
+      "bg-input": "#242923",
+      border: "#2c332c",
+      "border-soft": "#232823",
+      "border-strong": "#3f493f",
+      accent: "#6fc493",
+      "accent-2": "#a5dcbb",
+      "accent-soft": "#0f3421",
+      "accent-dim": "#1b4f35",
+      text: "#e6eae6",
+      "text-dim": "#9fa99f",
+      "text-faint": "#929c92",
+      ok: "#46c4ac",
+      "ok-soft": "#0c2b26",
+      warn: "#d5a24b",
+      "warn-soft": "#33280f",
+      "warn-border": "#5a4a22",
+      danger: "#de7b6c",
+      "danger-soft": "#361c18",
+      "on-accent": "#0a2416",
+      rule: "rgba(230, 234, 230, 0.10)",
     },
   },
 } as const satisfies Record<string, ThemeDefinition>;

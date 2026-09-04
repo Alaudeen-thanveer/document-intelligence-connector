@@ -1,9 +1,17 @@
+/* Zoho Puvi — the typeface Zoho Books itself uses. Served from public/fonts
+   rather than a CDN so the app has no third-party font dependency.
+   NOTE: Zoho publishes Puvi for download but states no licence terms; get
+   written confirmation from Zoho before this ships to customers. */
+@font-face{font-family:'Zoho Puvi';font-style:normal;font-weight:400;font-display:swap;src:url('/fonts/Puvi-Regular.woff2') format('woff2')}
+@font-face{font-family:'Zoho Puvi';font-style:normal;font-weight:500;font-display:swap;src:url('/fonts/Puvi-Medium.woff2') format('woff2')}
+@font-face{font-family:'Zoho Puvi';font-style:normal;font-weight:600;font-display:swap;src:url('/fonts/Puvi-Semibold.woff2') format('woff2')}
+@font-face{font-family:'Zoho Puvi';font-style:normal;font-weight:700;font-display:swap;src:url('/fonts/Puvi-Bold.woff2') format('woff2')}
+
 :root {
-  --danger: #e07070;
   --shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
   --radius: 14px;
   --radius-sm: 9px;
-  font-family: "Inter", "Sora", sans-serif;
+  font-family: "Zoho Puvi", system-ui, "Segoe UI", Roboto, sans-serif;
   color: var(--text);
   background: var(--bg);
   line-height: 1.45;
@@ -14,6 +22,14 @@
 
 * {
   box-sizing: border-box;
+}
+
+/* Puvi's digits are proportional by default — a 1 is far narrower than a 4 —
+   so every figure that sits in a column asks for the tabular set. */
+table,
+.num,
+input[type="number"] {
+  font-variant-numeric: tabular-nums;
 }
 
 html,
@@ -68,7 +84,7 @@ button.linkish {
 
 .brand {
   margin: 0 0 4px;
-  font-family: "Fraunces", serif;
+  font-family: "Zoho Puvi", system-ui, "Segoe UI", Roboto, sans-serif;
   font-size: clamp(1.25rem, 2.4vw, 1.75rem);
   font-weight: 700;
   letter-spacing: -0.03em;
@@ -130,7 +146,7 @@ button.linkish {
 .page-head h1,
 .page-head h2 {
   margin: 0 0 5px;
-  font-family: "Fraunces", serif;
+  font-family: "Zoho Puvi", system-ui, "Segoe UI", Roboto, sans-serif;
   font-size: 22px;
   font-weight: 600;
   letter-spacing: -0.02em;
@@ -168,7 +184,7 @@ button.linkish {
 }
 
 .stat .num {
-  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
   font-size: 26px;
   font-weight: 600;
   color: var(--accent);
@@ -238,7 +254,7 @@ button.linkish {
 .panel h2,
 .section h3 {
   margin: 0;
-  font-family: "Fraunces", serif;
+  font-family: "Zoho Puvi", system-ui, "Segoe UI", Roboto, sans-serif;
   letter-spacing: -0.02em;
 }
 
@@ -358,7 +374,7 @@ button.linkish {
 }
 
 .doc-id {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
   font-size: 0.85rem;
 }
 
@@ -1000,7 +1016,7 @@ button.linkish {
   padding: 0.5rem 0.65rem;
 }
 .bank-intake textarea {
-  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
   font-size: 0.78rem;
   resize: vertical;
 }
@@ -1063,7 +1079,7 @@ button.linkish {
 .bank-src-open_document { color: var(--accent); }
 .bank-src-accepted_rule { color: var(--accent); }
 .bank-src-zoho_rule { color: var(--accent); }
-.bank-src-learned { color: #9dc4ff; }
+.bank-src-learned { color: var(--accent-2); }
 .bank-src-party_name { color: var(--warn); }
 @media (max-width: 800px) { .bank-intake { grid-template-columns: 1fr; } }
 
@@ -1098,7 +1114,7 @@ button.linkish {
 
 .signin-wrap h1 {
   margin: 8px 0 10px;
-  font-family: "Fraunces", serif;
+  font-family: "Zoho Puvi", system-ui, "Segoe UI", Roboto, sans-serif;
   font-size: 1.6rem;
 }
 
@@ -1156,7 +1172,7 @@ button.linkish {
   color: var(--on-accent);
   font-weight: 700;
   font-size: 13px;
-  font-family: "Fraunces", serif;
+  font-family: "Zoho Puvi", system-ui, "Segoe UI", Roboto, sans-serif;
   margin-bottom: 20px;
 }
 
