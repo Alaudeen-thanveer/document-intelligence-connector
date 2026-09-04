@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from "react";
 import { callEdgeFunction } from "../lib/functions";
-import { invoiceStoragePath } from "../lib/storagePath";
+import { PanelSection } from "./PanelSection";
 import { supabase } from "../lib/supabase";
 import { entityAccountType, findByName } from "../lib/zoho";
 import { useZohoEntities } from "../hooks/useZohoEntities";
@@ -121,6 +121,9 @@ export function ReviewPanel({
   const [dueDate, setDueDate] = useState("");
   const [lineItems, setLineItems] = useState<EditableLine[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
+  // Which document the fields below were last loaded for, so a live
+  // refetch of THIS document does not clear the reviewer's session with it.
+  const lastDocIdRef = useRef<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [zohoBillId, setZohoBillId] = useState<string | null>(null);
 
@@ -307,7 +310,6 @@ export function ReviewPanel({
     | null
   >(null);
   const [overrideReason, setOverrideReason] = useState("");
-  const lastDocIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     setPartyCredits([]);
@@ -531,25 +533,6 @@ export function ReviewPanel({
       if (insError) return insError.message;
     }
     return null;
-  }
-
-  async function openDocumentFile() {
-    if (!document?.file_url) return;
-    const path = invoiceStoragePath(document.file_url);
-    if (!path) {
-      window.open(document.file_url, "_blank", "noopener,noreferrer");
-      return;
-    }
-    const { data, error: signError } = await supabase.storage
-      .from("invoices")
-      .createSignedUrl(path, 3600);
-    if (signError || !data?.signedUrl) {
-      setActionMsg(
-        `Could not open file: ${signError?.message ?? "signed URL failed"}`,
-      );
-      return;
-    }
-    window.open(data.signedUrl, "_blank", "noopener,noreferrer");
   }
 
   async function correct() {
@@ -896,24 +879,14 @@ export function ReviewPanel({
   }
 
   return (
-    <div className="panel review-panel">
-      <header className="panel-header">
+    <div className="review-panel">
+      <dl className="rp-facts">
         <div>
-          <p className="eyebrow">Selected document</p>
-          <h2>{document.doc_type ?? "Document"}</h2>
-        </div>
-        <span className={`status-pill status-${document.status}`}>
-          {document.status}
-        </span>
-      </header>
-
-      <dl className="meta-grid">
-        <div>
-          <dt>Source</dt>
+          <dt>Arrived</dt>
           <dd>{document.source}</dd>
         </div>
         <div>
-          <dt>Confidence</dt>
+          <dt>Read</dt>
           <dd>
             {document.confidence != null
               ? Number(document.confidence).toFixed(2)
@@ -921,30 +894,31 @@ export function ReviewPanel({
           </dd>
         </div>
         <div>
-          <dt>File</dt>
-          <dd className="truncate">
-            <button
-              type="button"
-              className="linkish"
-              onClick={() => void openDocumentFile()}
-            >
-              Open file
-            </button>
+          <dt>In Zoho</dt>
+          <dd>
+            {zohoBillId ??
+              (document.status === "synced"
+                ? "Synced — see the sync log"
+                : "—")}
           </dd>
-        </div>
-        <div>
-          <dt>Zoho bill</dt>
-          <dd>{zohoBillId ?? (document.status === "synced" ? "synced (see erp_sync_log)" : "—")}</dd>
         </div>
       </dl>
 
       {loading && <p className="muted">Loading review details…</p>}
       {error && <p className="error-text">{error}</p>}
 
-      <section className="section">
-        <h3>Judgment failures</h3>
+      <PanelSection
+        id="checks"
+        title="Checks"
+        note={
+          failedRules.length === 0
+            ? "All passed"
+            : `${failedRules.length} failed`
+        }
+        tone={failedRules.length === 0 ? "ok" : "bad"}
+      >
         {failedRules.length === 0 ? (
-          <p className="muted">No failed judgment rules.</p>
+          <p className="muted">Every check on this document passed.</p>
         ) : (
           <ul className="rule-list">
             {failedRules.map((rule) => (
@@ -955,27 +929,37 @@ export function ReviewPanel({
             ))}
           </ul>
         )}
-        {poMatch && (
-          <p className={poMatch.passed ? "muted" : "warn-banner"} style={{ marginTop: 8 }}>
-            <strong>Purchase order:</strong> {poMatch.notes || (poMatch.passed ? "matches" : "does not match")}
-          </p>
-        )}
         {entityUnresolvedHint && (
           <p className="warn-banner">
-            Entity match unresolved — vendor and/or GL account could not be
-            auto-matched with enough confidence. Correct fields below, then
-            approve for push.
+            The vendor and the account could not be matched with enough
+            confidence. Correct the record below, then approve.
           </p>
         )}
-      </section>
+      </PanelSection>
 
-      <section className="section">
-        <h3>Correct extracted fields</h3>
+      {poMatch && (
+        <PanelSection
+          id="po"
+          title="Purchase order"
+          note={poMatch.passed ? "Matched" : "No match"}
+          tone={poMatch.passed ? "ok" : "warn"}
+          defaultOpen={!poMatch.passed}
+        >
+          <p className={poMatch.passed ? "muted" : "warn-banner"}>
+            {poMatch.notes ||
+              (poMatch.passed
+                ? "Matches an open purchase order in Zoho Books."
+                : "Does not match an open purchase order in Zoho Books.")}
+          </p>
+        </PanelSection>
+      )}
+
+      <PanelSection id="record" title="The record">
         {!extracted ? (
           <div>
             <p className="muted">
-              No extracted_fields yet — upload alone does not read the invoice.
-              Run extract (needs Mindee + functions serve).
+              Nothing has been read from this document yet — uploading it does
+              not read it. Extracting needs Mindee and the edge functions.
             </p>
             <button
               type="button"
@@ -997,11 +981,11 @@ export function ReviewPanel({
               />
             </label>
             <label>
-              Total amount
+              Invoice number
               <input
-                value={totalAmount}
-                onChange={(e) => setTotalAmount(e.target.value)}
-                inputMode="decimal"
+                value={invoiceNumber}
+                onChange={(e) => setInvoiceNumber(e.target.value)}
+                placeholder="as printed, e.g. INV-2210"
               />
             </label>
             <label>
@@ -1010,6 +994,14 @@ export function ReviewPanel({
                 type="date"
                 value={invoiceDate ?? ""}
                 onChange={(e) => setInvoiceDate(e.target.value)}
+              />
+            </label>
+            <label>
+              Due date
+              <input
+                type="date"
+                value={dueDate}
+                onChange={(e) => setDueDate(e.target.value)}
               />
             </label>
             <label>
@@ -1022,6 +1014,29 @@ export function ReviewPanel({
               />
             </label>
             <label>
+              Total amount
+              <input
+                value={totalAmount}
+                onChange={(e) => setTotalAmount(e.target.value)}
+                inputMode="decimal"
+              />
+            </label>
+          </div>
+        )}
+      </PanelSection>
+
+      {extracted && (
+        <PanelSection
+          id="tax"
+          title="Tax"
+          note={
+            taxAmount.trim() === ""
+              ? "No VAT on the document"
+              : `VAT ${taxAmount}`
+          }
+        >
+          <div className="form-grid">
+            <label>
               VAT amount
               <input
                 value={taxAmount}
@@ -1031,28 +1046,40 @@ export function ReviewPanel({
               />
             </label>
             <label>
-              Invoice number
-              <input
-                value={invoiceNumber}
-                onChange={(e) => setInvoiceNumber(e.target.value)}
-                placeholder="as printed, e.g. INV-2210"
-              />
-            </label>
-            <label>
-              Due date
-              <input
-                type="date"
-                value={dueDate}
-                onChange={(e) => setDueDate(e.target.value)}
-              />
+              Tax treatment
+              <select
+                value={taxTreatment}
+                onChange={(e) => setTaxTreatment(e.target.value)}
+              >
+                <option value="">
+                  {partyTreatmentLabel
+                    ? `— party default (${partyTreatmentLabel}) —`
+                    : "— party default —"}
+                </option>
+                {TAX_TREATMENTS.map((t) => (
+                  <option key={t.value} value={t.value}>
+                    {t.label}
+                  </option>
+                ))}
+              </select>
             </label>
           </div>
-        )}
-      </section>
+          {taxTreatment && partyTreatment && taxTreatment !== partyTreatment && (
+            <p className="muted">
+              Overriding this party's default treatment for this transaction
+              only — the party master in Zoho is not changed.
+            </p>
+          )}
+        </PanelSection>
+      )}
 
       {extracted && (
-        <section className="section">
-          <h3>Line items</h3>
+        <PanelSection
+          id="lines"
+          title="Lines"
+          note={lineItems.length ? `${lineItems.length}` : "None read"}
+          defaultOpen={lineItems.length > 0}
+        >
           {lineItems.length === 0 && (
             <p className="muted">
               No line items captured — the whole amount posts as one line.
@@ -1247,11 +1274,10 @@ export function ReviewPanel({
               </span>
             )}
           </div>
-        </section>
+        </PanelSection>
       )}
 
-      <section className="section">
-        <h3>Post to Zoho</h3>
+      <PanelSection id="posting" title="Posting">
         {partyCredits.length > 0 && postAs !== "expense" && (
           <div className="unused-credit">
             <p className="unused-credit-head">
@@ -1422,24 +1448,6 @@ export function ReviewPanel({
               </select>
             </label>
           )}
-          <label>
-            Tax treatment
-            <select
-              value={taxTreatment}
-              onChange={(e) => setTaxTreatment(e.target.value)}
-            >
-              <option value="">
-                {partyTreatmentLabel
-                  ? `— party default (${partyTreatmentLabel}) —`
-                  : "— party default —"}
-              </option>
-              {TAX_TREATMENTS.map((t) => (
-                <option key={t.value} value={t.value}>
-                  {t.label}
-                </option>
-              ))}
-            </select>
-          </label>
           {transactionTags.map((tag) => (
             <label key={tag.zoho_id}>
               {tag.name}
@@ -1465,12 +1473,6 @@ export function ReviewPanel({
             {transactionTags.map((t) => t.name).join(", ")}{" "}
             {transactionTags.length === 1 ? "is" : "are"} set once per
             transaction in Zoho Books, so one value applies to every line.
-          </p>
-        )}
-        {taxTreatment && partyTreatment && taxTreatment !== partyTreatment && (
-          <p className="muted">
-            Overriding this party's default treatment for this transaction
-            only — the party master in Zoho is not changed.
           </p>
         )}
 
@@ -1514,38 +1516,7 @@ export function ReviewPanel({
             </span>
           </div>
         )}
-      </section>
-
-      <div className="actions">
-        <button
-          type="button"
-          className="btn ghost"
-          disabled={!!busy || !extracted}
-          onClick={() => void correct()}
-        >
-          {busy === "correct" ? "Saving…" : "Correct"}
-        </button>
-        <button
-          type="button"
-          className="btn danger"
-          disabled={!!busy}
-          onClick={() => void reject()}
-        >
-          {busy === "reject" ? "Rejecting…" : "Reject"}
-        </button>
-        <button
-          type="button"
-          className="btn primary"
-          disabled={!!busy || !extracted || document.status === "synced"}
-          onClick={() => void approve()}
-        >
-          {busy === "approve"
-            ? "Pushing…"
-            : document.status === "approved" && !zohoBillId
-              ? "Retry Zoho push"
-              : "Approve → Zoho"}
-        </button>
-      </div>
+      </PanelSection>
 
       {actionMsg && <p className="action-msg">{actionMsg}</p>}
 
@@ -1583,6 +1554,37 @@ export function ReviewPanel({
           </div>
         </div>
       )}
+
+      <div className="rp-actions">
+        <button
+          type="button"
+          className="btn ghost"
+          disabled={!!busy || !extracted}
+          onClick={() => void correct()}
+        >
+          {busy === "correct" ? "Saving…" : "Correct"}
+        </button>
+        <button
+          type="button"
+          className="btn danger"
+          disabled={!!busy}
+          onClick={() => void reject()}
+        >
+          {busy === "reject" ? "Rejecting…" : "Reject"}
+        </button>
+        <button
+          type="button"
+          className="btn primary"
+          disabled={!!busy || !extracted || document.status === "synced"}
+          onClick={() => void approve()}
+        >
+          {busy === "approve"
+            ? "Pushing…"
+            : document.status === "approved" && !zohoBillId
+              ? "Retry Zoho push"
+              : "Approve → Zoho"}
+        </button>
+      </div>
     </div>
   );
 }

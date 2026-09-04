@@ -117,6 +117,14 @@ button.linkish {
   min-width: 180px;
 }
 
+/* The form now lives in a 452px overlay column, not a full-width page: a
+   180px floor on three columns overflowed the pane by 32px and put a
+   horizontal scrollbar under the whole detail pane. */
+.form-grid input,
+.form-grid select {
+  min-width: 0;
+}
+
 .layout {
   display: grid;
   grid-template-columns: minmax(280px, 360px) 1fr;
@@ -494,7 +502,9 @@ button.linkish {
 
 .form-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* Auto-fit, because the pane's width does not follow the window's: the
+     overlay column is ~420px wide whatever the window is doing. */
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 12px;
   margin-top: 12px;
 }
@@ -521,6 +531,20 @@ button.linkish {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+/* In the overlay column there is not room for the label beside the button:
+   let the count wrap and keep the button on one line. */
+.zoho-sync-row > p {
+  margin: 0;
+  min-width: 0;
+}
+.zoho-sync-row .btn,
+.rule-actions .btn {
+  white-space: nowrap;
+  flex: none;
+}
+.rule-row {
+  flex-wrap: wrap;
 }
 
 .radio-row {
@@ -775,13 +799,48 @@ button.linkish {
   color: var(--muted);
 }
 
-/* Review line items */
+/* Review line items. Seven columns across needed 452px of track before the
+   description got a pixel; the pane is 420px, so a line folds instead. */
 .line-item-row {
   display: grid;
-  grid-template-columns: 1fr 64px 96px 180px auto 80px 32px;
+  grid-template-columns: minmax(0, 1fr) 62px 88px 30px;
+  grid-template-areas:
+    "desc qty  rate del"
+    "acct acct amt  amt";
   gap: 8px;
   align-items: center;
-  margin-bottom: 8px;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.line-item-row:last-of-type {
+  border-bottom: 0;
+}
+.li-desc {
+  grid-area: desc;
+}
+.li-qty {
+  grid-area: qty;
+}
+.li-rate {
+  grid-area: rate;
+}
+.li-account {
+  grid-area: acct;
+}
+.li-amount {
+  grid-area: amt;
+}
+.line-item-row > .btn {
+  grid-area: del;
+  padding-left: 0;
+  padding-right: 0;
+}
+/* Row 3 named explicitly: the dimensions are conditional, and an area in
+   grid-template-areas would leave an empty row behind when they are absent. */
+.li-dims {
+  grid-column: 1 / -1;
+  grid-row: 3;
 }
 
 /* Project + reporting-tag selectors on a line (only when the org has any). */
@@ -815,12 +874,7 @@ button.linkish {
   margin-top: 4px;
 }
 
-@media (max-width: 900px) {
-  .line-item-row {
-    grid-template-columns: 1fr 56px 80px;
-    grid-auto-rows: auto;
-  }
-}
+
 
 /* API usage page */
 .usage-meters { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 6px 0 10px; }
@@ -1979,7 +2033,6 @@ button.linkish {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 16px;
 }
 
 
@@ -2172,4 +2225,142 @@ a.btn {
 .dgov-state.quiet {
   background: var(--bg-panel-2);
   color: var(--text-dim);
+}
+
+
+/* --- the detail pane as named bands (slice 7) ---------------------------- */
+/* It sits directly on the overlay's own column: a card inside a card was
+   two borders, two shadows and 38px of padding for no gain. */
+.review-panel {
+  display: flex;
+  flex-direction: column;
+  /* No padding at the foot: the action bar is sticky and has to reach the
+     bottom edge of the scroll box, not float 16px above it. */
+  padding: 16px 16px 0;
+}
+
+.rp-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 24px;
+  margin: 0 0 4px;
+  padding: 0 0 13px;
+  border-bottom: 1px solid var(--border);
+}
+.rp-facts > div {
+  display: grid;
+  gap: 2px;
+}
+.rp-facts dt {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+.rp-facts dd {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.rp-sec {
+  border-bottom: 1px solid var(--border);
+}
+.rp-sec-h {
+  margin: 0;
+  font: inherit;
+}
+.rp-sec-top {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 0;
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+  color: var(--text);
+  text-align: left;
+}
+.rp-sec-top:hover .rp-sec-title {
+  color: var(--accent-2);
+}
+.rp-sec-top:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.rp-sec-caret {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  fill: none;
+  stroke: var(--text-faint);
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 160ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+.rp-sec.open .rp-sec-caret {
+  transform: rotate(90deg);
+}
+.rp-sec-title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+.rp-sec-note {
+  margin-left: auto;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  background: var(--bg-panel-2);
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.rp-sec-note.ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.rp-sec-note.warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.rp-sec-note.bad {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.rp-sec-body {
+  padding: 0 0 16px;
+}
+/* .form-grid and friends set display, which would beat the [hidden] default. */
+.rp-sec-body[hidden] {
+  display: none;
+}
+
+/* The three decisions stay reachable however far the bands scroll. */
+.rp-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  display: flex;
+  gap: 8px;
+  /* Bled to the pane edges so nothing scrolls past beside it. */
+  margin: 14px -16px 0;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+.rp-actions .btn {
+  flex: 1;
+  /* Three equal thirds of 452px; without this "Approve → Zoho" wraps and
+     the whole bar grows to two lines. */
+  white-space: nowrap;
+  padding-left: 8px;
+  padding-right: 8px;
 }
