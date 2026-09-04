@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { supabase } from "../lib/supabase";
 import type { DocumentRow } from "../types";
 
@@ -6,6 +6,8 @@ export function useDocuments() {
   const [documents, setDocuments] = useState<DocumentRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  const reloadRef = useRef<() => Promise<void>>(async () => {});
 
   useEffect(() => {
     let cancelled = false;
@@ -33,6 +35,7 @@ export function useDocuments() {
       setLoading(false);
     }
 
+    reloadRef.current = load;
     void load();
 
     const channel = supabase
@@ -59,5 +62,7 @@ export function useDocuments() {
     };
   }, []);
 
-  return { documents, loading, error, setDocuments };
+  const reload = useCallback(() => reloadRef.current(), []);
+
+  return { documents, loading, error, setDocuments, reload };
 }

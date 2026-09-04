@@ -1570,3 +1570,414 @@ button.linkish {
 .override-reason { display: grid; gap: 0.3rem; font-size: 0.8rem; color: var(--muted); }
 .override-reason input { font: inherit; color: var(--text); background: rgba(255,255,255,0.05); border: 1px solid var(--line); border-radius: 8px; padding: 0.45rem 0.6rem; }
 .override-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+
+
+/* ===========================================================================
+   The documents grid — one document per row, everything in the row itself.
+   Wide on purpose: it scrolls sideways with the document pinned left and the
+   ready tick pinned right, and the grid scrolls rather than the window.
+   =========================================================================== */
+.dg-page {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 62px);
+  min-height: 0;
+}
+.dg-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px 0;
+  flex: none;
+}
+.dg-head h2 {
+  margin: 0;
+  font-size: 19px;
+}
+.dg-head-sp {
+  margin-left: auto;
+}
+
+.dg {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.dg-stages {
+  display: flex;
+  align-items: center;
+  gap: 26px;
+  padding: 12px 18px 0;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex: none;
+}
+.dg-stages::-webkit-scrollbar {
+  display: none;
+}
+.dg-stage {
+  border: 0;
+  background: transparent;
+  padding: 0 0 11px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font: inherit;
+  font-size: 14.5px;
+  font-weight: 500;
+  color: var(--text-dim);
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.dg-stage:hover {
+  color: var(--text);
+}
+.dg-stage.active {
+  color: var(--text);
+  font-weight: 600;
+  border-bottom-color: var(--accent);
+}
+.dg-n {
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+  background: var(--bg-panel-2);
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+.dg-stage.active .dg-n {
+  background: var(--accent-soft);
+  color: var(--accent-2);
+}
+.dg-stage.bad .dg-n {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.dg-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 18px;
+  flex: none;
+}
+.dg-tools-sp {
+  margin-left: auto;
+}
+.dg-seek {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 7px 12px;
+  color: var(--text-faint);
+  min-width: 280px;
+}
+.dg-seek svg {
+  width: 15px;
+  height: 15px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  flex: none;
+}
+.dg-seek input {
+  border: 0;
+  background: transparent;
+  outline: none;
+  font: inherit;
+  font-size: 12.5px;
+  width: 100%;
+  color: var(--text);
+}
+
+.dg-card {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border);
+}
+.dg-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.dg-table {
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 12.5px;
+  width: max-content;
+  min-width: 100%;
+}
+.dg-table th {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg-panel-2);
+  text-align: left;
+  white-space: nowrap;
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  font-weight: 600;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.dg-table td {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: middle;
+  white-space: nowrap;
+  background: var(--bg-panel);
+}
+.dg-table tbody tr {
+  cursor: pointer;
+}
+.dg-table tbody tr:hover td {
+  background: var(--bg-panel-2);
+}
+.dg-table tbody tr[aria-selected="true"] td {
+  background: var(--accent-soft);
+}
+.dg-table td.n,
+.dg-table th.n {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* the two edges that never scroll away */
+.dg-table .dg-k-doc {
+  position: sticky;
+  left: 0;
+  z-index: 4;
+  box-shadow: 1px 0 0 var(--border);
+}
+.dg-table .dg-k-ready {
+  position: sticky;
+  right: 0;
+  z-index: 4;
+  box-shadow: -1px 0 0 var(--border);
+  width: 76px;
+  text-align: center;
+}
+.dg-table th.dg-k-doc,
+.dg-table th.dg-k-ready {
+  z-index: 6;
+}
+
+.dg-doc {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.dg-mark {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  font-weight: 700;
+  flex: none;
+  border: 1px solid var(--border);
+  background: var(--accent-soft);
+  color: var(--accent-2);
+}
+.dg-doc-t {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.dg-doc-1 {
+  font-weight: 600;
+  font-size: 12.5px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dg-doc-2 {
+  font-size: 11px;
+  color: var(--text-faint);
+  margin-top: 1px;
+}
+.dg-two {
+  display: flex;
+  flex-direction: column;
+}
+.dg-a {
+  font-weight: 500;
+}
+.dg-b {
+  font-size: 11px;
+  color: var(--text-faint);
+  margin-top: 1px;
+}
+.dg-none {
+  color: var(--text-faint);
+}
+.dg-bad {
+  color: var(--danger);
+  font-weight: 600;
+}
+.dg-zid {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+}
+
+.dg-ready {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-faint);
+  display: grid;
+  place-items: center;
+  margin: 0 auto;
+  opacity: 0.45;
+}
+.dg-ready svg {
+  width: 15px;
+  height: 15px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.dg-ready.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+  opacity: 1;
+}
+
+.dg-empty {
+  padding: 26px 18px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  margin: 0;
+}
+.dg-pager {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 11px 18px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--bg-input);
+  flex: none;
+}
+
+/* --------------------------------------------------------- the overlay --- */
+.dgov-scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(12, 20, 16, 0.28);
+  backdrop-filter: blur(2px);
+  z-index: 50;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.46s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.dgov-scrim.on {
+  opacity: 1;
+  pointer-events: auto;
+}
+.dgov {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: min(430px, 26vw);
+  z-index: 52;
+  background: var(--bg);
+  border-left: 1px solid var(--border);
+  box-shadow: 0 24px 64px rgba(12, 20, 16, 0.24);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  transform: translateX(64px);
+  opacity: 0;
+  pointer-events: none;
+  will-change: transform, opacity;
+  transition: transform 0.5s cubic-bezier(0.32, 0.72, 0, 1), opacity 0.34s ease;
+}
+.dgov.on {
+  transform: none;
+  opacity: 1;
+  pointer-events: auto;
+  transition: transform 0.5s cubic-bezier(0.32, 0.72, 0, 1), opacity 0.26s ease;
+}
+@media (max-width: 1100px) {
+  .dgov {
+    left: 0;
+  }
+}
+.dgov-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  flex: none;
+}
+.dgov-title {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.dgov-1 {
+  font-size: 15px;
+  font-weight: 600;
+}
+.dgov-2 {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-top: 1px;
+}
+.dgov-x {
+  margin-left: auto;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-dim);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  flex: none;
+}
+.dgov-x svg {
+  width: 15px;
+  height: 15px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+}
+.dgov-x:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+.dgov-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px;
+}
