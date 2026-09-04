@@ -16,6 +16,7 @@ export function DocumentsPage() {
   const [failedJudgmentIds, setFailedJudgmentIds] = useState<Set<string>>(
     () => new Set(),
   );
+  const [visibleIds, setVisibleIds] = useState<string[]>([]);
   const [tick, setTick] = useState(0);
   const [rulesVersion, setRulesVersion] = useState(0);
 
@@ -72,6 +73,28 @@ export function DocumentsPage() {
     setTick((n) => n + 1);
   }
 
+  // Prev/Next walks the queue the user is looking at, not every document.
+  const at = selectedId ? visibleIds.indexOf(selectedId) : -1;
+  function step(delta: number) {
+    if (at < 0) return;
+    const to = at + delta;
+    if (to < 0 || to >= visibleIds.length) return;
+    setSelectedId(visibleIds[to]);
+  }
+
+  const failed = selected ? failedJudgmentIds.has(selected.id) : false;
+  const state: { tone: "good" | "hold" | "quiet"; label: string } | undefined =
+    !selected
+      ? undefined
+      : selected.status === "synced"
+        ? { tone: "good", label: `In Zoho Books${selected.zoho_bill_id ? ` — ${selected.zoho_bill_id}` : ""}` }
+        : failed
+          ? { tone: "hold", label: "Held by a failed check — posting needs a written override" }
+          : (selected.checks_total ?? 0) > 0 &&
+              selected.checks_passed === selected.checks_total
+            ? { tone: "good", label: "Every check passed" }
+            : { tone: "quiet", label: `Checks: ${selected.checks_passed ?? 0} of ${selected.checks_total ?? 0}` };
+
   const party =
     selected?.vendor_raw || selected?.customer_raw || "Document";
 
@@ -99,6 +122,7 @@ export function DocumentsPage() {
         documents={documents}
         selectedId={selectedId}
         onOpen={setSelectedId}
+        onVisible={setVisibleIds}
         failedJudgmentIds={failedJudgmentIds}
         loading={loading}
       />
@@ -111,6 +135,11 @@ export function DocumentsPage() {
             ? `${selected.invoice_number ?? selected.id.slice(0, 8)} · ${selected.status}`
             : undefined
         }
+        fileUrl={selected?.file_url}
+        state={state}
+        hasPrev={at > 0}
+        hasNext={at >= 0 && at < visibleIds.length - 1}
+        onStep={step}
         onClose={() => setSelectedId(null)}
       >
         <ReviewPanel

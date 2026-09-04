@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { DocumentRow } from "../types";
 
 /**
@@ -95,6 +95,8 @@ interface Props {
   documents: DocumentRow[];
   selectedId: string | null;
   onOpen: (id: string) => void;
+  /** The filtered, sorted queue, so Prev/Next steps what is on screen. */
+  onVisible: (ids: string[]) => void;
   failedJudgmentIds: Set<string>;
   loading: boolean;
 }
@@ -103,6 +105,7 @@ export function DocumentGrid({
   documents,
   selectedId,
   onOpen,
+  onVisible,
   failedJudgmentIds,
   loading,
 }: Props) {
@@ -130,6 +133,14 @@ export function DocumentGrid({
           .some((v) => (v ?? "").toString().toLowerCase().includes(q));
       });
   }, [documents, stage, query]);
+
+  // Compared by value, not identity: rows is a fresh array every render, and
+  // the parent re-renders on every keystroke in the panel.
+  const visibleKey = rows.map((r) => r.id).join(",");
+  useEffect(() => {
+    onVisible(visibleKey ? visibleKey.split(",") : []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleKey]);
 
   return (
     <section className="dg">
