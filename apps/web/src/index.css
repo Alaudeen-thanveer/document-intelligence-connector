@@ -80,14 +80,24 @@ a {
   color: var(--text-dim);
 }
 
+/* One description of what a field looks like in the review panel. The line
+   fields used to set only their width, so they arrived as raw browser
+   controls - square corners, native metrics - sitting beside the rounded
+   ones in every other band. */
 .reviewer-field input,
-.form-grid input {
+.form-grid input,
+.form-grid select,
+.line-item-row input,
+.line-item-row select {
   border: 1px solid var(--border);
   background: var(--bg-input);
   color: var(--text);
   border-radius: 12px;
   padding: 10px 12px;
   font: inherit;
+}
+
+.reviewer-field input {
   min-width: 180px;
 }
 
@@ -354,15 +364,7 @@ a {
   color: var(--text-dim);
 }
 
-.form-grid select {
-  border: 1px solid var(--border);
-  background: var(--bg-input);
-  color: var(--text);
-  border-radius: 12px;
-  padding: 10px 12px;
-  font: inherit;
-  min-width: 180px;
-}
+
 
 .zoho-sync-row {
   display: flex;
@@ -631,16 +633,26 @@ a {
 
 /* Review line items. Seven columns across needed 452px of track before the
    description got a pixel; the pane is 420px, so a line folds instead. */
+.line-item-row,
+.line-item-head {
+  /* The record's fields sit inside a .form-grid label, which sets this; the
+     line's do not, so they were inheriting the panel's 16px and reading a
+     size larger than every other field in the pane. */
+  font-size: 0.8rem;
+}
+
 .line-item-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 62px 88px 30px;
+  /* Wider than before: a field with the panel's own 12px padding needs 26px
+     of it back before a digit can be seen. */
+  grid-template-columns: minmax(0, 1fr) 76px 104px 38px;
   grid-template-areas:
     "desc qty  rate del"
     "acct acct amt  amt";
   gap: 8px;
   align-items: center;
-  margin-bottom: 12px;
-  padding-bottom: 12px;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
   border-bottom: 1px solid var(--border);
 }
 .line-item-row:last-of-type {
@@ -653,16 +665,15 @@ a {
    an invoice line reads on paper. */
 .line-item-head {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 62px 88px 30px;
+  grid-template-columns: minmax(0, 1fr) 76px 104px 38px;
   gap: 8px;
   margin-bottom: 6px;
+  padding-left: 2px;
 }
+/* Said the way "Vendor" and "Invoice number" are said, two bands above. */
 .line-item-head span {
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-faint);
+  font-size: 0.8rem;
+  color: var(--text-dim);
 }
 
 .li-desc {
@@ -682,8 +693,9 @@ a {
 }
 .line-item-row > .btn {
   grid-area: del;
-  padding-left: 0;
-  padding-right: 0;
+  padding: 0;
+  height: 42px;
+  border-radius: 12px;
 }
 /* Row 3 named explicitly: the dimensions are conditional, and an area in
    grid-template-areas would leave an empty row behind when they are absent. */
@@ -700,8 +712,7 @@ a {
 }
 
 .li-dims select {
-  max-width: 150px;
-  font-size: 0.85rem;
+  max-width: 190px;
 }
 
 .line-item-row input,
