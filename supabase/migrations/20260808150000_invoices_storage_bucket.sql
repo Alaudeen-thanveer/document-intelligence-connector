@@ -16,7 +16,10 @@ values (
   ]::text[]
 )
 on conflict (id) do update set
-  public = excluded.public,
+  -- `public` is deliberately NOT re-asserted here. It used to be, and because
+  -- this file sorts before 20260817153000 (which makes the bucket private),
+  -- any replay of it silently re-opened customer invoices to anonymous GET.
+  -- See 20260905090000_invoices_bucket_private.sql.
   file_size_limit = excluded.file_size_limit,
   allowed_mime_types = excluded.allowed_mime_types;
 
