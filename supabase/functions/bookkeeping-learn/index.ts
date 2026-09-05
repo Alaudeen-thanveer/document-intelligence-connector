@@ -46,6 +46,7 @@ import {
   buildBankPatterns,
 } from "./bank_patterns.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
 type DocKind =
   | "bill"
@@ -137,76 +138,36 @@ function getSupabase(): SupabaseClient {
   });
 }
 
-function apiBase(): string {
-  return Deno.env.get("ZOHO_API_BASE_URL")?.trim() ||
-    "https://www.zohoapis.com/books/v3";
-}
-function orgId(): string {
-  return requireEnv("ZOHO_ORGANIZATION_ID");
-}
 
 // ---------------------------------------------------------------------------
-// OAuth: cached token first (Zoho throttles refresh hard), refresh on miss.
+// OAuth: cached z first (Zoho throttles refresh hard), refresh on miss.
 // ---------------------------------------------------------------------------
-async function refreshAccessToken(supabase: SupabaseClient): Promise<string> {
-  const accountsUrl = Deno.env.get("ZOHO_ACCOUNTS_URL")?.trim() ||
-    "https://accounts.zoho.com";
-  const res = await fetch(`${accountsUrl}/oauth/v2/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      refresh_token: requireEnv("ZOHO_REFRESH_TOKEN"),
-      client_id: requireEnv("ZOHO_CLIENT_ID"),
-      client_secret: requireEnv("ZOHO_CLIENT_SECRET"),
-      grant_type: "refresh_token",
-    }),
-  });
-  const payload = await res.json();
-  if (!res.ok || !payload?.access_token) {
-    throw new Error(
-      `Zoho token refresh failed (${res.status}): ${JSON.stringify(payload)}`,
-    );
-  }
-  const token = String(payload.access_token);
-  await supabase.from("zoho_oauth_tokens").upsert({
-    id: 1,
-    access_token: token,
-    expires_at: new Date(Date.now() + 55 * 60_000).toISOString(),
-    updated_at: new Date().toISOString(),
-  });
-  return token;
-}
 
-async function getAccessToken(supabase: SupabaseClient): Promise<string> {
-  const existing = Deno.env.get("ZOHO_ACCESS_TOKEN")?.trim();
-  if (existing) return existing;
-  const { data } = await supabase
-    .from("zoho_oauth_tokens")
-    .select("access_token, expires_at")
-    .eq("id", 1)
-    .maybeSingle();
-  if (
-    data?.access_token &&
-    new Date(String(data.expires_at)).getTime() > Date.now() + 120_000
-  ) {
-    return String(data.access_token);
-  }
-  return await refreshAccessToken(supabase);
+/**
+ * The company's own Zoho organisation and a z for it. This used to read
+ * ZOHO_REFRESH_TOKEN and ZOHO_ORGANIZATION_ID from the environment, which is
+ * one organisation for the whole deployment — see _shared/zoho_auth.ts.
+ */
+async function getAccessToken(
+  supabase: SupabaseClient,
+  companyId: string,
+): Promise<ZohoAuth> {
+  return await zohoAuthFor(supabase, companyId);
 }
 
 // ---------------------------------------------------------------------------
 // Zoho fetch with gentle backoff on 429 / 5xx.
 // ---------------------------------------------------------------------------
 async function zohoGet(
-  accessToken: string,
+  z: ZohoAuth,
   path: string,
   params: Record<string, string> = {},
 ): Promise<Record<string, unknown>> {
-  const qs = new URLSearchParams({ organization_id: orgId(), ...params });
-  const url = `${apiBase()}/${path}?${qs.toString()}`;
+  const qs = new URLSearchParams({ organization_id: z.organizationId, ...params });
+  const url = `${z.apiBase}/${path}?${qs.toString()}`;
   for (let attempt = 1; attempt <= 4; attempt++) {
     const res = await zohoFetch(url, {
-      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+      headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` },
     });
     const raw = await res.json().catch(() => ({}));
     if (res.ok) return raw as Record<string, unknown>;
@@ -222,7 +183,7 @@ async function zohoGet(
 }
 
 async function listIds(
-  accessToken: string,
+  z: ZohoAuth,
   kind: DocKind,
   fromDate: string,
   cap: number,
@@ -233,7 +194,7 @@ async function listIds(
   while (ids.length < cap && page <= 50) {
     // Journals use journal_date for filtering/sorting; the others use date.
     const dateField = kind === "journal" ? "journal_date" : "date";
-    const raw = await zohoGet(accessToken, path, {
+    const raw = await zohoGet(z, path, {
       per_page: "200",
       page: String(page),
       [`${dateField}_start`]: fromDate,
@@ -373,12 +334,12 @@ function bankTxnKind(t: string): BankTxnKind {
  */
 async function fetchBankTransactions(
   supabase: SupabaseClient,
-  token: string,
+  z: ZohoAuth,
   companyId: string,
   fromDate: string,
   cap: number,
 ): Promise<number> {
-  const accts = await zohoGet(token, "bankaccounts");
+  const accts = await zohoGet(z, "bankaccounts");
   const accounts = ((accts.bankaccounts as Array<Record<string, unknown>>) ?? [])
     .filter((a) => a.account_id != null);
   let fetched = 0;
@@ -389,7 +350,7 @@ async function fetchBankTransactions(
     while (count < cap && page <= 25) {
       let raw: Record<string, unknown>;
       try {
-        raw = await zohoGet(token, "banktransactions", {
+        raw = await zohoGet(z, "banktransactions", {
           account_id: accountId,
           date_start: fromDate,
           per_page: "200",
@@ -399,7 +360,7 @@ async function fetchBankTransactions(
         });
       } catch {
         // Some orgs reject the date filter here; fall back to unfiltered.
-        raw = await zohoGet(token, "banktransactions", {
+        raw = await zohoGet(z, "banktransactions", {
           account_id: accountId,
           per_page: "200",
           page: String(page),
@@ -425,7 +386,7 @@ async function fetchBankTransactions(
         let payload: Record<string, unknown> = { banktransaction: row };
         if (kind !== "customer_payment" && kind !== "vendor_payment") {
           try {
-            const detail = await zohoGet(token, `banktransactions/${id}`);
+            const detail = await zohoGet(z, `banktransactions/${id}`);
             if (detail.banktransaction) {
               payload = {
                 banktransaction: {
@@ -598,7 +559,7 @@ Deno.serve(async (req) => {
     let bankTransactionsFetched = 0;
 
     if (!input.reanalyze_only) {
-      const token = await getAccessToken(supabase);
+      const z = await getAccessToken(supabase, companyId);
       const from = new Date();
       from.setMonth(from.getMonth() - monthsBack);
       const fromDate = from.toISOString().slice(0, 10);
@@ -613,7 +574,7 @@ Deno.serve(async (req) => {
           "customerpayment",
         ] as const
       ) {
-        const ids = await listIds(token, kind, fromDate, cap);
+        const ids = await listIds(z, kind, fromDate, cap);
         const path = KIND_META[kind].path;
         // Skip ids we already have raw payloads for.
         const { data: have } = await supabase
@@ -631,7 +592,7 @@ Deno.serve(async (req) => {
 
         for (const id of ids) {
           if (haveSet.has(id) && !refresh) continue;
-          const detail = await zohoGet(token, `${path}/${id}`);
+          const detail = await zohoGet(z, `${path}/${id}`);
           await supabase.from("bk_history_raw").upsert({
             company_id: companyId,
             doc_kind: kind,
@@ -652,7 +613,7 @@ Deno.serve(async (req) => {
       // offset_account_name); detail is fetched only for non-payment kinds
       // to resolve the category account's id, and only when unseen.
       bankTransactionsFetched = await fetchBankTransactions(
-        supabase, token, companyId, fromDate, cap,
+        supabase, z, companyId, fromDate, cap,
       );
     }
 

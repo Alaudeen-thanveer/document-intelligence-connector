@@ -19,6 +19,7 @@ import {
   type ZohoVendor,
 } from "./match-entities.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
 interface PushInput {
   document_id: string;
@@ -185,16 +186,7 @@ function parseJsonEnv<T>(name: string): T | null {
   }
 }
 
-function apiBase(): string {
-  return (
-    Deno.env.get("ZOHO_API_BASE_URL")?.trim() ||
-    "https://www.zohoapis.com/books/v3"
-  );
-}
 
-function orgId(): string {
-  return requireEnv("ZOHO_ORGANIZATION_ID");
-}
 
 function toZohoBillBody(
   bill: ZohoBillMapped,
@@ -236,17 +228,17 @@ function toZohoBillBody(
 
 /** Find an existing bill by number + vendor (for idempotent creates). */
 async function findBillByNumber(
-  accessToken: string,
+  z: ZohoAuth,
   billNumber: string,
   vendorId: string,
 ): Promise<ZohoCallResult> {
-  const url = `${apiBase()}/bills?organization_id=${
-    encodeURIComponent(orgId())
+  const url = `${z.apiBase}/bills?organization_id=${
+    encodeURIComponent(z.organizationId)
   }&bill_number=${encodeURIComponent(billNumber)}&vendor_id=${
     encodeURIComponent(vendorId)
   }`;
   const res = await zohoFetch(url, {
-    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` },
   });
   const raw = await res.json().catch(() => null);
   if (!res.ok) return { ok: false, status: res.status, raw };
@@ -256,56 +248,7 @@ async function findBillByNumber(
     : { ok: false, status: 404, raw: null };
 }
 
-/** Exchange refresh token for a new access token (OAuth2). */
-async function refreshAccessToken(): Promise<string> {
-  const clientId = requireEnv("ZOHO_CLIENT_ID");
-  const clientSecret = requireEnv("ZOHO_CLIENT_SECRET");
-  const refreshToken = requireEnv("ZOHO_REFRESH_TOKEN");
-  const accountsUrl =
-    Deno.env.get("ZOHO_ACCOUNTS_URL")?.trim() || "https://accounts.zoho.com";
 
-  const params = new URLSearchParams({
-    refresh_token: refreshToken,
-    client_id: clientId,
-    client_secret: clientSecret,
-    grant_type: "refresh_token",
-  });
-
-  const res = await fetch(`${accountsUrl}/oauth/v2/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: params,
-  });
-
-  const payload = await res.json();
-  if (!res.ok || !payload?.access_token) {
-    throw new Error(
-      `Zoho token refresh failed (${res.status}): ${JSON.stringify(payload)}`,
-    );
-  }
-  const token = String(payload.access_token);
-  await cacheAccessToken(token);
-  return token;
-}
-
-/** Best-effort write-through of the token cache (service-role only table). */
-async function cacheAccessToken(token: string): Promise<void> {
-  try {
-    const supabase = getSupabase();
-    await supabase.from("zoho_oauth_tokens").upsert({
-      id: 1,
-      access_token: token,
-      // Zoho tokens last ~1h; refresh a little early.
-      expires_at: new Date(Date.now() + 55 * 60_000).toISOString(),
-      updated_at: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.warn(
-      "zoho_oauth_tokens cache write failed:",
-      err instanceof Error ? err.message : String(err),
-    );
-  }
-}
 
 /** Cached token when still valid — Zoho throttles the refresh endpoint
  * hard, and a refresh per function call locks the connection out. */
@@ -329,12 +272,14 @@ async function readCachedAccessToken(): Promise<string | null> {
   return null;
 }
 
-async function getAccessToken(): Promise<string> {
-  const existing = Deno.env.get("ZOHO_ACCESS_TOKEN")?.trim();
-  if (existing) return existing;
-  const cached = await readCachedAccessToken();
-  if (cached) return cached;
-  return await refreshAccessToken();
+/**
+ * The calling company's own Zoho organisation and a token for it. This used
+ * to read ZOHO_REFRESH_TOKEN and ZOHO_ORGANIZATION_ID from the environment,
+ * which is one organisation for the whole deployment — see
+ * _shared/zoho_auth.ts, which also holds the token cache, now per company.
+ */
+async function getZoho(companyId: string): Promise<ZohoAuth> {
+  return await zohoAuthFor(getSupabase(), companyId);
 }
 
 type ZohoCallResult = {
@@ -347,11 +292,12 @@ type ZohoCallResult = {
  * Run a Zoho HTTP call; on 401/403/5xx refresh token and retry once.
  */
 async function withZohoRetry(
-  call: (accessToken: string) => Promise<ZohoCallResult>,
-): Promise<{ result: ZohoCallResult; accessToken: string; retried: boolean }> {
-  let accessToken = await getAccessToken();
+  companyId: string,
+  call: (z: ZohoAuth) => Promise<ZohoCallResult>,
+): Promise<{ result: ZohoCallResult; z: ZohoAuth; retried: boolean }> {
+  let z = await getZoho(companyId);
   let retried = false;
-  let result = await call(accessToken);
+  let result = await call(z);
 
   if (!result.ok) {
     const shouldRetry =
@@ -362,25 +308,26 @@ async function withZohoRetry(
       console.log(
         `Zoho call failed (${result.status}); refreshing token and retrying once`,
       );
-      accessToken = await refreshAccessToken();
+      // A cached token can be revoked before it expires; ask for a new one.
+      z = await zohoAuthFor(getSupabase(), companyId, { forceRefresh: true });
       retried = true;
-      result = await call(accessToken);
+      result = await call(z);
     }
   }
 
-  return { result, accessToken, retried };
+  return { result, z, retried };
 }
 
 async function createZohoBill(
-  accessToken: string,
+  z: ZohoAuth,
   billBody: Record<string, unknown>,
 ): Promise<ZohoCallResult & { externalDocId?: string }> {
   const url =
-    `${apiBase()}/bills?organization_id=${encodeURIComponent(orgId())}`;
+    `${z.apiBase}/bills?organization_id=${encodeURIComponent(z.organizationId)}`;
   const res = await zohoFetch(url, {
     method: "POST",
     headers: {
-      Authorization: `Zoho-oauthtoken ${accessToken}`,
+      Authorization: `Zoho-oauthtoken ${z.accessToken}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(billBody),
@@ -404,7 +351,7 @@ async function createZohoBill(
 }
 
 async function attachBillDocument(
-  accessToken: string,
+  z: ZohoAuth,
   billId: string,
   bytes: Uint8Array,
   contentType: string,
@@ -418,13 +365,13 @@ async function attachBillDocument(
   );
 
   const url =
-    `${apiBase()}/bills/${encodeURIComponent(billId)}/attachment?organization_id=${
-      encodeURIComponent(orgId())
+    `${z.apiBase}/bills/${encodeURIComponent(billId)}/attachment?organization_id=${
+      encodeURIComponent(z.organizationId)
     }`;
   const res = await zohoFetch(url, {
     method: "POST",
     headers: {
-      Authorization: `Zoho-oauthtoken ${accessToken}`,
+      Authorization: `Zoho-oauthtoken ${z.accessToken}`,
     },
     body: form,
   });
@@ -433,15 +380,15 @@ async function attachBillDocument(
 }
 
 async function getZohoBill(
-  accessToken: string,
+  z: ZohoAuth,
   billId: string,
 ): Promise<ZohoCallResult> {
   const url =
-    `${apiBase()}/bills/${encodeURIComponent(billId)}?organization_id=${
-      encodeURIComponent(orgId())
+    `${z.apiBase}/bills/${encodeURIComponent(billId)}?organization_id=${
+      encodeURIComponent(z.organizationId)
     }`;
   const res = await zohoFetch(url, {
-    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` },
   });
   const raw = await res.json().catch(async () => await res.text());
   return { ok: res.ok, status: res.status, raw };
@@ -456,7 +403,7 @@ async function getZohoBill(
  * shown to hold. Zoho refuses over-application, and we surface its message.
  */
 async function applyCreditsToDoc(
-  accessToken: string,
+  z: ZohoAuth,
   docKind: "invoice" | "bill",
   docId: string,
   credits: NonNullable<PushInput["apply_credits"]>,
@@ -478,10 +425,10 @@ async function applyCreditsToDoc(
     if (vcs.length) body.apply_vendor_credits = vcs;
   }
   if (!Object.keys(body).length) return { applied, results };
-  const url = `${apiBase()}/${docKind === "invoice" ? "invoices" : "bills"}/${encodeURIComponent(docId)}/credits?organization_id=${encodeURIComponent(orgId())}`;
+  const url = `${z.apiBase}/${docKind === "invoice" ? "invoices" : "bills"}/${encodeURIComponent(docId)}/credits?organization_id=${encodeURIComponent(z.organizationId)}`;
   const res = await zohoFetch(url, {
     method: "POST",
-    headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   const raw = await res.json().catch(async () => await res.text());
@@ -492,19 +439,19 @@ async function applyCreditsToDoc(
 }
 
 async function createZohoDoc(
-  accessToken: string,
+  z: ZohoAuth,
   path: "invoices" | "expenses",
   body: Record<string, unknown>,
   rootKey: "invoice" | "expense",
   idKey: "invoice_id" | "expense_id",
 ): Promise<ZohoCallResult & { externalDocId?: string }> {
-  const url = `${apiBase()}/${path}?organization_id=${
-    encodeURIComponent(orgId())
+  const url = `${z.apiBase}/${path}?organization_id=${
+    encodeURIComponent(z.organizationId)
   }`;
   const res = await zohoFetch(url, {
     method: "POST",
     headers: {
-      Authorization: `Zoho-oauthtoken ${accessToken}`,
+      Authorization: `Zoho-oauthtoken ${z.accessToken}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
@@ -529,7 +476,7 @@ async function createZohoDoc(
 
 /** Attach the source file to an invoice (attachment) or expense (receipt). */
 async function attachToZohoDoc(
-  accessToken: string,
+  z: ZohoAuth,
   urlPath: string,
   fieldName: "attachment" | "receipt",
   bytes: Uint8Array,
@@ -542,12 +489,12 @@ async function attachToZohoDoc(
     new Blob([bytes], { type: contentType || "application/pdf" }),
     filename || "document.pdf",
   );
-  const url = `${apiBase()}/${urlPath}?organization_id=${
-    encodeURIComponent(orgId())
+  const url = `${z.apiBase}/${urlPath}?organization_id=${
+    encodeURIComponent(z.organizationId)
   }`;
   const res = await zohoFetch(url, {
     method: "POST",
-    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` },
     body: form,
   });
   const raw = await res.json().catch(async () => await res.text());
@@ -555,12 +502,12 @@ async function attachToZohoDoc(
 }
 
 async function fetchVendorsFromZoho(
-  accessToken: string,
+  z: ZohoAuth,
 ): Promise<ZohoVendor[]> {
   const url =
-    `${apiBase()}/contacts?organization_id=${encodeURIComponent(orgId())}&contact_type=vendor&per_page=200`;
+    `${z.apiBase}/contacts?organization_id=${encodeURIComponent(z.organizationId)}&contact_type=vendor&per_page=200`;
   const res = await zohoFetch(url, {
-    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` },
   });
   const raw = await res.json();
   if (!res.ok) {
@@ -577,12 +524,12 @@ async function fetchVendorsFromZoho(
 }
 
 async function fetchAccountsFromZoho(
-  accessToken: string,
+  z: ZohoAuth,
 ): Promise<ZohoAccount[]> {
   const url =
-    `${apiBase()}/chartofaccounts?organization_id=${encodeURIComponent(orgId())}&per_page=200`;
+    `${z.apiBase}/chartofaccounts?organization_id=${encodeURIComponent(z.organizationId)}&per_page=200`;
   const res = await zohoFetch(url, {
-    headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+    headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` },
   });
   const raw = await res.json();
   if (!res.ok) {
@@ -744,6 +691,11 @@ Deno.serve(async (req) => {
     errorBody: (m) => ({ error: m }),
   });
   if (isCompanyFail(tenant)) return tenant.response;
+  const companyId = tenant.companyId;
+  // Resolved here rather than inside the bill branch: the sync-log payloads
+  // record which Zoho organisation was posted to, and they are written from
+  // branches that never enter it.
+  let zAuth = await getZoho(companyId);
 
   try {
     const supabase = getSupabase();
@@ -1056,8 +1008,8 @@ Deno.serve(async (req) => {
       }
 
       const { result: createResult, retried: createRetried } =
-        await withZohoRetry((tok) =>
-          createZohoDoc(tok, path, createBody, rootKey, idKey)
+        await withZohoRetry(companyId, (z) =>
+          createZohoDoc(z, path, createBody, rootKey, idKey)
         );
 
       if (
@@ -1101,8 +1053,8 @@ Deno.serve(async (req) => {
       let creditsApplied: { applied: number; results: Array<Record<string, unknown>> } | null = null;
       if (postAs === "invoice" && input.apply_credits?.length) {
         try {
-          const { result: cr } = await withZohoRetry(async (tok) => {
-            const r = await applyCreditsToDoc(tok, "invoice", externalDocId, input.apply_credits!);
+          const { result: cr } = await withZohoRetry(companyId, async (z) => {
+            const r = await applyCreditsToDoc(z, "invoice", externalDocId, input.apply_credits!);
             creditsApplied = r;
             return { ok: r.results.every((x) => x.ok), status: 200, raw: r } as ZohoCallResult;
           });
@@ -1122,9 +1074,9 @@ Deno.serve(async (req) => {
         const attachPath = postAs === "invoice"
           ? `invoices/${encodeURIComponent(externalDocId)}/attachment`
           : `expenses/${encodeURIComponent(externalDocId)}/receipt`;
-        const { result: attachResult } = await withZohoRetry((tok) =>
+        const { result: attachResult } = await withZohoRetry(companyId, (z) =>
           attachToZohoDoc(
-            tok,
+            z,
             attachPath,
             postAs === "invoice" ? "attachment" : "receipt",
             file.bytes,
@@ -1148,7 +1100,7 @@ Deno.serve(async (req) => {
         document_id: input.document_id,
         external_doc_id: externalDocId,
         erp_sync_log_id: syncRow.id,
-        sandbox_organization_id: orgId(),
+        sandbox_organization_id: zAuth.organizationId,
         retried: createRetried,
         credits_applied: creditsApplied,
         attachment: {
@@ -1164,7 +1116,7 @@ Deno.serve(async (req) => {
     // ------------------------------------------------------------------
     // Bill path (default) — fuzzy matching with optional UI overrides.
     // ------------------------------------------------------------------
-    let accessToken = await getAccessToken();
+
     let vendors =
       input.vendors ??
       parseJsonEnv<ZohoVendor[]>("ZOHO_VENDORS_JSON") ??
@@ -1185,14 +1137,14 @@ Deno.serve(async (req) => {
     const needVendors = vendors.length === 0 && !defaultVendorId;
 
     if (needVendors || needAccounts) {
-      const { result: tokenProbe, accessToken: token, retried } =
-        await withZohoRetry(async (tok) => {
+      const { result: tokenProbe, z: token, retried } =
+        await withZohoRetry(companyId, async (z) => {
           try {
             if (needVendors && vendors.length === 0) {
-              vendors = await fetchVendorsFromZoho(tok);
+              vendors = await fetchVendorsFromZoho(z);
             }
             if (needAccounts && accounts.length === 0) {
-              accounts = await fetchAccountsFromZoho(tok);
+              accounts = await fetchAccountsFromZoho(z);
             }
             return {
               ok: true,
@@ -1209,7 +1161,7 @@ Deno.serve(async (req) => {
             return { ok: false, status, raw: { error: msg } };
           }
         });
-      accessToken = token;
+      zAuth = token;
       if (
         !resultOk(tokenProbe) &&
         ((needVendors && vendors.length === 0) ||
@@ -1435,10 +1387,10 @@ Deno.serve(async (req) => {
     }
     const {
       result: createResult,
-      accessToken: tokenAfterCreate,
+      z: tokenAfterCreate,
       retried: createRetried,
-    } = await withZohoRetry((tok) => createZohoBill(tok, billBody));
-    accessToken = tokenAfterCreate;
+    } = await withZohoRetry(companyId, (z) => createZohoBill(z, billBody));
+    zAuth = tokenAfterCreate;
 
     let externalDocId: string;
     let recoveredExisting = false;
@@ -1455,9 +1407,9 @@ Deno.serve(async (req) => {
       const rawStr = JSON.stringify(createResult.raw ?? {});
       let recovered: string | null = null;
       if (rawStr.includes("13011")) {
-        const { result: lookup } = await withZohoRetry((tok) =>
+        const { result: lookup } = await withZohoRetry(companyId, (z) =>
           findBillByNumber(
-            tok,
+            z,
             String((billBody as { bill_number: string }).bill_number),
             String(matched.bill.vendor_id),
           )
@@ -1485,8 +1437,8 @@ Deno.serve(async (req) => {
     // On recovery the attachment may already be on the bill — don't duplicate.
     let skipAttach = false;
     if (recoveredExisting) {
-      const { result: preGet } = await withZohoRetry((tok) =>
-        getZohoBill(tok, externalDocId)
+      const { result: preGet } = await withZohoRetry(companyId, (z) =>
+        getZohoBill(z, externalDocId)
       );
       if (preGet.ok && attachmentPresent(preGet.raw).present) {
         skipAttach = true;
@@ -1502,18 +1454,18 @@ Deno.serve(async (req) => {
     if (!skipAttach) {
       const {
         result,
-        accessToken: tokenAfterAttach,
+        z: tokenAfterAttach,
         retried,
-      } = await withZohoRetry((tok) =>
+      } = await withZohoRetry(companyId, (z) =>
         attachBillDocument(
-          tok,
+          z,
           externalDocId,
           file.bytes,
           file.contentType,
           file.filename,
         )
       );
-      accessToken = tokenAfterAttach;
+      zAuth = tokenAfterAttach;
       attachResult = result;
       attachRetried = retried;
 
@@ -1526,8 +1478,8 @@ Deno.serve(async (req) => {
       }
     }
 
-    const { result: getResult } = await withZohoRetry((tok) =>
-      getZohoBill(tok, externalDocId)
+    const { result: getResult } = await withZohoRetry(companyId, (z) =>
+      getZohoBill(z, externalDocId)
     );
     const attachInfo = attachmentPresent(getResult.raw);
 
@@ -1557,8 +1509,8 @@ Deno.serve(async (req) => {
     let billCreditsApplied: { applied: number; results: Array<Record<string, unknown>> } | null = null;
     if (input.apply_credits?.length) {
       try {
-        await withZohoRetry(async (tok) => {
-          const r = await applyCreditsToDoc(tok, "bill", externalDocId, input.apply_credits!);
+        await withZohoRetry(companyId, async (z) => {
+          const r = await applyCreditsToDoc(z, "bill", externalDocId, input.apply_credits!);
           billCreditsApplied = r;
           return { ok: r.results.every((x) => x.ok), status: 200, raw: r } as ZohoCallResult;
         });
@@ -1574,7 +1526,7 @@ Deno.serve(async (req) => {
       document_id: input.document_id,
       external_doc_id: externalDocId,
       erp_sync_log_id: syncRow.id,
-      sandbox_organization_id: orgId(),
+      sandbox_organization_id: zAuth.organizationId,
       usage: meter.summary(),
       money_mapping: {
         currency: mapped.currency ?? null,

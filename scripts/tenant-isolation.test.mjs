@@ -287,42 +287,44 @@ for (const fn of FUNCTIONS) {
 }
 
 /**
- * Known red, and it must stay red until it is really fixed.
+ * Zoho credentials used to be environment variables, so every company on the
+ * deployment shared one organisation and a second client could not be
+ * onboarded. They now live per company: the organisation id in
+ * zoho_connections, the refresh token in Vault.
  *
- * ZOHO_ORGANIZATION_ID and the refresh token are environment variables, so
- * every company on the deployment shares one Zoho organisation. No guard in
- * the functions can close that: each company's books have to live in its own
- * Zoho org, reached with its own credentials.
- *
- * This asks the question structurally rather than by making a Zoho call. An
- * earlier version called zoho-pull and asserted it did not return 200 — and
- * went green the moment the organisation hit its 1,000-call daily rate limit,
- * which says nothing about isolation. A test that can pass for a reason it is
- * not testing is worse than one that fails.
+ * This asks the question of the schema rather than by calling Zoho. An
+ * earlier version called zoho-pull and asserted a non-200 — and went green
+ * the moment the organisation hit its 1,000-call daily rate limit, which says
+ * nothing about isolation. A test that can pass for a reason it is not
+ * testing is worse than one that fails.
  */
-test(
-  "Zoho credentials belong to a company, not to the deployment",
-  // Marked todo on purpose. Left as a plain failure the suite would be red
-  // for ever, and a suite that is always red cannot tell you that something
-  // NEW broke. As a todo it is reported on every run — the standing reminder
-  // that a second client cannot be onboarded — while a red suite still means
-  // exactly one thing: a regression in tenant isolation.
-  { todo: "gate 2: move the Zoho org id and refresh token into per-company storage" },
-  async () => {
-    const cols = await svc(
-      "/rest/v1/company_config?select=*&limit=1",
-    ).then((r) => r.json());
-    const shape = Object.keys(cols?.[0] ?? {});
-    const hasPerCompanyZoho = shape.some((k) => /^zoho_/.test(k));
-    assert.ok(
-      hasPerCompanyZoho,
-      "company_config carries no Zoho credentials, so every company shares the " +
-        "one organisation named by ZOHO_ORGANIZATION_ID. Move the org id and " +
-        "refresh token into per-company storage before onboarding a second " +
-      `client. company_config has: ${shape.join(", ")}`,
-    );
-  },
-);
+test("Zoho credentials belong to a company, not to the deployment", async () => {
+  const rows = await svc(
+    "/rest/v1/zoho_connections?select=company_id,organization_id,refresh_token_secret_id&limit=1",
+  ).then((r) => r.json());
+  assert.ok(
+    Array.isArray(rows),
+    `zoho_connections is not readable: ${JSON.stringify(rows).slice(0, 200)}`,
+  );
+  if (rows.length) {
+    assert.ok(rows[0].company_id, "a connection with no company");
+    assert.ok(rows[0].organization_id, "a connection with no Zoho organisation");
+    assert.ok(rows[0].refresh_token_secret_id, "a connection with no token in Vault");
+  }
+});
+
+test("the refresh token is not readable with the browser's key", async () => {
+  const [conn] = await svc(
+    "/rest/v1/zoho_connections?select=refresh_token_secret_id&limit=1",
+  ).then((r) => r.json());
+  if (!conn) return; // nothing connected on this deployment yet
+  const res = await fetch(`${URL_}/rest/v1/rpc/zoho_refresh_token`, {
+    method: "POST",
+    headers: { apikey: ANON, Authorization: `Bearer ${ANON}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ p_secret_id: conn.refresh_token_secret_id }),
+  });
+  assert.notEqual(res.status, 200, "anon read a company's Zoho refresh token out of Vault");
+});
 
 test("A's own records were not modified by any of B's attempts", async () => {
   const [doc] = await svc(
