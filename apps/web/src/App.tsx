@@ -4,21 +4,15 @@ import type { Session } from "@supabase/supabase-js";
 import { ApiUsagePage } from "./components/ApiUsagePage";
 import { BankPage } from "./components/BankPage";
 import { CashPage } from "./components/CashPage";
+import { VatPage } from "./components/VatPage";
 import { ConnectionsPage } from "./components/ConnectionsPage";
 import { MonthEndPage } from "./components/MonthEndPage";
 import { SignInPage } from "./components/SignInPage";
 import { AppLayout } from "./layout/AppLayout";
 import { supabase } from "./lib/supabase";
+import { LEGACY_HASH } from "./nav";
 import { DocumentsPage } from "./pages/DocumentsPage";
 import { RulesPage } from "./pages/RulesPage";
-
-const LEGACY_HASH: Record<string, string> = {
-  connections: "/connections",
-  "month-end": "/month-end",
-  "api-usage": "/api-usage",
-  rules: "/rules",
-  bank: "/bank",
-};
 
 export default function App() {
   const [session, setSession] = useState<Session | null | undefined>(undefined);
@@ -52,6 +46,7 @@ export default function App() {
           <Route path="/" element={<DocumentsPage />} />
           <Route path="/bank" element={<BankPage />} />
           <Route path="/cash" element={<CashPage />} />
+          <Route path="/vat" element={<VatPage />} />
           <Route path="/month-end" element={<MonthEndPage />} />
           <Route path="/connections" element={<ConnectionsPage />} />
           <Route path="/rules" element={<RulesPage />} />

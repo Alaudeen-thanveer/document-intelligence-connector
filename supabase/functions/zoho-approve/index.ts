@@ -670,6 +670,8 @@ Deno.serve(async (req) => {
         "id, document_id, vendor_raw, total_amount, invoice_date, currency, tax_amount, invoice_number, due_date, po_number",
       )
       .eq("document_id", invoiceId)
+      // the current extraction: newest first, id only as the tiebreak
+      .order("created_at", { ascending: false })
       .order("id", { ascending: false })
       .limit(1)
       .maybeSingle();

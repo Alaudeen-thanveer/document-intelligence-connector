@@ -9,8 +9,15 @@ const ALLOWED_TYPES = new Set([
   "image/webp",
 ]);
 
+export interface UploadNotice {
+  text: string;
+  tone: "ok" | "bad";
+}
+
 interface Props {
   onUploaded: (documentId: string) => void;
+  /** Where what-just-happened is said. The grid puts it in its status line. */
+  onStatus: (notice: UploadNotice | null) => void;
 }
 
 function fileToBase64(file: File): Promise<string> {
@@ -26,30 +33,31 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
-export function UploadInvoice({ onUploaded }: Props) {
+/**
+ * One button, on the same line as the pipeline tabs. It used to be a card
+ * with a title and a line of explanation, which took a whole band of the
+ * page to say what the button already says.
+ */
+export function UploadInvoice({ onUploaded, onStatus }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   async function handleFile(file: File | null | undefined) {
     if (!file) return;
-
-    setError(null);
-    setMessage(null);
+    onStatus(null);
 
     if (!ALLOWED_TYPES.has(file.type)) {
-      setError("Use a PDF or image (PNG, JPG, WEBP).");
+      onStatus({ text: "Use a PDF or an image (PNG, JPG, WEBP).", tone: "bad" });
       return;
     }
     if (file.size > 50 * 1024 * 1024) {
-      setError("File must be 50MB or smaller.");
+      onStatus({ text: "That file is over 50MB.", tone: "bad" });
       return;
     }
 
     setBusy(true);
     try {
-      setMessage(`Uploading ${file.name} via shared ingest…`);
+      onStatus({ text: `Reading ${file.name}…`, tone: "ok" });
       const fileBase64 = await fileToBase64(file);
       const ingest = await callEdgeFunction("ingest", {
         source: "upload",
@@ -58,10 +66,16 @@ export function UploadInvoice({ onUploaded }: Props) {
         file_base64: fileBase64,
       });
       if (!ingest.ok) {
+        // Only suggest the server is down when nothing answered. A status
+        // the function itself returned is a real answer, and appending
+        // "is functions:serve running?" to it sends the reader after the
+        // wrong thing — a lapsed API subscription reads as a dead server.
+        const said = ingest.body.error ?? ingest.body.reason ?? ingest.status;
+        const nothingAnswered = [0, 404, 502, 503, 504].includes(ingest.status);
         throw new Error(
-          `Ingest failed: ${
-            ingest.body.error ?? ingest.body.reason ?? ingest.status
-          }. Is "npm run functions:serve" running?`,
+          nothingAnswered
+            ? `Could not reach the ingest function (${ingest.status}). Is "npm run functions:serve" running?`
+            : `Ingest failed: ${said}`,
         );
       }
 
@@ -70,47 +84,41 @@ export function UploadInvoice({ onUploaded }: Props) {
 
       const fields = (ingest.body.extract as { fields?: Record<string, unknown> } | undefined)
         ?.fields;
-      const vendor = (fields?.vendor_raw as string | undefined) ?? "—";
-      const amount = (fields?.total_amount as number | undefined) ?? "—";
-      setMessage(
-        `Ready for review: vendor=${vendor}, amount=${amount}. Select the doc to inspect fields / Approve → Zoho.`,
-      );
+      const vendor = (fields?.vendor_raw as string | undefined) ?? "not read";
+      onStatus({ text: `${file.name} is in — read as ${vendor}.`, tone: "ok" });
       onUploaded(documentId);
       if (inputRef.current) inputRef.current.value = "";
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      // A thrown fetch means nothing was listening at all.
+      const text =
+        err instanceof TypeError
+          ? 'Could not reach the ingest function. Is "npm run functions:serve" running?'
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      onStatus({ text, tone: "bad" });
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <div className="upload-box">
-      <div className="upload-row">
-        <div>
-          <p className="upload-title">Upload invoice</p>
-          <p className="upload-hint">
-            Same ingest path as inbound email (needs functions serve)
-          </p>
-        </div>
-        <button
-          type="button"
-          className="btn primary upload-btn"
-          disabled={busy}
-          onClick={() => inputRef.current?.click()}
-        >
-          {busy ? "Processing…" : "Choose file"}
-        </button>
-        <input
-          ref={inputRef}
-          type="file"
-          accept=".pdf,image/png,image/jpeg,image/webp,application/pdf"
-          hidden
-          onChange={(e) => void handleFile(e.target.files?.[0])}
-        />
-      </div>
-      {message && <p className="upload-ok">{message}</p>}
-      {error && <p className="error-text">{error}</p>}
-    </div>
+    <>
+      <button
+        type="button"
+        className="btn primary btn-small"
+        disabled={busy}
+        onClick={() => inputRef.current?.click()}
+      >
+        {busy ? "Uploading…" : "Upload documents"}
+      </button>
+      <input
+        ref={inputRef}
+        type="file"
+        accept=".pdf,image/png,image/jpeg,image/webp,application/pdf"
+        hidden
+        onChange={(e) => void handleFile(e.target.files?.[0])}
+      />
+    </>
   );
 }

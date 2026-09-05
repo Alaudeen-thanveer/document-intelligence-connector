@@ -1,19 +1,10 @@
-import { NavLink, Outlet, useLocation } from "react-router-dom";
+import { NavLink, Outlet } from "react-router-dom";
 import type { Session } from "@supabase/supabase-js";
 import { useEffect, useState } from "react";
 import { useMonthEndAttention } from "../hooks/useMonthEndAttention";
+import { TABS } from "../nav";
 import { setActor } from "../lib/functions";
-import { supabase } from "../lib/supabase";
-import { useTheme } from "../theme/ThemeProvider";
-
-const SECTIONS: Record<string, string> = {
-  "/": "Documents",
-  "/month-end": "Month-end",
-  "/cash": "Cash",
-  "/connections": "Connections",
-  "/rules": "Rules",
-  "/api-usage": "API usage",
-};
+import { SettingsDrawer } from "./SettingsDrawer";
 
 export interface AppOutletContext {
   reviewerName: string;
@@ -25,10 +16,8 @@ export function AppLayout({ session }: { session: Session }) {
   const [reviewerName, setReviewerName] = useState(
     email.split("@")[0] || "reviewer",
   );
-  const location = useLocation();
   const monthEndAttention = useMonthEndAttention();
-  const section = SECTIONS[location.pathname] ?? "Documents";
-  const initials = reviewerName.trim().slice(0, 1).toUpperCase() || "R";
+  const initials = reviewerName.trim().slice(0, 2).toUpperCase() || "R";
 
   useEffect(() => {
     setActor(reviewerName);
@@ -36,112 +25,50 @@ export function AppLayout({ session }: { session: Session }) {
 
   return (
     <div className="app-frame">
-      <aside className="rail" aria-label="App sections">
-        <div className="rail-mark" aria-hidden="true">
-          DI
-        </div>
-
-        <div className="rail-group">
-          <RailLink to="/" label="Documents" icon="▤" />
-          <RailLink
-            to="/month-end"
-            label={
-              monthEndAttention
-                ? "Month-end · needs attention"
-                : "Month-end"
-            }
-            icon="◔"
-            dot={monthEndAttention}
+      <header className="appbar">
+        <div className="appbar-lead">
+          <SettingsDrawer
+            email={email}
+            reviewerName={reviewerName}
+            onReviewerName={setReviewerName}
           />
+          <span className="appbar-brand">
+            <i className="appbar-dot" aria-hidden="true" />
+            <span className="appbar-name">Verity</span>
+          </span>
         </div>
 
-        <div className="rail-divider" />
-
-        <div className="rail-group">
-          <RailLink to="/bank" label="Bank" icon="⌸" />
-          <RailLink to="/cash" label="Cash" icon="◈" />
-          <RailLink to="/connections" label="Connections" icon="⇄" />
-          <RailLink to="/rules" label="Rules" icon="§" />
-          <RailLink to="/api-usage" label="API usage" icon="▦" />
-        </div>
-
-        <div className="rail-spacer" />
-
-        <div className="rail-identity" tabIndex={0}>
-          {initials}
-          <div className="rail-tip rail-tip-identity">
-            <div className="rail-tip-lbl">Reviewer</div>
-            <div className="rail-tip-val">{reviewerName}</div>
-            <div className="rail-tip-lbl">{email}</div>
-            <label className="rail-name-field">
-              Display name
-              <input
-                value={reviewerName}
-                onChange={(e) => setReviewerName(e.target.value)}
-              />
-            </label>
-            <button
-              type="button"
-              className="btn ghost btn-small"
-              onClick={() => void supabase.auth.signOut()}
+        <nav className="appbar-seg" aria-label="Sections">
+          {TABS.map((item) => (
+            <NavLink
+              key={item.path}
+              to={item.path}
+              // Without this the Documents link matches every route.
+              end={item.path === "/"}
+              className={({ isActive }) => `appbar-tab${isActive ? " active" : ""}`}
             >
-              Sign out
-            </button>
-          </div>
+              {item.label}
+              {item.path === "/month-end" && monthEndAttention ? (
+                <span className="appbar-tabdot" aria-label="needs attention" />
+              ) : null}
+            </NavLink>
+          ))}
+        </nav>
+
+        <div className="appbar-who">
+          <span className="appbar-whoname">
+            <span className="appbar-who1">{reviewerName}</span>
+            <span className="appbar-who2">{email}</span>
+          </span>
+          <span className="appbar-av" aria-hidden="true">
+            {initials}
+          </span>
         </div>
-      </aside>
+      </header>
 
       <div className="app-content">
-        <header className="content-head-bar">
-          <span className="crumb">
-            Document Intelligence Connector / <b>{section}</b>
-          </span>
-          <ModeToggle />
-        </header>
         <Outlet context={{ reviewerName, session } satisfies AppOutletContext} />
       </div>
     </div>
-  );
-}
-
-function ModeToggle() {
-  const { theme, setTheme } = useTheme();
-  const isDark = theme === "ink";
-  return (
-    <button
-      type="button"
-      className={`mode-toggle${isDark ? " dark" : ""}`}
-      aria-pressed={isDark}
-      aria-label={isDark ? "Switch to light mode" : "Switch to dark mode"}
-      onClick={() => setTheme(isDark ? "chalk" : "ink")}
-    >
-      <span className="mode-toggle-switch" aria-hidden="true" />
-      <span>{isDark ? "Dark" : "Light"}</span>
-    </button>
-  );
-}
-
-function RailLink({
-  to,
-  label,
-  icon,
-  dot,
-}: {
-  to: string;
-  label: string;
-  icon: string;
-  dot?: boolean;
-}) {
-  return (
-    <NavLink
-      to={to}
-      end={to === "/"}
-      className={({ isActive }) => `rail-btn${isActive ? " active" : ""}`}
-      aria-label={label}
-    >
-      <span aria-hidden="true">{icon}</span>
-      {dot ? <span className="rail-dot" /> : null}
-      <span className="rail-tip">{label}</span>
-    </NavLink>
   );
 }
