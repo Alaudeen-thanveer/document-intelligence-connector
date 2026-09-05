@@ -10,7 +10,8 @@
     "functions:serve": "supabase functions serve --env-file .env",
     "login": "supabase login",
     "web:dev": "npm --prefix apps/web run dev",
-    "web:build": "npm --prefix apps/web run build"
+    "web:build": "npm --prefix apps/web run build",
+    "test:isolation": "node --test scripts/tenant-isolation.test.mjs"
   },
   "devDependencies": {
     "supabase": "^2.112.0"

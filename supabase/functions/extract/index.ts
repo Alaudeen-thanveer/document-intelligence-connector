@@ -10,6 +10,7 @@ import {
   reExtractFieldWithGemini,
 } from "./gemini_fallback.ts";
 import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
+import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 
 const DEFAULT_EXTRACTION_CONFIDENCE_THRESHOLD = 0.8;
 const MINDEE_V1_INVOICE_URL =
@@ -808,6 +809,14 @@ Deno.serve(async (req) => {
   if (!input?.document_id) {
     return jsonResponse({ error: "document_id is required" }, 400);
   }
+
+  // This function runs with the service role, which bypasses row-level
+  // security — so establish the document is the caller's before touching it.
+  const tenant = await companyForCaller(auth, {
+    documentId: input.document_id,
+    errorBody: (m) => ({ error: m }),
+  });
+  if (isCompanyFail(tenant)) return tenant.response;
 
   const warnings: string[] = [];
 

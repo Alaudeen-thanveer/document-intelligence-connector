@@ -8,6 +8,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
+import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 
 /** Set per request; every Zoho call goes through it so usage is metered. */
 let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
@@ -562,11 +563,13 @@ Deno.serve(async (req) => {
   const auth = await requireUser(req);
   if (isAuthFail(auth)) return auth.response;
 
-  const companyId =
-    typeof auth.user?.app_metadata?.company_id === "string" &&
-      auth.user.app_metadata.company_id.trim()
-      ? auth.user.app_metadata.company_id.trim()
-      : null;
+  // The body is parsed further down; this only ever acts on the caller's own
+  // company, so there is nothing to take from it.
+  const tenant = await companyForCaller(auth, {
+    errorBody: (m) => ({ ok: false, error: m }),
+  });
+  if (isCompanyFail(tenant)) return tenant.response;
+  const companyId: string | null = tenant.companyId;
   if (!companyId) {
     return jsonResponse(
       {

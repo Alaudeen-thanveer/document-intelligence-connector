@@ -6,6 +6,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
+import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 
 type DocType = "invoice" | "purchase_order" | "tax_notice" | "irrelevant";
 
@@ -309,6 +310,15 @@ Deno.serve(async (req) => {
     input = await req.json();
   } catch {
     return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (input.document_id) {
+    // Optional here, but if they named one it has to be theirs.
+    const tenant = await companyForCaller(auth, {
+      documentId: input.document_id,
+      errorBody: (m) => ({ error: m }),
+    });
+    if (isCompanyFail(tenant)) return tenant.response;
   }
 
   if (!input?.file_url || !input?.sender || !input?.filename) {
