@@ -14,6 +14,7 @@ import { isAuthFail, requireUser } from "../_shared/require_user.ts";
 import { fetchOpenCredits, fetchOpenDocuments } from "../bank-statement/suggest.ts";
 import { ageInvoices, buildChaseList, buildPaymentRun, creditCheck, validatePayment, type OpenInvoiceLike, type PayBehaviour } from "./cash.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
 let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
 
@@ -32,33 +33,24 @@ function requireEnv(name: string): string {
 function getSupabase(): SupabaseClient {
   return createClient(requireEnv("SUPABASE_URL"), requireEnv("SUPABASE_SERVICE_ROLE_KEY"), { auth: { persistSession: false, autoRefreshToken: false } });
 }
-function apiBase(): string {
-  return Deno.env.get("ZOHO_API_BASE_URL")?.trim() || "https://www.zohoapis.com/books/v3";
+
+/**
+ * The company's own Zoho organisation and a token for it. This used to read
+ * ZOHO_REFRESH_TOKEN and ZOHO_ORGANIZATION_ID from the environment, which is
+ * one organisation for the whole deployment — see _shared/zoho_auth.ts.
+ */
+async function getAccessToken(
+  supabase: SupabaseClient,
+  companyId: string,
+): Promise<ZohoAuth> {
+  return await zohoAuthFor(supabase, companyId);
 }
 
-async function getAccessToken(supabase: SupabaseClient): Promise<string> {
-  const existing = Deno.env.get("ZOHO_ACCESS_TOKEN")?.trim();
-  if (existing) return existing;
-  const { data } = await supabase.from("zoho_oauth_tokens").select("access_token, expires_at").eq("id", 1).maybeSingle();
-  if (data?.access_token && new Date(String(data.expires_at)).getTime() > Date.now() + 120_000) return String(data.access_token);
-  const accountsUrl = Deno.env.get("ZOHO_ACCOUNTS_URL")?.trim() || "https://accounts.zoho.com";
-  const res = await fetch(`${accountsUrl}/oauth/v2/token`, {
+async function zohoPost(z: ZohoAuth, path: string, body: unknown): Promise<{ ok: boolean; status: number; raw: Record<string, unknown> }> {
+  const qs = new URLSearchParams({ organization_id: z.organizationId });
+  const res = await zohoFetch(`${z.apiBase}/${path}?${qs}`, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ refresh_token: requireEnv("ZOHO_REFRESH_TOKEN"), client_id: requireEnv("ZOHO_CLIENT_ID"), client_secret: requireEnv("ZOHO_CLIENT_SECRET"), grant_type: "refresh_token" }),
-  });
-  const payload = await res.json();
-  if (!res.ok || !payload?.access_token) throw new Error(`Zoho token refresh failed (${res.status})`);
-  const token = String(payload.access_token);
-  await supabase.from("zoho_oauth_tokens").upsert({ id: 1, access_token: token, expires_at: new Date(Date.now() + 55 * 60_000).toISOString(), updated_at: new Date().toISOString() });
-  return token;
-}
-
-async function zohoPost(token: string, path: string, body: unknown): Promise<{ ok: boolean; status: number; raw: Record<string, unknown> }> {
-  const qs = new URLSearchParams({ organization_id: requireEnv("ZOHO_ORGANIZATION_ID") });
-  const res = await zohoFetch(`${apiBase()}/${path}?${qs}`, {
-    method: "POST",
-    headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}`, "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
   });
   const raw = await res.json().catch(() => ({})) as Record<string, unknown>;
@@ -101,8 +93,8 @@ Deno.serve(async (req) => {
     const supabase = getSupabase();
     const meter = createZohoMeter(supabase, { ...meterContextFromRequest(req, "cashflow", `cashflow-${action}`), company_id: companyId });
     zohoFetch = meter.fetch;
-    const token = await getAccessToken(supabase);
-    const orgId = requireEnv("ZOHO_ORGANIZATION_ID");
+    const z = await getAccessToken(supabase, companyId);
+    const orgId = z.organizationId;
     const { data: cfg } = await supabase.from("company_config")
       .select("payment_run_horizon_days, credit_limits, locked_until")
       .eq("company_id", companyId).maybeSingle();
@@ -112,7 +104,7 @@ Deno.serve(async (req) => {
 
     // ------------------------------------------------------ collections
     if (action === "collections") {
-      const docs = await fetchOpenDocuments(zohoFetch, apiBase(), orgId, token);
+      const docs = await fetchOpenDocuments(zohoFetch, z.apiBase, orgId, z);
       const invoices = docs.filter((d) => d.kind === "invoice") as unknown as OpenInvoiceLike[];
       // Learned payment habits (layer 6) — any status; evidence, not a rule.
       const { data: lagRows } = await supabase.from("bk_check_proposals")
@@ -155,7 +147,7 @@ Deno.serve(async (req) => {
       // empty body fails with a misleading "email not found"). Recipients
       // come from the invoice's own contact persons, else the contact email.
       const detQs = new URLSearchParams({ organization_id: orgId });
-      const detRes = await zohoFetch(`${apiBase()}/invoices/${invoiceId}?${detQs}`, { headers: { Authorization: `Zoho-oauthtoken ${token}` } });
+      const detRes = await zohoFetch(`${z.apiBase}/invoices/${invoiceId}?${detQs}`, { headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` } });
       const det = await detRes.json().catch(() => ({})) as { invoice?: Record<string, unknown> };
       const inv = det.invoice ?? {};
       const persons = ((inv.contact_persons_details ?? []) as Array<Record<string, unknown>>).map((p) => String(p.email ?? "")).filter(Boolean);
@@ -163,11 +155,11 @@ Deno.serve(async (req) => {
       if (!to.length) {
         return jsonResponse({ ok: false, error: `${inv.customer_name ?? "The customer"} has no email on file in Zoho Books — add a contact person with an email, then send the reminder.` }, 422);
       }
-      let res = await zohoPost(token, `invoices/${invoiceId}/paymentreminder`, { to_mail_ids: to });
+      let res = await zohoPost(z, `invoices/${invoiceId}/paymentreminder`, { to_mail_ids: to });
       if (!res.ok) {
         // Some editions also want the wording; keep it factual and neutral.
         const due = inv.due_date ? String(inv.due_date) : null;
-        res = await zohoPost(token, `invoices/${invoiceId}/paymentreminder`, {
+        res = await zohoPost(z, `invoices/${invoiceId}/paymentreminder`, {
           to_mail_ids: to,
           subject: `Payment reminder: invoice ${inv.invoice_number ?? ""}`.trim(),
           body: `Dear customer,
@@ -184,9 +176,9 @@ Thank you.`,
 
     // ----------------------------------------------------- payment_run
     if (action === "payment_run") {
-      const docs = await fetchOpenDocuments(zohoFetch, apiBase(), orgId, token);
+      const docs = await fetchOpenDocuments(zohoFetch, z.apiBase, orgId, z);
       const bills = docs.filter((d) => d.kind === "bill") as unknown as OpenInvoiceLike[];
-      const credits = await fetchOpenCredits(zohoFetch, apiBase(), orgId, token);
+      const credits = await fetchOpenCredits(zohoFetch, z.apiBase, orgId, z);
       const unused = credits.filter((c) => c.party_kind === "vendor").map((c) => ({ party_zoho_id: c.party_zoho_id, kind: c.kind, number: c.number, balance: c.balance }));
       const groups = buildPaymentRun(bills, { today, horizon_days: Number(cfg?.payment_run_horizon_days ?? 7), unused_credits: unused });
       const { data: bankAccounts } = await supabase.from("zoho_entities").select("zoho_id, name, extra").eq("kind", "bank_account");
@@ -199,7 +191,7 @@ Thank you.`,
     if (action === "record_payments") {
       const payments = Array.isArray(input.payments) ? input.payments : [];
       if (!payments.length) return jsonResponse({ ok: false, error: "No payments in the batch." }, 400);
-      const docs = await fetchOpenDocuments(zohoFetch, apiBase(), orgId, token);
+      const docs = await fetchOpenDocuments(zohoFetch, z.apiBase, orgId, z);
       const openBills = docs.filter((d) => d.kind === "bill") as unknown as OpenInvoiceLike[];
       const results: Array<Record<string, unknown>> = [];
       let recorded = 0, failed = 0;
@@ -207,7 +199,7 @@ Thank you.`,
         const v = validatePayment({ vendor_id: String(p.vendor_id), date: String(p.date), bills: (p.bills ?? []).map((b) => ({ bill_id: String(b.bill_id), amount_applied: Number(b.amount_applied) })) }, openBills, { today, locked_until: lockedUntil });
         if (!v.ok) { results.push({ vendor_id: p.vendor_id, ok: false, error: v.error }); failed++; continue; }
         if (!p.paid_through_account_id) { results.push({ vendor_id: p.vendor_id, ok: false, error: "Pick the bank account the payment goes out of." }); failed++; continue; }
-        const res = await zohoPost(token, "vendorpayments", {
+        const res = await zohoPost(z, "vendorpayments", {
           vendor_id: p.vendor_id, amount: v.total, date: p.date, payment_mode: "banktransfer",
           paid_through_account_id: p.paid_through_account_id,
           ...(p.reference ? { reference_number: String(p.reference).slice(0, 50) } : {}),

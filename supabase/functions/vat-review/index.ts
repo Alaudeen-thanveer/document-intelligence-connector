@@ -10,6 +10,7 @@ import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
 import { buildForm201, vatPeriodFor, type VatDoc } from "./form201.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
 let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
 
@@ -28,31 +29,22 @@ function requireEnv(name: string): string {
 function getSupabase(): SupabaseClient {
   return createClient(requireEnv("SUPABASE_URL"), requireEnv("SUPABASE_SERVICE_ROLE_KEY"), { auth: { persistSession: false, autoRefreshToken: false } });
 }
-function apiBase(): string {
-  return Deno.env.get("ZOHO_API_BASE_URL")?.trim() || "https://www.zohoapis.com/books/v3";
+
+/**
+ * The company's own Zoho organisation and a token for it. This used to read
+ * ZOHO_REFRESH_TOKEN and ZOHO_ORGANIZATION_ID from the environment, which is
+ * one organisation for the whole deployment — see _shared/zoho_auth.ts.
+ */
+async function getAccessToken(
+  supabase: SupabaseClient,
+  companyId: string,
+): Promise<ZohoAuth> {
+  return await zohoAuthFor(supabase, companyId);
 }
 
-async function getAccessToken(supabase: SupabaseClient): Promise<string> {
-  const existing = Deno.env.get("ZOHO_ACCESS_TOKEN")?.trim();
-  if (existing) return existing;
-  const { data } = await supabase.from("zoho_oauth_tokens").select("access_token, expires_at").eq("id", 1).maybeSingle();
-  if (data?.access_token && new Date(String(data.expires_at)).getTime() > Date.now() + 120_000) return String(data.access_token);
-  const accountsUrl = Deno.env.get("ZOHO_ACCOUNTS_URL")?.trim() || "https://accounts.zoho.com";
-  const res = await fetch(`${accountsUrl}/oauth/v2/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ refresh_token: requireEnv("ZOHO_REFRESH_TOKEN"), client_id: requireEnv("ZOHO_CLIENT_ID"), client_secret: requireEnv("ZOHO_CLIENT_SECRET"), grant_type: "refresh_token" }),
-  });
-  const payload = await res.json();
-  if (!res.ok || !payload?.access_token) throw new Error(`Zoho token refresh failed (${res.status})`);
-  const token = String(payload.access_token);
-  await supabase.from("zoho_oauth_tokens").upsert({ id: 1, access_token: token, expires_at: new Date(Date.now() + 55 * 60_000).toISOString(), updated_at: new Date().toISOString() });
-  return token;
-}
-
-async function zohoGet(token: string, path: string, params: Record<string, string> = {}): Promise<Record<string, unknown>> {
-  const qs = new URLSearchParams({ organization_id: requireEnv("ZOHO_ORGANIZATION_ID"), ...params });
-  const res = await zohoFetch(`${apiBase()}/${path}?${qs}`, { headers: { Authorization: `Zoho-oauthtoken ${token}` } });
+async function zohoGet(z: ZohoAuth, path: string, params: Record<string, string> = {}): Promise<Record<string, unknown>> {
+  const qs = new URLSearchParams({ organization_id: z.organizationId, ...params });
+  const res = await zohoFetch(`${z.apiBase}/${path}?${qs}`, { headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` } });
   const raw = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Zoho ${path} failed (${res.status}): ${JSON.stringify(raw).slice(0, 200)}`);
   return raw as Record<string, unknown>;
@@ -60,7 +52,7 @@ async function zohoGet(token: string, path: string, params: Record<string, strin
 
 /** List a document kind for the period, detail-fetching what the list view omits (capped). */
 async function fetchDocs(
-  token: string,
+  z: ZohoAuth,
   kind: VatDoc["kind"],
   start: string,
   end: string,
@@ -78,7 +70,7 @@ async function fetchDocs(
   const out: VatDoc[] = [];
   let page = 1;
   while (out.length < cap && page <= 5) {
-    const raw = await zohoGet(token, c.path, { date_start: start, date_end: end, per_page: "200", page: String(page) });
+    const raw = await zohoGet(z, c.path, { date_start: start, date_end: end, per_page: "200", page: String(page) });
     const rows = (raw[c.listKey] ?? []) as Array<Record<string, unknown>>;
     for (const r of rows) {
       if (out.length >= cap) break;
@@ -94,7 +86,7 @@ async function fetchDocs(
         pos = null; rc = Boolean(r.is_reverse_charge_applied ?? false);
         treatment = (r.tax_treatment as string | undefined) || treatments.get(String(r[c.partyId] ?? "")) || null;
       } else {
-        const det = await zohoGet(token, `${c.path}/${id}`);
+        const det = await zohoGet(z, `${c.path}/${id}`);
         const d = (det[c.detailKey] ?? {}) as Record<string, unknown>;
         subTotal = Number(d.sub_total ?? 0) || 0;
         taxTotal = Number(d.tax_total ?? 0) || 0;
@@ -146,7 +138,7 @@ Deno.serve(async (req) => {
     const supabase = getSupabase();
     const meter = createZohoMeter(supabase, { ...meterContextFromRequest(req, "vat-review", "vat-review"), company_id: companyId });
     zohoFetch = meter.fetch;
-    const token = await getAccessToken(supabase);
+    const token = await getAccessToken(supabase, companyId);
 
     const { data: config } = await supabase.from("company_config")
       .select("vat_period_months, vat_period_anchor_month, vat_filing_due_days")
@@ -171,7 +163,7 @@ Deno.serve(async (req) => {
     // The org's TRN, from Zoho's own settings (the filer's identity).
     let orgTrn: string | null = null;
     try {
-      const raw = await zohoGet(token, `organizations/${requireEnv("ZOHO_ORGANIZATION_ID")}`);
+      const raw = await zohoGet(token, `organizations/${token.organizationId}`);
       const org = (raw.organization ?? {}) as Record<string, unknown>;
       orgTrn = (((org.tax_settings ?? {}) as Record<string, unknown>).tax_reg_no as string | undefined) || null;
     } catch { /* check reports it as missing */ }

@@ -300,6 +300,43 @@ for (const fn of FUNCTIONS) {
  * which says nothing about isolation. A test that can pass for a reason it is
  * not testing is worse than one that fails.
  */
+/**
+ * Half-converted is worse than unconverted.
+ *
+ * A function that still reads ZOHO_ORGANIZATION_ID from the environment will
+ * happily act on the deployment's one organisation no matter which company
+ * the caller belongs to. Today every company resolves to the same org, so it
+ * makes no difference — but the moment a second client is connected, the
+ * converted functions would use that client's books while the unconverted
+ * ones used the first client's, inside the same session. Silently.
+ *
+ * So this fails while any function still reads the environment, and names
+ * them. It is the gate on onboarding a second client.
+ */
+test("no edge function reads Zoho credentials from the environment", async () => {
+  const { readdirSync, readFileSync, existsSync } = await import("node:fs");
+  const stragglers = [];
+  for (const d of readdirSync("supabase/functions", { withFileTypes: true })) {
+    if (!d.isDirectory() || d.name === "_shared") continue;
+    const file = `supabase/functions/${d.name}/index.ts`;
+    if (!existsSync(file)) continue;
+    const src = readFileSync(file, "utf8");
+    // A READ of the variable, not a mention of it — the converted functions
+    // still name it in the comment explaining what they moved away from.
+    if (/(?:Deno\.env\.get|requireEnv)\(\s*["']ZOHO_(?:ORGANIZATION_ID|REFRESH_TOKEN)/.test(src)) {
+      stragglers.push(d.name);
+    }
+  }
+  assert.deepEqual(
+    stragglers,
+    [],
+    `${stragglers.length} function(s) still take their Zoho organisation from the ` +
+      `environment rather than from the calling company: ${stragglers.join(", ")}. ` +
+      "Until they use _shared/zoho_auth.ts, connecting a second client would have " +
+      "these act on the first client's books.",
+  );
+});
+
 test(
   "Zoho credentials belong to a company, not to the deployment",
   // Marked todo on purpose. Left as a plain failure the suite would be red

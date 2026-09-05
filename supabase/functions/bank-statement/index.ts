@@ -387,7 +387,9 @@ Deno.serve(async (req) => {
   // unless this does. No default company: a fallback is how a bug
   // becomes a cross-client leak instead of an error.
   const tenant = await companyForCaller(auth, {
-    companyId: input.company_id ?? null,
+    // input is Record<string, unknown> here, so this needs narrowing rather
+    // than a cast — a non-string company_id must read as "none named".
+    companyId: typeof input.company_id === "string" ? input.company_id : null,
     errorBody: (m) => ({ error: m }),
   });
   if (isCompanyFail(tenant)) return tenant.response;
