@@ -1,136 +1,70 @@
-import { useEffect, useMemo, useState } from "react";
-import { DocumentList } from "./components/DocumentList";
-import { ReviewPanel } from "./components/ReviewPanel";
-import { UploadInvoice } from "./components/UploadInvoice";
-import { useDocumentDetail } from "./hooks/useDocumentDetail";
-import { useDocuments } from "./hooks/useDocuments";
+import { useEffect, useState } from "react";
+import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import type { Session } from "@supabase/supabase-js";
+import { ApiUsagePage } from "./components/ApiUsagePage";
+import { BankPage } from "./components/BankPage";
+import { CashPage } from "./components/CashPage";
+import { VatPage } from "./components/VatPage";
+import { ConnectionsPage } from "./components/ConnectionsPage";
+import { MonthEndPage } from "./components/MonthEndPage";
+import { SignInPage } from "./components/SignInPage";
+import { AppLayout } from "./layout/AppLayout";
 import { supabase } from "./lib/supabase";
+import { LEGACY_HASH } from "./nav";
+import { DocumentsPage } from "./pages/DocumentsPage";
+import { RulesPage } from "./pages/RulesPage";
 
 export default function App() {
-  const { documents, loading, error, setDocuments } = useDocuments();
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [reviewerName, setReviewerName] = useState("reviewer");
-  const [failedJudgmentIds, setFailedJudgmentIds] = useState<Set<string>>(
-    () => new Set(),
-  );
-  const [tick, setTick] = useState(0);
-
-  const selected = useMemo(
-    () => documents.find((d) => d.id === selectedId) ?? null,
-    [documents, selectedId],
-  );
-
-  const detail = useDocumentDetail(selectedId, tick);
+  const [session, setSession] = useState<Session | null | undefined>(undefined);
 
   useEffect(() => {
-    let cancelled = false;
-
-    async function loadFailed() {
-      const { data } = await supabase
-        .from("judgment_results")
-        .select("document_id")
-        .eq("passed", false);
-
-      if (cancelled) return;
-      setFailedJudgmentIds(new Set((data ?? []).map((r) => r.document_id)));
-    }
-
-    void loadFailed();
-
-    const channel = supabase
-      .channel("judgment-flags")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "judgment_results" },
-        () => {
-          void loadFailed();
-          setTick((n) => n + 1);
-        },
-      )
-      .subscribe();
-
-    return () => {
-      cancelled = true;
-      void supabase.removeChannel(channel);
-    };
+    void supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+    });
+    const { data } = supabase.auth.onAuthStateChange((_event, next) => {
+      setSession(next);
+    });
+    return () => data.subscription.unsubscribe();
   }, []);
 
+  if (session === undefined) {
+    return (
+      <div className="app-shell">
+        <div className="atmosphere" aria-hidden="true" />
+        <p className="muted">Checking session…</p>
+      </div>
+    );
+  }
+
+  if (!session) return <SignInPage />;
+
   return (
-    <div className="app-shell">
-      <div className="atmosphere" aria-hidden="true" />
-      <header className="topbar">
-        <div>
-          <p className="brand">Document Intelligence Connector</p>
-          <h1>Document review</h1>
-        </div>
-        <label className="reviewer-field">
-          Reviewer
-          <input
-            value={reviewerName}
-            onChange={(e) => setReviewerName(e.target.value)}
-            placeholder="Your name"
-          />
-        </label>
-      </header>
-
-      <main className="layout">
-        <section className="list-pane">
-          <div className="pane-heading">
-            <h2>Documents</h2>
-            <span className="live-dot">Realtime</span>
-          </div>
-          <UploadInvoice
-            onUploaded={(documentId) => {
-              setSelectedId(documentId);
-              void supabase
-                .from("documents")
-                .select(
-                  "id, source, file_url, status, uploaded_at, doc_type, confidence",
-                )
-                .order("uploaded_at", { ascending: false })
-                .then(({ data }) => {
-                  if (data) setDocuments(data);
-                });
-              setTick((n) => n + 1);
-            }}
-          />
-          {loading && <p className="muted">Loading documents…</p>}
-          {error && (
-            <p className="error-text">
-              {error}. Apply the review policies migration and ensure Supabase
-              is running.
-            </p>
-          )}
-          <DocumentList
-            documents={documents}
-            selectedId={selectedId}
-            onSelect={setSelectedId}
-            failedJudgmentIds={failedJudgmentIds}
-          />
-        </section>
-
-        <ReviewPanel
-          document={selected}
-          extracted={detail.extracted}
-          judgments={detail.judgments}
-          loading={detail.loading}
-          error={detail.error}
-          reviewerName={reviewerName}
-          onChanged={() => {
-            // Reload list from source of truth after mutations.
-            void supabase
-              .from("documents")
-              .select(
-                "id, source, file_url, status, uploaded_at, doc_type, confidence",
-              )
-              .order("uploaded_at", { ascending: false })
-              .then(({ data }) => {
-                if (data) setDocuments(data);
-              });
-            setTick((n) => n + 1);
-          }}
-        />
-      </main>
-    </div>
+    <>
+      <LegacyHashRedirect />
+      <Routes>
+        <Route element={<AppLayout session={session} />}>
+          <Route path="/" element={<DocumentsPage />} />
+          <Route path="/bank" element={<BankPage />} />
+          <Route path="/cash" element={<CashPage />} />
+          <Route path="/vat" element={<VatPage />} />
+          <Route path="/month-end" element={<MonthEndPage />} />
+          <Route path="/connections" element={<ConnectionsPage />} />
+          <Route path="/rules" element={<RulesPage />} />
+          <Route path="/api-usage" element={<ApiUsagePage />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Route>
+      </Routes>
+    </>
   );
+}
+
+/** Old hash tabs (#connections) → real paths (/connections). */
+function LegacyHashRedirect() {
+  const navigate = useNavigate();
+  useEffect(() => {
+    const raw = window.location.hash.replace(/^#\/?/, "");
+    const dest = LEGACY_HASH[raw];
+    if (dest) navigate(dest, { replace: true });
+  }, [navigate]);
+  return null;
 }

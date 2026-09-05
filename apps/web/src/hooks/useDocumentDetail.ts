@@ -27,9 +27,11 @@ export function useDocumentDetail(
         supabase
           .from("extracted_fields")
           .select(
-            "id, document_id, doc_type, vendor_raw, total_amount, invoice_date, confidence_scores, ai_fallback_used",
+            "id, document_id, doc_type, vendor_raw, total_amount, invoice_date, currency, tax_amount, invoice_number, due_date, customer_raw, confidence_scores, ai_fallback_used",
           )
           .eq("document_id", documentId)
+          // the current extraction: newest first, id only as the tiebreak
+          .order("created_at", { ascending: false })
           .order("id", { ascending: false })
           .limit(1)
           .maybeSingle(),
