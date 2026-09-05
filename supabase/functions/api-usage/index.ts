@@ -12,8 +12,8 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
+import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 
-const DEFAULT_COMPANY = "00000000-0000-4000-8000-000000000001";
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, content-type, apikey, x-client-info, x-action-id, x-actor",
@@ -110,7 +110,15 @@ Deno.serve(async (req) => {
   } catch {
     return jsonResponse({ error: "Invalid JSON body" }, 400);
   }
-  const companyId = input.company_id ?? DEFAULT_COMPANY;
+  // Runs with the service role, so nothing below checks who is asking
+  // unless this does. No default company: a fallback is how a bug
+  // becomes a cross-client leak instead of an error.
+  const tenant = await companyForCaller(auth, {
+    companyId: input.company_id ?? null,
+    errorBody: (m) => ({ error: m }),
+  });
+  if (isCompanyFail(tenant)) return tenant.response;
+  const companyId = tenant.companyId;
   const windowDays = Math.max(1, Math.min(90, input.window_days ?? 7));
 
   try {

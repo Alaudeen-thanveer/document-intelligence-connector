@@ -18,6 +18,7 @@ import {
   type ZohoAccount,
   type ZohoVendor,
 } from "./match-entities.ts";
+import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 
 interface PushInput {
   document_id: string;
@@ -735,6 +736,14 @@ Deno.serve(async (req) => {
   if (!input?.document_id) {
     return jsonResponse({ error: "document_id is required" }, 400);
   }
+
+  // This function runs with the service role, which bypasses row-level
+  // security — so establish the document is the caller's before touching it.
+  const tenant = await companyForCaller(auth, {
+    documentId: input.document_id,
+    errorBody: (m) => ({ error: m }),
+  });
+  if (isCompanyFail(tenant)) return tenant.response;
 
   try {
     const supabase = getSupabase();

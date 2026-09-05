@@ -4,8 +4,8 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
+import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 
-const DEFAULT_COMPANY = "00000000-0000-4000-8000-000000000001";
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
@@ -119,9 +119,16 @@ Deno.serve(async (req) => {
     .trim() || "application/pdf";
   const source: IngestSource = input.source ?? "upload";
 
-  // User uploads: company comes from JWT app_metadata (ignore client spoof).
-  // Service/email path: may pass company_id explicitly.
-  let companyId = DEFAULT_COMPANY;
+  // A caller naming a company that is not theirs is refused outright rather
+  // than quietly served their own — with two clients open, silently switching
+  // which one a document lands in is worse than an error.
+  const tenant = await companyForCaller(auth, {
+    companyId: input.company_id ?? null,
+    errorBody: (m) => ({ ok: false, error: m }),
+  });
+  if (isCompanyFail(tenant)) return tenant.response;
+
+  let companyId = tenant.companyId;
   if (auth.user) {
     const claim = auth.user.app_metadata?.company_id;
     if (typeof claim === "string" && claim.trim()) {

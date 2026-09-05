@@ -45,6 +45,7 @@ import {
   type BankTxnKind,
   buildBankPatterns,
 } from "./bank_patterns.ts";
+import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 
 type DocKind =
   | "bill"
@@ -106,7 +107,6 @@ interface LearnInput {
   refresh_documents?: boolean;
 }
 
-const DEFAULT_COMPANY = "00000000-0000-4000-8000-000000000001";
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
@@ -564,7 +564,15 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: "Invalid JSON body" }, 400);
   }
 
-  const companyId = input.company_id ?? DEFAULT_COMPANY;
+  // Runs with the service role, so nothing below checks who is asking
+  // unless this does. No default company: a fallback is how a bug
+  // becomes a cross-client leak instead of an error.
+  const tenant = await companyForCaller(auth, {
+    companyId: input.company_id ?? null,
+    errorBody: (m) => ({ error: m }),
+  });
+  if (isCompanyFail(tenant)) return tenant.response;
+  const companyId = tenant.companyId;
   const monthsBack = Math.max(1, Math.min(60, input.months_back ?? 24));
   const cap = Math.max(1, Math.min(2000, input.max_docs_per_kind ?? 500));
   const supabase = getSupabase();

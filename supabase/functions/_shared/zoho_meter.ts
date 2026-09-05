@@ -22,7 +22,6 @@ export interface MeterContext {
   actor?: string | null;
 }
 
-const DEFAULT_COMPANY = "00000000-0000-4000-8000-000000000001";
 
 /** Strip org id and numeric ids so calls group by endpoint shape. */
 export function normalizeEndpoint(url: string): string {
@@ -51,7 +50,10 @@ export function meterContextFromRequest(
 }
 
 export function createZohoMeter(supabase: SupabaseClient, ctx: MeterContext) {
-  const companyId = ctx.company_id ?? DEFAULT_COMPANY;
+  // No default company. A call that cannot say who it was for is still made
+  // and still counted for the caller's own response — it just is not written
+  // to another company's ledger, which is what a fallback constant did.
+  const companyId = ctx.company_id ?? null;
   const actionId = ctx.action_id ?? crypto.randomUUID();
   let count = 0;
   let rateLimited = 0;
@@ -65,6 +67,7 @@ export function createZohoMeter(supabase: SupabaseClient, ctx: MeterContext) {
     count++;
     const limited = status === 429;
     if (limited) rateLimited++;
+    if (!companyId) return;
     try {
       await supabase.from("zoho_api_calls").insert({
         company_id: companyId,

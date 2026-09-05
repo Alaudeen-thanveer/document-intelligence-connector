@@ -32,6 +32,7 @@ import { computeCtProvision, fiscalYearStart, netProfitFromReport } from "./ct_p
 import { bcaBody, bcaParams, parseBcaAccounts, validateRate } from "./fx_reval.ts";
 import { dueScheduleEntries, faDepreciationNudge, validateSchedule, type ScheduleRow } from "./schedules.ts";
 import { findDuplicateAccounts, findDuplicateContacts, findMissingTrns, findSuspenseBalances, unusedAccountCandidates, type HygieneAccount, type HygieneContact } from "./hygiene.ts";
+import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 
 /** Same fingerprint as bookkeeping-learn/journal_patterns.ts. */
 function fingerprintLines(
@@ -46,7 +47,6 @@ function fingerprintLines(
   return [...parts].sort().join("+");
 }
 
-const DEFAULT_COMPANY = "00000000-0000-4000-8000-000000000001";
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
@@ -226,7 +226,15 @@ Deno.serve(async (req) => {
   }
   const today = new Date().toISOString().slice(0, 10);
   const month = /^\d{4}-\d{2}$/.test(input.month ?? "") ? input.month! : today.slice(0, 7);
-  const companyId = input.company_id ?? DEFAULT_COMPANY;
+  // Runs with the service role, so nothing below checks who is asking
+  // unless this does. No default company: a fallback is how a bug
+  // becomes a cross-client leak instead of an error.
+  const tenant = await companyForCaller(auth, {
+    companyId: input.company_id ?? null,
+    errorBody: (m) => ({ error: m }),
+  });
+  if (isCompanyFail(tenant)) return tenant.response;
+  const companyId = tenant.companyId;
   const { start, end } = monthBounds(month);
 
   try {

@@ -29,8 +29,10 @@ import {
   type PeerDoc,
 } from "./learned_checks.ts";
 import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
+import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 
-const DEFAULT_COMPANY_ID = "00000000-0000-4000-8000-000000000001";
+// No default company. A document without one is a broken record, not a
+// reason to act on somebody else's books.
 const DEFAULT_DUPLICATE_DAYS = 3;
 const DEFAULT_AMOUNT_PO_THRESHOLD = 5000;
 
@@ -100,7 +102,10 @@ async function loadContext(
     throw new Error(`No extracted_fields row for document ${documentId}`);
   }
 
-  const companyId = (doc.company_id as string) || DEFAULT_COMPANY_ID;
+  const companyId = (doc.company_id as string) || "";
+  if (!companyId) {
+    throw new Error(`Document ${documentId} has no company_id`);
+  }
   const { data: config } = await supabase
     .from("company_config")
     .select("duplicate_check_days, amount_requires_po_threshold, po_variance_pct, po_variance_amount")
@@ -318,6 +323,15 @@ Deno.serve(async (req) => {
   if (!input?.document_id) {
     return jsonResponse({ error: "document_id is required" }, 400);
   }
+
+  // The caller handed us a document id. Establish that it is theirs before
+  // reading anything off it — this function runs with the service role, so
+  // nothing else will.
+  const tenant = await companyForCaller(auth, {
+    documentId: input.document_id,
+    errorBody: (m) => ({ error: m }),
+  });
+  if (isCompanyFail(tenant)) return tenant.response;
 
   try {
     const supabase = getSupabase();
