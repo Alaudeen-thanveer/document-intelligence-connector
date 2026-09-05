@@ -17,6 +17,7 @@ import {
   type ZohoAccount,
   type ZohoVendor,
 } from "../zoho-push/match-entities.ts";
+import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
@@ -115,14 +116,7 @@ function requireEnv(name: string): string {
   return value;
 }
 
-function apiBase(): string {
-  return Deno.env.get("ZOHO_API_BASE_URL")?.trim() ||
-    "https://www.zohoapis.com/books/v3";
-}
 
-function orgId(): string {
-  return requireEnv("ZOHO_ORGANIZATION_ID");
-}
 
 function getServiceClient(): SupabaseClient {
   return createClient(
@@ -234,66 +228,32 @@ async function cacheAccessToken(token: string): Promise<void> {
   }
 }
 
-async function refreshAccessToken(): Promise<string> {
-  const clientId = requireEnv("ZOHO_CLIENT_ID");
-  const clientSecret = requireEnv("ZOHO_CLIENT_SECRET");
-  const refreshToken = requireEnv("ZOHO_REFRESH_TOKEN");
-  const accountsUrl = Deno.env.get("ZOHO_ACCOUNTS_URL")?.trim() ||
-    "https://accounts.zoho.com";
 
-  const res = await fetch(`${accountsUrl}/oauth/v2/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      refresh_token: refreshToken,
-      client_id: clientId,
-      client_secret: clientSecret,
-      grant_type: "refresh_token",
-    }),
-  });
-  const payload = await res.json();
-  if (!res.ok || !payload?.access_token) {
-    throw new Error(`Zoho token refresh failed (${res.status})`);
-  }
-  const token = String(payload.access_token);
-  await cacheAccessToken(token);
-  return token;
-}
-
-async function getAccessToken(): Promise<string> {
-  const existing = Deno.env.get("ZOHO_ACCESS_TOKEN")?.trim();
-  if (existing) return existing;
-  try {
-    const { data } = await getServiceClient()
-      .from("zoho_oauth_tokens")
-      .select("access_token, expires_at")
-      .eq("id", 1)
-      .maybeSingle();
-    if (
-      data?.access_token &&
-      new Date(String(data.expires_at)).getTime() > Date.now() + 120_000
-    ) {
-      return String(data.access_token);
-    }
-  } catch {
-    // Cache is optional.
-  }
-  return await refreshAccessToken();
+/**
+ * The calling company's own Zoho organisation and a token for it. This used
+ * to read ZOHO_REFRESH_TOKEN and ZOHO_ORGANIZATION_ID from the environment,
+ * which is one organisation for the whole deployment — see
+ * _shared/zoho_auth.ts, which also holds the token cache, now per company.
+ */
+async function getZoho(companyId: string): Promise<ZohoAuth> {
+  return await zohoAuthFor(getServiceClient(), companyId);
 }
 
 type ZohoCallResult = { ok: boolean; status: number; raw: unknown };
 
 async function withZohoRetry(
-  call: (accessToken: string) => Promise<ZohoCallResult>,
+  companyId: string,
+  call: (z: ZohoAuth) => Promise<ZohoCallResult>,
 ): Promise<ZohoCallResult> {
-  let token = await getAccessToken();
-  let result = await call(token);
+  let z = await getZoho(companyId);
+  let result = await call(z);
   if (
     !result.ok &&
     (result.status === 401 || result.status === 403 || result.status >= 500)
   ) {
-    token = await refreshAccessToken();
-    result = await call(token);
+    // A cached token can be revoked before it expires; ask for a new one.
+    z = await zohoAuthFor(getServiceClient(), companyId, { forceRefresh: true });
+    result = await call(z);
   }
   return result;
 }
@@ -303,10 +263,10 @@ function result_contact(raw: unknown): Record<string, unknown> | null {
 }
 
 /** Organisation detail (for the seller TRN), through the metered fetch. */
-async function zohoGetJsonForOrg(): Promise<Record<string, unknown>> {
-  return await withZohoRetry(async (accessToken) => {
-    const res = await zohoFetch(`${apiBase()}/organizations/${encodeURIComponent(orgId())}?organization_id=${encodeURIComponent(orgId())}`, {
-      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+async function zohoGetJsonForOrg(companyId: string): Promise<Record<string, unknown>> {
+  return await withZohoRetry(companyId, async (z) => {
+    const res = await zohoFetch(`${z.apiBase}/organizations/${encodeURIComponent(z.organizationId)}?organization_id=${encodeURIComponent(z.organizationId)}`, {
+      headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` },
     });
     const raw = await res.json().catch(() => ({}));
     return { ok: res.ok, status: res.status, raw };
@@ -314,16 +274,17 @@ async function zohoGetJsonForOrg(): Promise<Record<string, unknown>> {
 }
 
 async function zohoCreate(
+  companyId: string,
   path: "bills" | "invoices" | "expenses",
   body: Record<string, unknown>,
 ): Promise<{ id: string | null; result: ZohoCallResult }> {
-  const result = await withZohoRetry(async (accessToken) => {
+  const result = await withZohoRetry(companyId, async (z) => {
     const res = await zohoFetch(
-      `${apiBase()}/${path}?organization_id=${encodeURIComponent(orgId())}`,
+      `${z.apiBase}/${path}?organization_id=${encodeURIComponent(z.organizationId)}`,
       {
         method: "POST",
         headers: {
-          Authorization: `Zoho-oauthtoken ${accessToken}`,
+          Authorization: `Zoho-oauthtoken ${z.accessToken}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify(body),
@@ -349,6 +310,7 @@ async function zohoCreate(
  * Only what the reviewer ticked. Zoho refuses over-application; we surface it.
  */
 async function applyCreditsToDoc(
+  companyId: string,
   docKind: "invoice" | "bill",
   docId: string,
   credits: NonNullable<ApproveInput["apply_credits"]>,
@@ -368,10 +330,10 @@ async function applyCreditsToDoc(
     if (vcs.length) body.apply_vendor_credits = vcs;
   }
   if (!Object.keys(body).length) return { applied: 0, ok: true };
-  const result = await withZohoRetry(async (accessToken) => {
+  const result = await withZohoRetry(companyId, async (z) => {
     const res = await zohoFetch(
-      `${apiBase()}/${docKind === "invoice" ? "invoices" : "bills"}/${encodeURIComponent(docId)}/credits?organization_id=${encodeURIComponent(orgId())}`,
-      { method: "POST", headers: { Authorization: `Zoho-oauthtoken ${accessToken}`, "Content-Type": "application/json" }, body: JSON.stringify(body) },
+      `${z.apiBase}/${docKind === "invoice" ? "invoices" : "bills"}/${encodeURIComponent(docId)}/credits?organization_id=${encodeURIComponent(z.organizationId)}`,
+      { method: "POST", headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}`, "Content-Type": "application/json" }, body: JSON.stringify(body) },
     );
     const raw = await res.json().catch(() => ({}));
     return { ok: res.ok && (raw as { code?: number })?.code === 0, status: res.status, raw };
@@ -472,8 +434,8 @@ async function resolvePlaceOfSupply(
   companyId: string,
 ): Promise<string | null> {
   if (explicit?.trim()) return emirateCode(explicit) ?? explicit.trim();
-  const contact = await withZohoRetry(async (accessToken) => {
-    const res = await zohoFetch(`${apiBase()}/contacts/${encodeURIComponent(customerId)}?organization_id=${encodeURIComponent(orgId())}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+  const contact = await withZohoRetry(companyId, async (z) => {
+    const res = await zohoFetch(`${z.apiBase}/contacts/${encodeURIComponent(customerId)}?organization_id=${encodeURIComponent(z.organizationId)}`, { headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` } });
     const raw = await res.json().catch(() => ({}));
     return { ok: res.ok, status: res.status, raw };
   });
@@ -483,12 +445,15 @@ async function resolvePlaceOfSupply(
   const { data: cfg } = await supabase.from("company_config").select("default_place_of_supply").eq("company_id", companyId).maybeSingle();
   const fromCompany = emirateCode(cfg?.default_place_of_supply);
   if (fromCompany) return fromCompany;
-  const org = await withZohoRetry(async (accessToken) => {
-    const res = await zohoFetch(`${apiBase()}/organizations?organization_id=${encodeURIComponent(orgId())}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+  // Needed after the call returns as well, to pick this company's org out of
+  // the list, so resolve it here rather than reaching into the callback.
+  const zOrg = (await getZoho(companyId)).organizationId;
+  const org = await withZohoRetry(companyId, async (z) => {
+    const res = await zohoFetch(`${z.apiBase}/organizations?organization_id=${encodeURIComponent(z.organizationId)}`, { headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` } });
     const raw = await res.json().catch(() => ({}));
     return { ok: res.ok, status: res.status, raw };
   });
-  const o = ((org.raw as { organizations?: Array<Record<string, unknown>> })?.organizations ?? []).find((x) => String(x.organization_id) === orgId()) ?? ((org.raw as { organizations?: Array<Record<string, unknown>> })?.organizations ?? [])[0];
+  const o = ((org.raw as { organizations?: Array<Record<string, unknown>> })?.organizations ?? []).find((x) => String(x.organization_id) === zOrg) ?? ((org.raw as { organizations?: Array<Record<string, unknown>> })?.organizations ?? [])[0];
   return emirateCode(o?.state) ?? emirateCode((o?.address as { state?: string } | undefined)?.state) ?? null;
 }
 
@@ -514,6 +479,7 @@ async function loadDocumentBytes(
 
 /** Attach the source document to the Zoho record. Best effort; never undoes the document. */
 async function attachDocument(
+  companyId: string,
   supabase: SupabaseClient,
   fileUrl: string | null,
   zohoPath: string,
@@ -522,10 +488,10 @@ async function attachDocument(
   if (!fileUrl) return { uploaded: false, error: "no file on document" };
   try {
     const file = await loadDocumentBytes(supabase, fileUrl);
-    const result = await withZohoRetry(async (accessToken) => {
+    const result = await withZohoRetry(companyId, async (z) => {
       const form = new FormData();
       form.append(fieldName, new Blob([file.bytes], { type: file.contentType }), file.filename);
-      const res = await zohoFetch(`${apiBase()}/${zohoPath}?organization_id=${encodeURIComponent(orgId())}`, { method: "POST", headers: { Authorization: `Zoho-oauthtoken ${accessToken}` }, body: form });
+      const res = await zohoFetch(`${z.apiBase}/${zohoPath}?organization_id=${encodeURIComponent(z.organizationId)}`, { method: "POST", headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` }, body: form });
       const raw = await res.json().catch(async () => await res.text());
       return { ok: res.ok && ((raw as { code?: number })?.code ?? 0) === 0, status: res.status, raw };
     });
@@ -775,8 +741,8 @@ Deno.serve(async (req) => {
         const limits = (cfgRow?.credit_limits ?? {}) as Record<string, number>;
         let fresh: Record<string, unknown> = {};
         try {
-          const res = await withZohoRetry(async (accessToken) => {
-            const r = await zohoFetch(`${apiBase()}/contacts/${encodeURIComponent(customerId)}?organization_id=${encodeURIComponent(orgId())}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+          const res = await withZohoRetry(companyId, async (z) => {
+            const r = await zohoFetch(`${z.apiBase}/contacts/${encodeURIComponent(customerId)}?organization_id=${encodeURIComponent(z.organizationId)}`, { headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` } });
             return { ok: r.ok, status: r.status, raw: await r.json().catch(() => ({})) };
           });
           fresh = ((result_contact(res.raw))) ?? {};
@@ -810,7 +776,7 @@ Deno.serve(async (req) => {
         const custExtra = (custRow?.extra as Record<string, unknown>) ?? {};
         let sellerTrn: string | null = null;
         try {
-          const orgRaw = await zohoGetJsonForOrg();
+          const orgRaw = await zohoGetJsonForOrg(companyId);
           sellerTrn = (((orgRaw.organization as Record<string, unknown> | undefined)?.tax_settings ?? {}) as Record<string, unknown>).tax_reg_no as string | undefined || null;
         } catch { /* reported as missing */ }
         einvoice = checkEInvoiceReadiness({
@@ -823,7 +789,7 @@ Deno.serve(async (req) => {
         });
       }
 
-      const created = await zohoCreate("invoices", {
+      const created = await zohoCreate(companyId, "invoices", {
         customer_id: customerId,
         date: mapped.date,
         place_of_supply: pos,
@@ -872,7 +838,7 @@ Deno.serve(async (req) => {
       // Expense amount: the document total, net of VAT when a tax matched
       // (tax_id then makes Zoho re-add it), else the gross.
       const expenseNet = money.taxId && money.taxPct != null ? Math.round((documentTotal / (1 + money.taxPct / 100)) * 100) / 100 : documentTotal;
-      const created = await zohoCreate("expenses", {
+      const created = await zohoCreate(companyId, "expenses", {
         account_id: accountId,
         paid_through_account_id: paidThrough,
         date: mapped.date,
@@ -889,9 +855,9 @@ Deno.serve(async (req) => {
       // recorded." and NO expense object — find the id by reference.
       if (created.result.ok && !created.id && ((created.result.raw as { code?: number })?.code ?? 0) === 0) {
         const ref = mapped.invoice_number?.trim();
-        const lookup = await withZohoRetry(async (accessToken) => {
-          const qs = new URLSearchParams({ organization_id: orgId(), ...(ref ? { reference_number: ref } : {}), sort_column: "created_time", sort_order: "D", per_page: "5" });
-          const res = await zohoFetch(`${apiBase()}/expenses?${qs}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+        const lookup = await withZohoRetry(companyId, async (z) => {
+          const qs = new URLSearchParams({ organization_id: z.organizationId, ...(ref ? { reference_number: ref } : {}), sort_column: "created_time", sort_order: "D", per_page: "5" });
+          const res = await zohoFetch(`${z.apiBase}/expenses?${qs}`, { headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` } });
           const raw = await res.json().catch(() => ({}));
           return { ok: res.ok, status: res.status, raw };
         });
@@ -1013,7 +979,7 @@ Deno.serve(async (req) => {
         const { data: poRow } = await supabase.from("zoho_entities").select("zoho_id, name").eq("kind", "purchase_order").eq("zoho_id", input.purchaseorder_id).maybeSingle();
         purchaseOrder = { zoho_id: input.purchaseorder_id, number: poRow ? String(poRow.name) : input.purchaseorder_id, how: "input" };
       }
-      const created = await zohoCreate("bills", {
+      const created = await zohoCreate(companyId, "bills", {
         vendor_id: matched.bill.vendor_id,
         bill_number: billNumber,
         ...(purchaseOrder ? { purchaseorder_ids: [purchaseOrder.zoho_id] } : {}),
@@ -1101,6 +1067,7 @@ Deno.serve(async (req) => {
     // Attach the source document (best effort; the Zoho record already exists).
     const attachment = zohoId
       ? await attachDocument(
+          companyId,
         supabase,
         (doc.file_url as string | null) ?? null,
         postAs === "invoice" ? `invoices/${zohoId}/attachment` : postAs === "expense" ? `expenses/${zohoId}/receipt` : `bills/${zohoId}/attachment`,
@@ -1114,7 +1081,7 @@ Deno.serve(async (req) => {
     let creditsApplied: ApproveResult["credits_applied"] = null;
     if (zohoId && postAs !== "expense" && input.apply_credits?.length) {
       try {
-        creditsApplied = await applyCreditsToDoc(postAs === "invoice" ? "invoice" : "bill", zohoId, input.apply_credits);
+        creditsApplied = await applyCreditsToDoc(companyId, postAs === "invoice" ? "invoice" : "bill", zohoId, input.apply_credits);
       } catch (err) {
         creditsApplied = { applied: 0, ok: false, response: publicError(err) };
       }

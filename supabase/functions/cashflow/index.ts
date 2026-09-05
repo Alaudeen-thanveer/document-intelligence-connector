@@ -104,7 +104,7 @@ Deno.serve(async (req) => {
 
     // ------------------------------------------------------ collections
     if (action === "collections") {
-      const docs = await fetchOpenDocuments(zohoFetch, z.apiBase, orgId, z);
+      const docs = await fetchOpenDocuments(zohoFetch, z.apiBase, orgId, z.accessToken);
       const invoices = docs.filter((d) => d.kind === "invoice") as unknown as OpenInvoiceLike[];
       // Learned payment habits (layer 6) — any status; evidence, not a rule.
       const { data: lagRows } = await supabase.from("bk_check_proposals")
@@ -176,9 +176,9 @@ Thank you.`,
 
     // ----------------------------------------------------- payment_run
     if (action === "payment_run") {
-      const docs = await fetchOpenDocuments(zohoFetch, z.apiBase, orgId, z);
+      const docs = await fetchOpenDocuments(zohoFetch, z.apiBase, orgId, z.accessToken);
       const bills = docs.filter((d) => d.kind === "bill") as unknown as OpenInvoiceLike[];
-      const credits = await fetchOpenCredits(zohoFetch, z.apiBase, orgId, z);
+      const credits = await fetchOpenCredits(zohoFetch, z.apiBase, orgId, z.accessToken);
       const unused = credits.filter((c) => c.party_kind === "vendor").map((c) => ({ party_zoho_id: c.party_zoho_id, kind: c.kind, number: c.number, balance: c.balance }));
       const groups = buildPaymentRun(bills, { today, horizon_days: Number(cfg?.payment_run_horizon_days ?? 7), unused_credits: unused });
       const { data: bankAccounts } = await supabase.from("zoho_entities").select("zoho_id, name, extra").eq("kind", "bank_account");
@@ -191,7 +191,7 @@ Thank you.`,
     if (action === "record_payments") {
       const payments = Array.isArray(input.payments) ? input.payments : [];
       if (!payments.length) return jsonResponse({ ok: false, error: "No payments in the batch." }, 400);
-      const docs = await fetchOpenDocuments(zohoFetch, z.apiBase, orgId, z);
+      const docs = await fetchOpenDocuments(zohoFetch, z.apiBase, orgId, z.accessToken);
       const openBills = docs.filter((d) => d.kind === "bill") as unknown as OpenInvoiceLike[];
       const results: Array<Record<string, unknown>> = [];
       let recorded = 0, failed = 0;

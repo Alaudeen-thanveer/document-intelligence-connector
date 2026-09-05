@@ -96,10 +96,17 @@ async function refreshTokenFor(
 export async function zohoAuthFor(
   supabase: SupabaseClient,
   companyId: string,
+  /**
+   * Skip the cache and mint a new token. Callers that saw a 401 from Zoho use
+   * this: the cached token may have been revoked before its stated expiry.
+   */
+  opts: { forceRefresh?: boolean } = {},
 ): Promise<ZohoAuth> {
   const conn = await loadConnection(supabase, companyId);
 
-  const { data: cached } = await supabase
+  const { data: cached } = opts.forceRefresh
+    ? { data: null }
+    : await supabase
     .from("zoho_access_tokens")
     .select("access_token, expires_at")
     .eq("company_id", companyId)

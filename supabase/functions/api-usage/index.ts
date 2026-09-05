@@ -13,6 +13,7 @@ import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
@@ -64,36 +65,16 @@ function getSupabase(): SupabaseClient {
   });
 }
 
-async function getAccessToken(supabase: SupabaseClient): Promise<string> {
-  const existing = Deno.env.get("ZOHO_ACCESS_TOKEN")?.trim();
-  if (existing) return existing;
-  const { data } = await supabase.from("zoho_oauth_tokens")
-    .select("access_token, expires_at").eq("id", 1).maybeSingle();
-  if (data?.access_token && new Date(String(data.expires_at)).getTime() > Date.now() + 120_000) {
-    return String(data.access_token);
-  }
-  const accountsUrl = Deno.env.get("ZOHO_ACCOUNTS_URL")?.trim() || "https://accounts.zoho.com";
-  const res = await fetch(`${accountsUrl}/oauth/v2/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      refresh_token: requireEnv("ZOHO_REFRESH_TOKEN"),
-      client_id: requireEnv("ZOHO_CLIENT_ID"),
-      client_secret: requireEnv("ZOHO_CLIENT_SECRET"),
-      grant_type: "refresh_token",
-    }),
-  });
-  const payload = await res.json();
-  if (!res.ok || !payload?.access_token) {
-    throw new Error(`Zoho token refresh failed (${res.status}): ${JSON.stringify(payload)}`);
-  }
-  const token = String(payload.access_token);
-  await supabase.from("zoho_oauth_tokens").upsert({
-    id: 1, access_token: token,
-    expires_at: new Date(Date.now() + 55 * 60_000).toISOString(),
-    updated_at: new Date().toISOString(),
-  });
-  return token;
+/**
+ * The company's own Zoho organisation and a token for it. This used to read
+ * ZOHO_REFRESH_TOKEN and ZOHO_ORGANIZATION_ID from the environment, which is
+ * one organisation for the whole deployment — see _shared/zoho_auth.ts.
+ */
+async function getAccessToken(
+  supabase: SupabaseClient,
+  companyId: string,
+): Promise<ZohoAuth> {
+  return await zohoAuthFor(supabase, companyId);
 }
 
 Deno.serve(async (req) => {
@@ -135,13 +116,13 @@ Deno.serve(async (req) => {
         ...meterContextFromRequest(req, "usage-dashboard", "api-usage"),
         company_id: companyId,
       });
-      const token = await getAccessToken(supabase);
+      const z = await getAccessToken(supabase, companyId);
       const apiBase = Deno.env.get("ZOHO_API_BASE_URL")?.trim() || "https://www.zohoapis.com/books/v3";
       const res = await meter.fetch(`${apiBase}/organizations`, {
-        headers: { Authorization: `Zoho-oauthtoken ${token}` },
+        headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` },
       });
       const j = await res.json();
-      const orgId = requireEnv("ZOHO_ORGANIZATION_ID");
+      const orgId = z.organizationId;
       const org = ((j.organizations ?? []) as Array<Record<string, unknown>>)
         .find((o) => String(o.organization_id) === orgId) ?? (j.organizations ?? [])[0];
       if (org) {
