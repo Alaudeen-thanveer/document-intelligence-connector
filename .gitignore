@@ -9,3 +9,11 @@ supabase/.temp
 .cursor/
 .DS_Store
 *.log
+
+# Any env file, whatever it is named (tmp-supabase.env, foo.env, ...)
+*.env
+!*.env.example
+
+# Local scratch artifacts, never committed
+tmp-*
+*.tgz
