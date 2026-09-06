@@ -1,6 +1,7 @@
 // Push a human-approved invoice bill to Zoho Books (sandbox org via env).
 // Uses existing OAuth refresh + single retry. Never hardcode credentials.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { blobPart } from "../_shared/bytes.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
@@ -188,19 +189,37 @@ function parseJsonEnv<T>(name: string): T | null {
 
 
 
+/** One line of the bill as Zoho's create call takes it. */
+type ZohoBillLine = {
+  description: string;
+  rate: number;
+  quantity: number;
+  account_id: string;
+  tax_id?: string;
+  project_id?: string;
+  tags?: Array<{ tag_id: string; tag_option_id: string }>;
+};
+
+/**
+ * The bill as sent to Zoho. A type alias rather than an interface so it
+ * still satisfies the Record<string, unknown> the HTTP helpers take.
+ */
+type ZohoBillBody = {
+  vendor_id: string;
+  bill_number: string;
+  date: string;
+  due_date?: string;
+  reference_number?: string;
+  line_items: ZohoBillLine[];
+};
+
 function toZohoBillBody(
   bill: ZohoBillMapped,
   opts?: { billNumber?: string },
-): Record<string, unknown> {
+): ZohoBillBody {
   if (!bill.vendor_id) {
     throw new Error("vendor_id is required before Zoho push");
   }
-  for (const item of bill.line_items) {
-    if (!item.account_id) {
-      throw new Error("account_id is required on line items before Zoho push");
-    }
-  }
-
   // Many Zoho orgs (esp. India) require an explicit bill_number when
   // auto-generation is off — omit/invalid values return code 4.
   const billNumber = (opts?.billNumber ?? "").trim() ||
@@ -214,15 +233,23 @@ function toZohoBillBody(
     ...(bill.reference_number
       ? { reference_number: bill.reference_number }
       : {}),
-    line_items: bill.line_items.map((item) => ({
-      description: item.description,
-      rate: item.rate,
-      quantity: item.quantity,
-      account_id: item.account_id,
-      ...(item.tax_id ? { tax_id: item.tax_id } : {}),
-      ...(item.project_id ? { project_id: item.project_id } : {}),
-      ...(item.tags && item.tags.length > 0 ? { tags: item.tags } : {}),
-    })),
+    line_items: bill.line_items.map((item): ZohoBillLine => {
+      // Refused here, before anything is sent: a line with no account
+      // cannot be posted, and Zoho's own error for it is unhelpful.
+      const accountId = item.account_id;
+      if (!accountId) {
+        throw new Error("account_id is required on line items before Zoho push");
+      }
+      return {
+        description: item.description,
+        rate: item.rate,
+        quantity: item.quantity,
+        account_id: accountId,
+        ...(item.tax_id ? { tax_id: item.tax_id } : {}),
+        ...(item.project_id ? { project_id: item.project_id } : {}),
+        ...(item.tags && item.tags.length > 0 ? { tags: item.tags } : {}),
+      };
+    }),
   };
 }
 
@@ -268,10 +295,10 @@ type ZohoCallResult = {
 /**
  * Run a Zoho HTTP call; on 401/403/5xx refresh token and retry once.
  */
-async function withZohoRetry(
+async function withZohoRetry<R extends ZohoCallResult>(
   companyId: string,
-  call: (z: ZohoAuth) => Promise<ZohoCallResult>,
-): Promise<{ result: ZohoCallResult; z: ZohoAuth; retried: boolean }> {
+  call: (z: ZohoAuth) => Promise<R>,
+): Promise<{ result: R; z: ZohoAuth; retried: boolean }> {
   let z = await getZoho(companyId);
   let retried = false;
   let result = await call(z);
@@ -337,7 +364,7 @@ async function attachBillDocument(
   const form = new FormData();
   form.append(
     "attachment",
-    new Blob([bytes], { type: contentType || "application/pdf" }),
+    new Blob([blobPart(bytes)], { type: contentType || "application/pdf" }),
     filename || "invoice.pdf",
   );
 
@@ -463,7 +490,7 @@ async function attachToZohoDoc(
   const form = new FormData();
   form.append(
     fieldName,
-    new Blob([bytes], { type: contentType || "application/pdf" }),
+    new Blob([blobPart(bytes)], { type: contentType || "application/pdf" }),
     filename || "document.pdf",
   );
   const url = `${z.apiBase}/${urlPath}?organization_id=${
@@ -1347,18 +1374,17 @@ Deno.serve(async (req) => {
 
     // VAT belongs in the tax field, never inside the line amount.
     if (money.taxId) {
-      billBody.line_items = (billBody.line_items as Array<
-        Record<string, unknown>
-      >).map((item, i) => {
+      const taxId = money.taxId;
+      billBody.line_items = billBody.line_items.map((item, i) => {
         if (hasRealLines) {
           // Extracted lines are the printed (net) amounts: attach the
           // matched rate to lines without their own tax; keep rates as-is.
-          return item.tax_id ? item : { ...item, tax_id: money.taxId };
+          return item.tax_id ? item : { ...item, tax_id: taxId };
         }
         // Implicit single line holds the gross: post net + tax_id so Zoho
         // recomputes the same gross the document shows.
         return i === 0 && money.netRate != null
-          ? { ...item, rate: money.netRate, tax_id: money.taxId }
+          ? { ...item, rate: money.netRate, tax_id: taxId }
           : item;
       });
     }

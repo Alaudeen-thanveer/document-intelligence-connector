@@ -2,6 +2,7 @@
 // Secrets come from Deno.env (local --env-file / hosted supabase secrets).
 // Never returns a Zoho token. Always scopes the invoice by the caller's company.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { blobPart } from "../_shared/bytes.ts";
 import { checkEInvoiceReadiness, type EInvoiceFinding } from "./einvoice.ts";
 import { creditCheck, type CreditCheckResult } from "../cashflow/cash.ts";
 import { detectFollowups, type Followups } from "../month-end/schedules.ts";
@@ -439,7 +440,7 @@ async function attachDocument(
     const file = await loadDocumentBytes(supabase, fileUrl);
     const result = await withZohoRetry(companyId, async (z) => {
       const form = new FormData();
-      form.append(fieldName, new Blob([file.bytes], { type: file.contentType }), file.filename);
+      form.append(fieldName, new Blob([blobPart(file.bytes)], { type: file.contentType }), file.filename);
       const res = await zohoFetch(`${z.apiBase}/${zohoPath}?organization_id=${encodeURIComponent(z.organizationId)}`, { method: "POST", headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` }, body: form });
       const raw = await res.json().catch(async () => await res.text());
       return { ok: res.ok && ((raw as { code?: number })?.code ?? 0) === 0, status: res.status, raw };

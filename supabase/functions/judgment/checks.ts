@@ -20,6 +20,13 @@ export interface JudgmentCheckContext {
   po_number: string | null;
   duplicate_check_days: number;
   amount_requires_po_threshold: number;
+  /** VAT on the document; the PO check compares net, not gross. */
+  tax_amount: number | null;
+  /** The extraction row, for the line items the PO check reads. */
+  extracted_fields_id: string;
+  /** Allowed PO variance, from company_config. */
+  po_variance_pct: number;
+  po_variance_amount: number;
 }
 
 function normalizeVendor(vendor: string | null): string | null {

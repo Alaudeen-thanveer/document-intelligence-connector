@@ -33,7 +33,7 @@ import {
 } from "./suggest.ts";
 import { type BankPattern } from "../bookkeeping-learn/bank_patterns.ts";
 import { pushLine } from "./push.ts";
-import { buildFeedRequest, extractZohoId, suggestFromZohoMatches, uncategorizedToLines, type ZohoMatchCandidate, type ZohoUncategorizedRow } from "./feed.ts";
+import { type FeedConfirmed, buildFeedRequest, extractZohoId, suggestFromZohoMatches, uncategorizedToLines, type ZohoMatchCandidate, type ZohoUncategorizedRow } from "./feed.ts";
 import { isProposableAsZohoRule, zohoRuleBodyForPattern, type ZohoBankRule } from "./zoho_rules.ts";
 import { attachTargetFor, buildLineEvidence, textToPdf } from "./evidence.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
@@ -162,7 +162,7 @@ async function loadRecorded(supabase: SupabaseClient, companyId: string, stateme
   for (const l of lines ?? []) {
     const k = String(l.chosen_txn_kind ?? "");
     if (!["customer_payment", "vendor_payment", "expense", "retainer_receipt", "already_recorded"].includes(k)) continue;
-    const st = (l as { bank_statements: { bank_account_name: string | null; period_start: string | null } }).bank_statements;
+    const st = (l as unknown as { bank_statements: { bank_account_name: string | null; period_start: string | null } }).bank_statements;
     out.push({
       kind: k === "customer_payment" || k === "retainer_receipt" ? "customer_payment" : k === "vendor_payment" ? "vendor_payment" : k === "expense" ? "expense" : "other",
       zoho_id: String(l.zoho_txn_id ?? l.chosen_ref_zoho_id ?? ""),
@@ -554,7 +554,7 @@ Deno.serve(async (req) => {
             const sug = (line.suggestion ?? null) as (Suggestion & { ref_zoho_id?: string | null }) | null;
             const cands = ((line as { zoho_match_candidates?: ZohoMatchCandidate[] | null }).zoho_match_candidates ?? []);
             const matchedType = cands.find((c) => String(c.transaction_id) === String(line.chosen_ref_zoho_id))?.transaction_type ?? null;
-            const req = buildFeedRequest({ ...(line as never), matched_transaction_type: matchedType }, st.bank_account_zoho_id, null);
+            const req = buildFeedRequest({ ...(line as unknown as FeedConfirmed), matched_transaction_type: matchedType }, st.bank_account_zoho_id, null);
             const res = await meter.fetch(`${z.apiBase}/${req.path}?organization_id=${encodeURIComponent(z.organizationId)}`, {
               method: "POST", headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}`, ...(req.body ? { "Content-Type": "application/json" } : {}) }, body: req.body ? JSON.stringify(req.body) : undefined,
             });
@@ -563,7 +563,7 @@ Deno.serve(async (req) => {
             r = { zoho_id: extractZohoId(raw) ?? (req.kind === "match" ? String(line.chosen_ref_zoho_id) : String((line as { zoho_uncategorized_id: string }).zoho_uncategorized_id)), payload: raw, extra: [], kind: req.kind };
             void sug;
           } else {
-            r = await pushLine(meter.fetch, z.apiBase, z.organizationId, z, line as never, st.bank_account_zoho_id, { bankChargesAccountId: feeAcct?.zoho_id ? String(feeAcct.zoho_id) : null });
+            r = await pushLine(meter.fetch, z.apiBase, z.organizationId, z.accessToken, line as never, st.bank_account_zoho_id, { bankChargesAccountId: feeAcct?.zoho_id ? String(feeAcct.zoho_id) : null });
           }
           // The statement is the evidence — attach it (file, else a text
           // note with the line) to the record just created. Feed-mode lines
