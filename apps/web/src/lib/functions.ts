@@ -29,6 +29,19 @@ async function authHeaders(actionId: string): Promise<HeadersInit> {
   };
 }
 
+/**
+ * The company this browser is showing. Row-level security decides what the
+ * signed-in person sees through current_company_id(), so an upload sent
+ * with this id lands where the grid already shows it. A person in several
+ * companies gets the one the database shows them; without it, the ingest
+ * guard has to refuse with "name the company" for anyone in two or more.
+ */
+export async function currentCompanyId(): Promise<string | null> {
+  const { data, error } = await supabase.rpc("current_company_id");
+  if (error) throw new Error(`Could not read your company: ${error.message}`);
+  return typeof data === "string" && data ? data : null;
+}
+
 export function newActionId(): string {
   return typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()

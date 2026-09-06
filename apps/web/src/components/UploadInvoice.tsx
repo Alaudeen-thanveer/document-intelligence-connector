@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { callEdgeFunction } from "../lib/functions";
+import { callEdgeFunction, currentCompanyId } from "../lib/functions";
 
 const ALLOWED_TYPES = new Set([
   "application/pdf",
@@ -59,7 +59,11 @@ export function UploadInvoice({ onUploaded, onStatus }: Props) {
     try {
       onStatus({ text: `Reading ${file.name}…`, tone: "ok" });
       const fileBase64 = await fileToBase64(file);
+      // Say which company this lands in — the one the grid is showing.
+      // ingest no longer guesses from a stamp on the login account.
+      const companyId = await currentCompanyId();
       const ingest = await callEdgeFunction("ingest", {
+        ...(companyId ? { company_id: companyId } : {}),
         source: "upload",
         filename: file.name,
         content_type: file.type,
