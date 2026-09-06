@@ -5,7 +5,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { checkEInvoiceReadiness, type EInvoiceFinding } from "./einvoice.ts";
 import { creditCheck, type CreditCheckResult } from "../cashflow/cash.ts";
 import { detectFollowups, type Followups } from "../month-end/schedules.ts";
-import { createClient, type SupabaseClient, type User } from "npm:@supabase/supabase-js@2";
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import {
   mapExtractedFieldsToZohoBill,
@@ -18,6 +18,8 @@ import {
   type ZohoVendor,
 } from "../zoho-push/match-entities.ts";
 import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
+import { isAuthFail, requireUser } from "../_shared/require_user.ts";
+import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
@@ -134,43 +136,6 @@ function publicError(err: unknown): string {
     "[redacted]",
   );
   return message.slice(0, 500);
-}
-
-function companyIdFromUser(user: User): string | null {
-  const raw = user.app_metadata?.company_id;
-  if (typeof raw === "string" && raw.trim()) return raw.trim();
-  return null;
-}
-
-async function callerFromRequest(
-  req: Request,
-): Promise<{ user: User; companyId: string } | Response> {
-  const authHeader = req.headers.get("Authorization") ?? "";
-  const token = authHeader.replace(/^Bearer\s+/i, "").trim();
-  if (!token) {
-    return jsonResponse({ success: false, error: "Sign in required" }, 401);
-  }
-
-  const authClient = createClient(
-    requireEnv("SUPABASE_URL"),
-    requireEnv("SUPABASE_ANON_KEY"),
-    {
-      auth: { persistSession: false, autoRefreshToken: false },
-      global: { headers: { Authorization: `Bearer ${token}` } },
-    },
-  );
-  const { data, error } = await authClient.auth.getUser(token);
-  if (error || !data.user) {
-    return jsonResponse({ success: false, error: "Sign in required" }, 401);
-  }
-  const companyId = companyIdFromUser(data.user);
-  if (!companyId) {
-    return jsonResponse(
-      { success: false, error: "No company_id on this account" },
-      403,
-    );
-  }
-  return { user: data.user, companyId };
 }
 
 async function writeAudit(
@@ -537,9 +502,17 @@ Deno.serve(async (req) => {
     return jsonResponse({ success: false, error: "Method not allowed" }, 405);
   }
 
-  const identity = await callerFromRequest(req);
-  if (identity instanceof Response) return identity;
-  const { user, companyId } = identity;
+  // A signed-in person only. Scripts that post to Zoho use zoho-push, which
+  // accepts the service role; nothing calls approve as the system.
+  const auth = await requireUser(req, {
+    corsHeaders: CORS_HEADERS,
+    errorBody: (m) => ({ success: false, error: m }),
+  });
+  if (isAuthFail(auth)) return auth.response;
+  if (!auth.user) {
+    return jsonResponse({ success: false, error: "Sign in required" }, 401);
+  }
+  const user = auth.user;
 
   let input: ApproveInput = {};
   try {
@@ -553,6 +526,21 @@ Deno.serve(async (req) => {
   if (!invoiceId) {
     return jsonResponse({ success: false, error: "invoice_id is required" }, 400);
   }
+
+  // Whose invoice is this? Its company is the target, and the caller must be
+  // a member of that company — the rule every other function applies. This
+  // used to read a company_id stamped on the login account, which gives a
+  // person one company for life: staff who serve several clients have one
+  // login, not one per client, and nothing in the request could say which
+  // client an approval was for. A wrong company answers 404, never 403, so
+  // the refusal does not confirm the invoice exists.
+  const tenant = await companyForCaller(auth, {
+    documentId: invoiceId,
+    cors: CORS_HEADERS,
+    errorBody: (m) => ({ success: false, error: m }),
+  });
+  if (isCompanyFail(tenant)) return tenant.response;
+  const companyId = tenant.companyId;
 
   const supabase = getServiceClient();
   const meter = createZohoMeter(supabase, {
