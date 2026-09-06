@@ -10,12 +10,9 @@
 // See docs/BOOKKEEPING_PATTERNS_SPEC.md.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { corsHeaders } from "../_shared/cors.ts";
-import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
 
-/** Set per request; every Zoho call goes through it so usage is metered. */
-let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
 import {
   buildPartyProfiles,
   type HistoryDoc,
@@ -27,7 +24,6 @@ import { learnAttachmentConvention } from "./attachments.ts";
 import {
   learnJournalTagUsage,
   learnPartyTagProfiles,
-  parseZohoLineTags,
 } from "./tags_projects.ts";
 import {
   buildTimingProfiles,
@@ -41,73 +37,23 @@ import {
   type JournalForPattern,
 } from "./journal_patterns.ts";
 import {
-  type BankObservation,
   type BankSide,
   type BankTxnKind,
   buildBankPatterns,
 } from "./bank_patterns.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
-import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
-
-type DocKind =
-  | "bill"
-  | "invoice"
-  | "expense"
-  | "journal"
-  | "vendorpayment"
-  | "customerpayment";
-const KIND_META: Record<
-  DocKind,
-  { path: string; listKey: string; idKey: string; rootKey: string }
-> = {
-  bill: { path: "bills", listKey: "bills", idKey: "bill_id", rootKey: "bill" },
-  invoice: {
-    path: "invoices",
-    listKey: "invoices",
-    idKey: "invoice_id",
-    rootKey: "invoice",
-  },
-  expense: {
-    path: "expenses",
-    listKey: "expenses",
-    idKey: "expense_id",
-    rootKey: "expense",
-  },
-  journal: {
-    path: "journals",
-    listKey: "journals",
-    idKey: "journal_id",
-    rootKey: "journal",
-  },
-  vendorpayment: {
-    path: "vendorpayments",
-    listKey: "vendorpayments",
-    idKey: "payment_id",
-    rootKey: "vendorpayment",
-  },
-  customerpayment: {
-    path: "customerpayments",
-    listKey: "customerpayments",
-    idKey: "payment_id",
-    rootKey: "payment",
-  },
-};
-
-interface LearnInput {
-  company_id?: string;
-  /** How far back to read; default 24. */
-  months_back?: number;
-  /** Cap on documents to detail-fetch per kind, for cost control. */
-  max_docs_per_kind?: number;
-  /** Re-analyse from bk_history_raw without touching Zoho. */
-  reanalyze_only?: boolean;
-  /**
-   * Re-fetch already-cached bills and invoices so status / balance reflect
-   * payments made since they were first cached. Timing (layer 6) depends
-   * on this; cheap for small orgs, so it defaults ON for full runs.
-   */
-  refresh_documents?: boolean;
-}
+import type { LearnInput } from "./types.ts";
+import {
+  type DocKind,
+  getAccessToken,
+  getSupabase,
+  KIND_META,
+  listIds,
+  setZohoFetch,
+  toHistoryDoc,
+  zohoGet,
+} from "./zoho_history.ts";
+import { bankObservationsFromHistory, fetchBankTransactions } from "./bank_history.ts";
 
 const CORS_HEADERS = corsHeaders("authorization, content-type, apikey, x-client-info");
 
@@ -116,390 +62,6 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { "Content-Type": "application/json", ...CORS_HEADERS },
   });
-}
-
-function requireEnv(name: string): string {
-  const value = Deno.env.get(name)?.trim();
-  if (!value) throw new Error(`${name} is not set`);
-  return value;
-}
-
-function getSupabase(): SupabaseClient {
-  const url = Deno.env.get("SUPABASE_URL");
-  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!url || !key) {
-    throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set");
-  }
-  return createClient(url, key, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
-
-
-// ---------------------------------------------------------------------------
-// OAuth: cached z first (Zoho throttles refresh hard), refresh on miss.
-// ---------------------------------------------------------------------------
-
-/**
- * The company's own Zoho organisation and a z for it. This used to read
- * ZOHO_REFRESH_TOKEN and ZOHO_ORGANIZATION_ID from the environment, which is
- * one organisation for the whole deployment — see _shared/zoho_auth.ts.
- */
-async function getAccessToken(
-  supabase: SupabaseClient,
-  companyId: string,
-): Promise<ZohoAuth> {
-  return await zohoAuthFor(supabase, companyId);
-}
-
-// ---------------------------------------------------------------------------
-// Zoho fetch with gentle backoff on 429 / 5xx.
-// ---------------------------------------------------------------------------
-async function zohoGet(
-  z: ZohoAuth,
-  path: string,
-  params: Record<string, string> = {},
-): Promise<Record<string, unknown>> {
-  const qs = new URLSearchParams({ organization_id: z.organizationId, ...params });
-  const url = `${z.apiBase}/${path}?${qs.toString()}`;
-  for (let attempt = 1; attempt <= 4; attempt++) {
-    const res = await zohoFetch(url, {
-      headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` },
-    });
-    const raw = await res.json().catch(() => ({}));
-    if (res.ok) return raw as Record<string, unknown>;
-    if ((res.status === 429 || res.status >= 500) && attempt < 4) {
-      await new Promise((r) => setTimeout(r, 400 * 2 ** (attempt - 1)));
-      continue;
-    }
-    throw new Error(
-      `Zoho ${path} failed (${res.status}): ${JSON.stringify(raw)}`,
-    );
-  }
-  throw new Error(`Zoho ${path}: retries exhausted`);
-}
-
-async function listIds(
-  z: ZohoAuth,
-  kind: DocKind,
-  fromDate: string,
-  cap: number,
-): Promise<string[]> {
-  const { path, listKey, idKey } = KIND_META[kind];
-  const ids: string[] = [];
-  let page = 1;
-  while (ids.length < cap && page <= 50) {
-    // Journals use journal_date for filtering/sorting; the others use date.
-    const dateField = kind === "journal" ? "journal_date" : "date";
-    const raw = await zohoGet(z, path, {
-      per_page: "200",
-      page: String(page),
-      [`${dateField}_start`]: fromDate,
-      sort_column: dateField,
-      sort_order: "D",
-    });
-    const items = (raw[listKey] as Array<Record<string, unknown>>) ?? [];
-    for (const it of items) {
-      if (it[idKey] != null) ids.push(String(it[idKey]));
-      if (ids.length >= cap) break;
-    }
-    const more = Boolean(
-      (raw as { page_context?: { has_more_page?: boolean } }).page_context
-        ?.has_more_page,
-    );
-    if (!more) break;
-    page++;
-  }
-  return ids;
-}
-
-// ---------------------------------------------------------------------------
-// Zoho payload → HistoryDoc.
-// ---------------------------------------------------------------------------
-function toHistoryDoc(
-  kind: DocKind,
-  raw: Record<string, unknown>,
-): HistoryDoc | null {
-  // Payments feed layer 6 and bank transactions feed bank layer 1; neither
-  // is a party→account document.
-  if (!KIND_META[kind]) return null;
-  if (kind === "vendorpayment" || kind === "customerpayment") return null;
-  const doc = (raw[KIND_META[kind].rootKey] ?? raw) as Record<string, unknown>;
-
-  // Journals have no party; expenses and bills have a vendor; invoices a customer.
-  const partyId = kind === "journal"
-    ? ""
-    : kind === "invoice"
-    ? doc.customer_id
-    : doc.vendor_id;
-  const partyName = kind === "journal"
-    ? ""
-    : kind === "invoice"
-    ? doc.customer_name
-    : doc.vendor_name;
-  if (kind !== "journal" && partyId == null) return null;
-
-  const rawLines = (doc.line_items as Array<Record<string, unknown>>) ?? [];
-  // Expenses are flat (one account, one amount) with header-level tags/project.
-  const lineSource = kind === "expense" && rawLines.length === 0
-    ? [{
-      account_id: doc.account_id,
-      account_name: doc.account_name,
-      amount: doc.total ?? doc.amount,
-      tags: doc.tags,
-      project_id: doc.project_id,
-      project_name: doc.project_name,
-    }]
-    : rawLines;
-
-  const lines = lineSource.map((li) => ({
-    account_id: li.account_id != null ? String(li.account_id) : null,
-    account_name: li.account_name != null ? String(li.account_name) : null,
-    // Journals: signed by debit/credit so both sides are visible.
-    amount: kind === "journal"
-      ? ((Number(li.debit_amount ?? 0) ||
-          (String(li.debit_or_credit ?? "").toLowerCase() === "debit"
-            ? Number(li.amount ?? 0) || 0
-            : 0)) -
-        (Number(li.credit_amount ?? 0) ||
-          (String(li.debit_or_credit ?? "").toLowerCase() === "credit"
-            ? Number(li.amount ?? 0) || 0
-            : 0)))
-      : Number(li.item_total ?? li.amount ?? 0) || 0,
-    tags: parseZohoLineTags(li.tags),
-    project_id: li.project_id != null && String(li.project_id) !== ""
-      ? String(li.project_id)
-      : null,
-    project_name: li.project_name != null ? String(li.project_name) : null,
-  }));
-
-  const hasPo = Boolean(
-    (kind === "bill" &&
-      (doc.purchaseorder_ids as unknown[] | undefined)?.length) ||
-      String(doc.reference_number ?? "").trim(),
-  );
-
-  return {
-    doc_kind: kind,
-    zoho_id: String(doc[KIND_META[kind].idKey] ?? ""),
-    party_zoho_id: String(partyId ?? ""),
-    party_name: String(partyName ?? ""),
-    date: String(doc.date ?? doc.journal_date ?? "").slice(0, 10),
-    total: Number(doc.total ?? doc.amount ?? 0) || 0,
-    currency: doc.currency_code != null ? String(doc.currency_code) : null,
-    tax_treatment: doc.tax_treatment ? String(doc.tax_treatment) : null,
-    payment_terms_id: doc.payment_terms_id != null
-      ? String(doc.payment_terms_id)
-      : null,
-    has_po: hasPo,
-    line_items: lines,
-    documents: ((doc.documents as Array<Record<string, unknown>>) ?? []).map(
-      (d) => ({
-        file_name: d.file_name != null ? String(d.file_name) : null,
-        file_type: d.file_type != null ? String(d.file_type) : null,
-      }),
-    ),
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Bank transactions (bank layer 1).
-// ---------------------------------------------------------------------------
-
-/** Zoho transaction_type → the kind we learn. */
-function bankTxnKind(t: string): BankTxnKind {
-  const s = t.toLowerCase();
-  if (s === "customer_payment") return "customer_payment";
-  if (s === "vendor_payment") return "vendor_payment";
-  if (s.includes("transfer")) return "transfer";
-  if (
-    s === "expense" || s === "card_payment" || s === "expense_refund" ||
-    s.includes("charge") || s.includes("tax")
-  ) return "expense";
-  if (
-    s === "deposit" || s === "sales_without_invoices" || s === "interest_income" ||
-    s === "other_income" || s === "owner_contribution" || s === "refund"
-  ) return "deposit";
-  return "other";
-}
-
-/**
- * List categorised transactions on every bank/cash account and cache the
- * rows. Zoho keeps payment-type rows under the payments endpoints (their
- * detail 404s here), so only expense/deposit/transfer kinds are detail-
- * fetched, and only to learn the category account id.
- */
-async function fetchBankTransactions(
-  supabase: SupabaseClient,
-  z: ZohoAuth,
-  companyId: string,
-  fromDate: string,
-  cap: number,
-): Promise<number> {
-  const accts = await zohoGet(z, "bankaccounts");
-  const accounts = ((accts.bankaccounts as Array<Record<string, unknown>>) ?? [])
-    .filter((a) => a.account_id != null);
-  let fetched = 0;
-  for (const a of accounts) {
-    const accountId = String(a.account_id);
-    let page = 1;
-    let count = 0;
-    while (count < cap && page <= 25) {
-      let raw: Record<string, unknown>;
-      try {
-        raw = await zohoGet(z, "banktransactions", {
-          account_id: accountId,
-          date_start: fromDate,
-          per_page: "200",
-          page: String(page),
-          sort_column: "date",
-          sort_order: "D",
-        });
-      } catch {
-        // Some orgs reject the date filter here; fall back to unfiltered.
-        raw = await zohoGet(z, "banktransactions", {
-          account_id: accountId,
-          per_page: "200",
-          page: String(page),
-        });
-      }
-      const rows = (raw.banktransactions as Array<Record<string, unknown>>) ?? [];
-      for (const row of rows) {
-        const id = String(row.transaction_id ?? "");
-        if (!id) continue;
-        // Uncategorised feed lines teach nothing yet.
-        const status = String(row.status ?? "").toLowerCase();
-        if (status === "uncategorized") continue;
-        const { data: have } = await supabase
-          .from("bk_history_raw")
-          .select("zoho_id")
-          .eq("company_id", companyId)
-          .eq("doc_kind", "banktransaction")
-          .eq("zoho_id", id)
-          .maybeSingle();
-        if (have) { count++; continue; }
-
-        const kind = bankTxnKind(String(row.transaction_type ?? ""));
-        let payload: Record<string, unknown> = { banktransaction: row };
-        if (kind !== "customer_payment" && kind !== "vendor_payment") {
-          try {
-            const detail = await zohoGet(z, `banktransactions/${id}`);
-            if (detail.banktransaction) {
-              payload = {
-                banktransaction: {
-                  ...row,
-                  ...(detail.banktransaction as Record<string, unknown>),
-                },
-              };
-            }
-          } catch {
-            // list row is enough; category id resolves by name later
-          }
-        }
-        await supabase.from("bk_history_raw").upsert({
-          company_id: companyId,
-          doc_kind: "banktransaction",
-          zoho_id: id,
-          payload,
-        }, { onConflict: "company_id,doc_kind,zoho_id" });
-        fetched++;
-        count++;
-        if (count >= cap) break;
-      }
-      const more = Boolean(
-        (raw as { page_context?: { has_more_page?: boolean } }).page_context
-          ?.has_more_page,
-      );
-      if (!more) break;
-      page++;
-    }
-  }
-  return fetched;
-}
-
-/**
- * Turn cached history into bank observations. Three sources:
- *   • categorised bank transactions (description, payee, category account)
- *   • customer / vendor payments (description + reference, party, deposit
- *     or paid-through account)
- *   • lines a reviewer confirmed in this app (added in bank layer 4)
- * accountByName resolves a category shown only by name on list rows.
- */
-function bankObservationsFromHistory(
-  rawRows: Array<{ doc_kind: string; payload: unknown }>,
-  accountByName: Map<string, string>,
-): BankObservation[] {
-  const out: BankObservation[] = [];
-  for (const r of rawRows) {
-    const p = r.payload as Record<string, unknown>;
-    if (r.doc_kind === "banktransaction") {
-      const t = (p.banktransaction ?? p) as Record<string, unknown>;
-      // First non-empty of description / reference / payee — feeds often
-      // leave description blank and put the counterparty in payee.
-      const description = [t.description, t.reference_number, t.payee]
-        .map((x) => (x == null ? "" : String(x).trim()))
-        .find(Boolean) ?? "";
-      if (!description) continue;
-      // Zoho's debit_or_credit is the LEDGER view (money out of the bank =
-      // credit to the bank account); our side is the statement view.
-      const side: BankSide = String(t.debit_or_credit ?? "").toLowerCase() === "credit"
-        ? "debit"
-        : "credit";
-      const kind = bankTxnKind(String(t.transaction_type ?? ""));
-      const isPayment = kind === "customer_payment" || kind === "vendor_payment";
-      // Category account: from detail line_items, else by offset name.
-      const li = ((t.line_items as Array<Record<string, unknown>>) ?? [])[0];
-      const offsetName = t.offset_account_name != null ? String(t.offset_account_name) : null;
-      const accountId = li?.account_id != null
-        ? String(li.account_id)
-        : offsetName && accountByName.has(offsetName.toLowerCase())
-        ? accountByName.get(offsetName.toLowerCase())!
-        : null;
-      const partyId = t.customer_id != null && String(t.customer_id) !== ""
-        ? String(t.customer_id)
-        : t.vendor_id != null && String(t.vendor_id) !== ""
-        ? String(t.vendor_id)
-        : null;
-      out.push({
-        description,
-        side,
-        amount: Number(t.amount ?? 0) || 0,
-        date: String(t.date ?? "").slice(0, 10),
-        txn_kind: kind,
-        party_kind: partyId
-          ? (kind === "vendor_payment" || (kind === "expense" && side === "debit") ? "vendor" : "customer")
-          : null,
-        party_zoho_id: partyId,
-        party_name: t.payee != null && String(t.payee) !== "" ? String(t.payee) : null,
-        account_id: isPayment ? null : accountId,
-        account_name: isPayment ? null : (li?.account_name != null ? String(li.account_name) : offsetName),
-        source: "zoho_bank",
-      });
-    } else if (r.doc_kind === "customerpayment" || r.doc_kind === "vendorpayment") {
-      const root = r.doc_kind === "customerpayment" ? "payment" : "vendorpayment";
-      const d = (p[root] ?? p) as Record<string, unknown>;
-      const description = [d.description, d.reference_number]
-        .map((x) => (x == null ? "" : String(x).trim()))
-        .filter(Boolean)
-        .join(" ");
-      if (!description) continue;
-      const isCustomer = r.doc_kind === "customerpayment";
-      out.push({
-        description,
-        side: isCustomer ? "credit" : "debit",
-        amount: Number(d.amount ?? 0) || 0,
-        date: String(d.date ?? "").slice(0, 10),
-        txn_kind: isCustomer ? "customer_payment" : "vendor_payment",
-        party_kind: isCustomer ? "customer" : "vendor",
-        party_zoho_id: String((isCustomer ? d.customer_id : d.vendor_id) ?? "") || null,
-        party_name: String((isCustomer ? d.customer_name : d.vendor_name) ?? "") || null,
-        account_id: null,
-        account_name: null,
-        source: "zoho_payment",
-      });
-    }
-  }
-  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +100,7 @@ Deno.serve(async (req) => {
     ...meterContextFromRequest(req, "learn", "bookkeeping-learn"),
     company_id: companyId,
   });
-  zohoFetch = meter.fetch;
+  setZohoFetch(meter.fetch);
 
   const { data: run } = await supabase
     .from("bk_learn_runs")
