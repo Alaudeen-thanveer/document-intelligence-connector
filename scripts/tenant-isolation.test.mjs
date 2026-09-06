@@ -124,7 +124,7 @@ async function dropTenant(t) {
 async function sweepStaleTenants() {
   const users = await svc("/auth/v1/admin/users?per_page=200").then((r) => r.json());
   for (const u of users?.users ?? []) {
-    if (!/^iso-[ab]-\d+@local\.test$/.test(u.email ?? "")) continue;
+    if (!/^iso-(?:a|b|ab)-\d+@local\.test$/.test(u.email ?? "")) continue;
     const company = u.app_metadata?.company_id;
     if (company) await dropTenant({ company, userId: u.id });
     else await svc(`/auth/v1/admin/users/${u.id}`, { method: "DELETE" });
@@ -342,4 +342,70 @@ test("A's own records were not modified by any of B's attempts", async () => {
     0,
     `B's calls wrote ${judgments.length} judgment rows into A's records`,
   );
+});
+
+/**
+ * A person who serves several clients has ONE login. zoho-approve used to
+ * read the company off a company_id stamped on that login by an admin, so
+ * such a person could approve for exactly one client — and a login with no
+ * stamp could approve for none, however many companies it belonged to.
+ *
+ * This signs in as a member of BOTH companies who carries no stamp at all,
+ * and approves A's document. The guard must let it through: the invoice's
+ * company is the target, and membership decides. Nothing is posted — the
+ * throwaway company has no Zoho connection, so the call fails further on,
+ * for that reason and not for identity. The assertion is on the refusal
+ * codes the guard produces, not on Zoho succeeding.
+ *
+ * It runs last on purpose: a call that gets past the guard marks the document
+ * sync_failed, and the "records were not modified" test above must see the
+ * document as B's attempts left it.
+ */
+const AB = { email: `iso-ab-${Date.now()}@local.test` };
+
+test("zoho-approve admits a member of two companies who carries no company stamp", async () => {
+  const created = await svc("/auth/v1/admin/users", {
+    method: "POST",
+    body: JSON.stringify({ email: AB.email, password: PASSWORD, email_confirm: true }),
+  }).then((r) => r.json());
+  AB.userId = created.id;
+  assert.ok(AB.userId, `could not create ${AB.email}: ${JSON.stringify(created)}`);
+  try {
+    for (const company of [A.company, B.company]) {
+      const joined = await svc("/rest/v1/company_members", {
+        method: "POST",
+        body: JSON.stringify({ user_id: AB.userId, company_id: company, role: "reviewer" }),
+      });
+      // A membership that silently fails to write makes the guard look broken
+      // when the test is. Check it rather than trust it.
+      assert.equal(joined.status, 201, `could not add ${AB.email} to a company: ${await joined.text()}`);
+    }
+    const session = await fetch(`${URL_}/auth/v1/token?grant_type=password`, {
+      method: "POST",
+      headers: { apikey: ANON, "Content-Type": "application/json" },
+      body: JSON.stringify({ email: AB.email, password: PASSWORD }),
+    }).then((r) => r.json());
+    assert.ok(session.access_token, `could not sign in ${AB.email}: ${JSON.stringify(session)}`);
+
+    const res = await asUser(session.access_token, "/functions/v1/zoho-approve", {
+      method: "POST",
+      body: JSON.stringify({ invoice_id: A.documentId }),
+    });
+    const text = await res.text();
+    assert.ok(
+      ![401, 403, 404].includes(res.status),
+      `zoho-approve refused (${res.status}) a member of A who carries no company stamp. Body: ${text.slice(0, 300)}`,
+    );
+    assert.ok(
+      !/company_id on this account/i.test(text),
+      `zoho-approve still wants a company stamp on the login: ${text.slice(0, 300)}`,
+    );
+  } finally {
+    await svc(`/rest/v1/company_members?user_id=eq.${AB.userId}`, { method: "DELETE" });
+    await svc(`/auth/v1/admin/users/${AB.userId}`, { method: "DELETE" });
+    await svc(`/rest/v1/documents?id=eq.${A.documentId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status: "needs_review" }),
+    });
+  }
 });
