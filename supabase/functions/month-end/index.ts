@@ -33,6 +33,7 @@ import { bcaBody, bcaParams, parseBcaAccounts, validateRate } from "./fx_reval.t
 import { dueScheduleEntries, faDepreciationNudge, validateSchedule, type ScheduleRow } from "./schedules.ts";
 import { findDuplicateAccounts, findDuplicateContacts, findMissingTrns, findSuspenseBalances, unusedAccountCandidates, type HygieneAccount, type HygieneContact } from "./hygiene.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
 /** Same fingerprint as bookkeeping-learn/journal_patterns.ts. */
 function fingerprintLines(
@@ -69,57 +70,34 @@ function getSupabase(): SupabaseClient {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 }
-function apiBase(): string {
-  return Deno.env.get("ZOHO_API_BASE_URL")?.trim() || "https://www.zohoapis.com/books/v3";
+
+/**
+ * The company's own Zoho organisation and a z for it. This used to read
+ * ZOHO_REFRESH_TOKEN and ZOHO_ORGANIZATION_ID from the environment, which is
+ * one organisation for the whole deployment — see _shared/zoho_auth.ts.
+ */
+async function getAccessToken(
+  supabase: SupabaseClient,
+  companyId: string,
+): Promise<ZohoAuth> {
+  return await zohoAuthFor(supabase, companyId);
 }
 
-async function getAccessToken(supabase: SupabaseClient): Promise<string> {
-  const existing = Deno.env.get("ZOHO_ACCESS_TOKEN")?.trim();
-  if (existing) return existing;
-  const { data } = await supabase.from("zoho_oauth_tokens")
-    .select("access_token, expires_at").eq("id", 1).maybeSingle();
-  if (data?.access_token && new Date(String(data.expires_at)).getTime() > Date.now() + 120_000) {
-    return String(data.access_token);
-  }
-  const accountsUrl = Deno.env.get("ZOHO_ACCOUNTS_URL")?.trim() || "https://accounts.zoho.com";
-  const res = await fetch(`${accountsUrl}/oauth/v2/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      refresh_token: requireEnv("ZOHO_REFRESH_TOKEN"),
-      client_id: requireEnv("ZOHO_CLIENT_ID"),
-      client_secret: requireEnv("ZOHO_CLIENT_SECRET"),
-      grant_type: "refresh_token",
-    }),
-  });
-  const payload = await res.json();
-  if (!res.ok || !payload?.access_token) {
-    throw new Error(`Zoho token refresh failed (${res.status}): ${JSON.stringify(payload)}`);
-  }
-  const token = String(payload.access_token);
-  await supabase.from("zoho_oauth_tokens").upsert({
-    id: 1, access_token: token,
-    expires_at: new Date(Date.now() + 55 * 60_000).toISOString(),
-    updated_at: new Date().toISOString(),
-  });
-  return token;
-}
-
-async function zohoGet(token: string, path: string, params: Record<string, string> = {}) {
-  const qs = new URLSearchParams({ organization_id: requireEnv("ZOHO_ORGANIZATION_ID"), ...params });
-  const res = await zohoFetch(`${apiBase()}/${path}?${qs}`, {
-    headers: { Authorization: `Zoho-oauthtoken ${token}` },
+async function zohoGet(z: ZohoAuth, path: string, params: Record<string, string> = {}) {
+  const qs = new URLSearchParams({ organization_id: z.organizationId, ...params });
+  const res = await zohoFetch(`${z.apiBase}/${path}?${qs}`, {
+    headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` },
   });
   const raw = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Zoho ${path} failed (${res.status}): ${JSON.stringify(raw)}`);
   return raw as Record<string, unknown>;
 }
 
-async function zohoPost(token: string, path: string, body: unknown): Promise<{ ok: boolean; status: number; raw: Record<string, unknown> }> {
-  const qs = new URLSearchParams({ organization_id: requireEnv("ZOHO_ORGANIZATION_ID") });
-  const res = await zohoFetch(`${apiBase()}/${path}?${qs}`, {
+async function zohoPost(z: ZohoAuth, path: string, body: unknown): Promise<{ ok: boolean; status: number; raw: Record<string, unknown> }> {
+  const qs = new URLSearchParams({ organization_id: z.organizationId });
+  const res = await zohoFetch(`${z.apiBase}/${path}?${qs}`, {
     method: "POST",
-    headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   const raw = await res.json().catch(() => ({})) as Record<string, unknown>;
@@ -127,10 +105,10 @@ async function zohoPost(token: string, path: string, body: unknown): Promise<{ o
 }
 
 /** Zoho bank transactions for one account, newest first, running balances included (no date filter). */
-async function fetchAccountTransactions(token: string, accountId: string, maxPages = 3): Promise<ReconZohoTxn[]> {
+async function fetchAccountTransactions(z: ZohoAuth, accountId: string, maxPages = 3): Promise<ReconZohoTxn[]> {
   const out: ReconZohoTxn[] = [];
   for (let page = 1; page <= maxPages; page++) {
-    const raw = await zohoGet(token, "banktransactions", { account_id: accountId, filter_by: "Status.All", per_page: "200", page: String(page) });
+    const raw = await zohoGet(z, "banktransactions", { account_id: accountId, filter_by: "Status.All", per_page: "200", page: String(page) });
     for (const t of (raw.banktransactions ?? []) as Array<Record<string, unknown>>) {
       out.push({
         transaction_id: String(t.transaction_id ?? ""), date: String(t.date ?? "").slice(0, 10), status: String(t.status ?? ""),
@@ -145,9 +123,9 @@ async function fetchAccountTransactions(token: string, accountId: string, maxPag
 }
 
 /** Latest completed reconciliation end date for an account (null when none). */
-async function lastReconciledEnd(token: string, accountId: string): Promise<{ end: string | null; in_progress: boolean }> {
+async function lastReconciledEnd(z: ZohoAuth, accountId: string): Promise<{ end: string | null; in_progress: boolean }> {
   try {
-    const raw = await zohoGet(token, `bankaccounts/${accountId}/reconciliations`);
+    const raw = await zohoGet(z, `bankaccounts/${accountId}/reconciliations`);
     const list = ((raw.reconciliations ?? []) as Array<Record<string, unknown>>);
     const done = list.filter((r) => String(r.status ?? "") !== "in_progress").map((r) => String(r.end_date ?? "").slice(0, 10)).filter(Boolean).sort();
     return { end: done.length ? done[done.length - 1] : null, in_progress: list.some((r) => String(r.status ?? "") === "in_progress") };
@@ -157,7 +135,7 @@ async function lastReconciledEnd(token: string, accountId: string): Promise<{ en
 }
 
 /** Reconciliation status for the company's bank accounts (all, or the given ids). */
-async function reconcileForAccounts(supabase: SupabaseClient, token: string, companyId: string, onlyIds: string[] | null, start: string, end: string, today: string): Promise<ReconResult[]> {
+async function reconcileForAccounts(supabase: SupabaseClient, z: ZohoAuth, companyId: string, onlyIds: string[] | null, start: string, end: string, today: string): Promise<ReconResult[]> {
   let q = supabase.from("zoho_entities").select("zoho_id, name, extra").eq("kind", "bank_account");
   if (onlyIds) q = q.in("zoho_id", onlyIds);
   const { data: accts } = await q;
@@ -174,9 +152,9 @@ async function reconcileForAccounts(supabase: SupabaseClient, token: string, com
       for (const r of rows ?? []) lines.push({ statement_id: String(r.statement_id), txn_date: String(r.txn_date), line_no: Number(r.line_no), side: r.side as "debit" | "credit", amount: Number(r.amount), balance: r.balance == null ? null : Number(r.balance), status: String(r.status) });
     }
     // Accounts the app has never touched and Zoho shows nothing for stay quiet.
-    const zoho = await fetchAccountTransactions(token, accountId);
+    const zoho = await fetchAccountTransactions(z, accountId);
     if (!lines.length && !zoho.length) continue;
-    const last = await lastReconciledEnd(token, accountId);
+    const last = await lastReconciledEnd(z, accountId);
     const result = reconcileAccount({ account: { zoho_id: accountId, name: String(a.name), currency: (extra.currency_code as string | null) ?? null }, period_start: start, period_end: end, today, lines, zoho, last_reconciled_end: last.end });
     if (last.in_progress) { result.can_reconcile = false; result.reconcile_body = null; result.note += " A reconciliation saved earlier in Zoho is still in progress — finish or undo it there first."; }
     out.push(result);
@@ -244,7 +222,7 @@ Deno.serve(async (req) => {
       company_id: companyId,
     });
     zohoFetch = meter.fetch;
-    const token = await getAccessToken(supabase);
+    const z = await getAccessToken(supabase, companyId);
     const actor = (auth.user?.email as string | undefined) ?? "reviewer";
     const action = input.action ?? "nudges";
     const { data: cfg } = await supabase.from("company_config")
@@ -260,7 +238,7 @@ Deno.serve(async (req) => {
     // locked_until through this app. The lock is hard — no per-action
     // override; unlock (audited) to change history.
     if (action === "lock_period") {
-      const recons = await reconcileForAccounts(supabase, token, companyId, null, start, end, today);
+      const recons = await reconcileForAccounts(supabase, z, companyId, null, start, end, today);
       const blockers: string[] = [];
       if (end >= today) blockers.push(`the period ${month} has not ended yet`);
       for (const r of recons) {
@@ -294,12 +272,12 @@ Deno.serve(async (req) => {
       if (!rateCheck.ok) return jsonResponse({ ok: false, error: rateCheck.error }, 400);
       const date = /^\d{4}-\d{2}-\d{2}$/.test(input.adjustment_date ?? "") ? String(input.adjustment_date) : (end <= today ? end : today);
       if (lockedUntil && date <= lockedUntil) return jsonResponse({ ok: false, error: `The books are locked through ${lockedUntil} — an adjustment dated ${date} cannot go in.` }, 409);
-      const curRaw = await zohoGet(token, "settings/currencies");
+      const curRaw = await zohoGet(z, "settings/currencies");
       const cur = ((curRaw.currencies ?? []) as Array<Record<string, unknown>>).find((c) => String(c.currency_id) === currencyId);
       if (!cur) return jsonResponse({ ok: false, error: "Unknown currency." }, 404);
       if (cur.is_base_currency) return jsonResponse({ ok: false, error: "That is the base currency — nothing to revalue." }, 400);
       const params = bcaParams(currencyId, date, rateCheck.rate, `Period-end revaluation ${month} via connector`);
-      const accRaw = await zohoGet(token, "basecurrencyadjustment/accounts", params);
+      const accRaw = await zohoGet(z, "basecurrencyadjustment/accounts", params);
       const exposure = parseBcaAccounts(currencyId, String(cur.currency_code ?? ""), Number(cur.exchange_rate ?? 0) || null, accRaw);
       if (action === "fx_exposure") {
         return jsonResponse({ ok: true, exposure, adjustment_date: date, exchange_rate: rateCheck.rate, usage: meter.summary() });
@@ -311,8 +289,8 @@ Deno.serve(async (req) => {
       // Verified live on the .ae DC: the entity goes in the JSON body and
       // account_ids goes in the QUERY string (comma-separated) — the only
       // combination Zoho accepts.
-      const qs = new URLSearchParams({ organization_id: requireEnv("ZOHO_ORGANIZATION_ID"), ...bcaBody(chosen) as Record<string, string> });
-      const res = await zohoFetch(`${apiBase()}/basecurrencyadjustment?${qs}`, { method: "POST", headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ currency_id: currencyId, adjustment_date: date, exchange_rate: rateCheck.rate, notes: params.notes }) });
+      const qs = new URLSearchParams({ organization_id: z.organizationId, ...bcaBody(chosen) as Record<string, string> });
+      const res = await zohoFetch(`${z.apiBase}/basecurrencyadjustment?${qs}`, { method: "POST", headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}`, "Content-Type": "application/json" }, body: JSON.stringify({ currency_id: currencyId, adjustment_date: date, exchange_rate: rateCheck.rate, notes: params.notes }) });
       const raw = await res.json().catch(() => ({})) as Record<string, unknown>;
       if (!res.ok || (raw.code != null && raw.code !== 0)) return jsonResponse({ ok: false, error: `Zoho refused the adjustment: ${raw.message ?? res.status}`, exposure }, 502);
       const bca = (raw.base_currency_adjustment ?? raw.data ?? {}) as Record<string, unknown>;
@@ -380,7 +358,7 @@ Deno.serve(async (req) => {
         ...(input.fixed_asset_type_id ? { fixed_asset_type_id: String(input.fixed_asset_type_id) } : {}),
         notes: `Created by the connector from bill ${prop.bill_number ?? prop.bill_zoho_id}; confirmed by ${actor}.`,
       };
-      const res = await zohoPost(token, "fixedassets", body);
+      const res = await zohoPost(z, "fixedassets", body);
       if (!res.ok) return jsonResponse({ ok: false, error: `Zoho did not create the asset: ${res.raw.message ?? res.status}`, body }, 502);
       const asset = (res.raw.fixed_asset ?? res.raw.fixedasset ?? {}) as Record<string, unknown>;
       const assetId = asset.fixed_asset_id ? String(asset.fixed_asset_id) : null;
@@ -389,7 +367,7 @@ Deno.serve(async (req) => {
       // Best effort — a draft asset is still a created asset.
       let activated = false;
       if (assetId) {
-        const act = await zohoPost(token, `fixedassets/${assetId}/status/active`, {});
+        const act = await zohoPost(z, `fixedassets/${assetId}/status/active`, {});
         activated = act.ok;
       }
       await supabase.from("bk_asset_proposals").update({ status: "created", zoho_asset_id: assetId, decided_by: actor, decided_at: new Date().toISOString() }).eq("id", pid);
@@ -410,11 +388,11 @@ Deno.serve(async (req) => {
     if (action === "reconcile") {
       const accountId = String(input.bank_account_zoho_id ?? "");
       if (!accountId) return jsonResponse({ ok: false, error: "bank_account_zoho_id required" }, 400);
-      const recon = await reconcileForAccounts(supabase, token, companyId, [accountId], start, end, today);
+      const recon = await reconcileForAccounts(supabase, z, companyId, [accountId], start, end, today);
       const r = recon[0];
       if (!r) return jsonResponse({ ok: false, error: "bank account not found" }, 404);
       if (!r.can_reconcile || !r.reconcile_body) return jsonResponse({ ok: false, error: `Not ready to reconcile: ${r.note}`, reconciliation: r }, 409);
-      const res = await zohoPost(token, `bankaccounts/${accountId}/reconciliations`, r.reconcile_body);
+      const res = await zohoPost(z, `bankaccounts/${accountId}/reconciliations`, r.reconcile_body);
       if (!res.ok) return jsonResponse({ ok: false, error: `Zoho refused the reconciliation: ${res.raw.message ?? res.status}`, reconciliation: r, body: r.reconcile_body }, 502);
       await supabase.from("audit_log").insert({ company_id: companyId, actor_type: "human", actor_id: auth.user?.id ?? null, action: "bank_reconciled", detail: { bank_account_zoho_id: accountId, period: month, closing_balance: r.statement_closing, transactions: (r.reconcile_body.transactions_to_be_reconciled as string[]).length, actor } }).then(() => {}, () => {});
       return jsonResponse({ ok: true, reconciliation: r, zoho: res.raw, usage: meter.summary() });
@@ -436,7 +414,7 @@ Deno.serve(async (req) => {
       if (lockedUntil && String(built.body.journal_date) <= lockedUntil) {
         return jsonResponse({ ok: false, error: `The books are locked through ${lockedUntil} — a journal dated ${built.body.journal_date} cannot go in. Date it later, or unlock the period first.` }, 409);
       }
-      const res = await zohoPost(token, "journals", built.body);
+      const res = await zohoPost(z, "journals", built.body);
       if (!res.ok) return jsonResponse({ ok: false, error: `Zoho refused the journal: ${res.raw.message ?? res.status}`, body: built.body }, 502);
       const journal = (res.raw.journal ?? {}) as Record<string, unknown>;
       const journalId = journal.journal_id ? String(journal.journal_id) : null;
@@ -459,7 +437,7 @@ Deno.serve(async (req) => {
     const warnings: string[] = [];
     let defs: RecurringJournalDef[] = [];
     try {
-      const rjRaw = await zohoGet(token, "recurringjournals");
+      const rjRaw = await zohoGet(z, "recurringjournals");
       defs = (
         (rjRaw.recurring_journals ?? rjRaw.recurringjournals ?? []) as Array<
           Record<string, unknown>
@@ -490,7 +468,7 @@ Deno.serve(async (req) => {
 
     // Zoho's journals list ignores journal_date_start/end but honours
     // date_start/end (verified on the .ae DC).
-    const jRaw = await zohoGet(token, "journals", {
+    const jRaw = await zohoGet(z, "journals", {
       date_start: start,
       date_end: end,
       per_page: "200",
@@ -541,7 +519,7 @@ Deno.serve(async (req) => {
           seen.push({ vendor_zoho_id: null, vendor_name: e.vendor_raw as string | null, invoice_date: e.invoice_date as string | null });
         }
       }
-      const bRaw = await zohoGet(token, "bills", { date_start: start, date_end: end, per_page: "200" });
+      const bRaw = await zohoGet(z, "bills", { date_start: start, date_end: end, per_page: "200" });
       for (const b of (bRaw.bills ?? []) as Array<Record<string, unknown>>) {
         seen.push({
           vendor_zoho_id: b.vendor_id != null ? String(b.vendor_id) : null,
@@ -564,7 +542,7 @@ Deno.serve(async (req) => {
     if (enabledPatterns.length > 0 && posted.length > 0) {
       for (const p of posted) {
         try {
-          const det = await zohoGet(token, `journals/${p.journal_id}`);
+          const det = await zohoGet(z, `journals/${p.journal_id}`);
           const j = (det.journal ?? det) as Record<string, unknown>;
           const lines = ((j.line_items as Array<Record<string, unknown>>) ?? []).map((li) => {
             const side = String(li.debit_or_credit ?? "").toLowerCase();
@@ -607,7 +585,7 @@ Deno.serve(async (req) => {
       const wantBills = enabledLtu.some((e) => e.party_kind === "vendor");
       const wantInvoices = enabledLtu.some((e) => e.party_kind === "customer");
       if (wantBills) {
-        const b = await zohoGet(token, "bills", { status: "unpaid", per_page: "200" });
+        const b = await zohoGet(z, "bills", { status: "unpaid", per_page: "200" });
         for (const x of (b.bills ?? []) as Array<Record<string, unknown>>) {
           openDocs.push({
             doc_kind: "bill", zoho_id: String(x.bill_id ?? ""), number: x.bill_number != null ? String(x.bill_number) : null,
@@ -616,7 +594,7 @@ Deno.serve(async (req) => {
         }
       }
       if (wantInvoices) {
-        const i = await zohoGet(token, "invoices", { status: "unpaid", per_page: "200" });
+        const i = await zohoGet(z, "invoices", { status: "unpaid", per_page: "200" });
         for (const x of (i.invoices ?? []) as Array<Record<string, unknown>>) {
           openDocs.push({
             doc_kind: "invoice", zoho_id: String(x.invoice_id ?? ""), number: x.invoice_number != null ? String(x.invoice_number) : null,
@@ -653,11 +631,11 @@ Deno.serve(async (req) => {
     let ct: Record<string, unknown> | null = null;
     if (cfg?.ct_expense_account_id && cfg?.ct_payable_account_id) {
       try {
-        const orgRaw = await zohoGet(token, `organizations/${requireEnv("ZOHO_ORGANIZATION_ID")}`);
+        const orgRaw = await zohoGet(z, `organizations/${z.organizationId}`);
         const fyName = String(((orgRaw.organization ?? {}) as Record<string, unknown>).fiscal_year_start_month ?? "january").toLowerCase();
         const fyMonth = ["january","february","march","april","may","june","july","august","september","october","november","december"].indexOf(fyName) + 1;
         const fyStart = fiscalYearStart(end, fyMonth || 1);
-        const plRaw = await zohoGet(token, "reports/profitandloss", { from_date: fyStart, to_date: end <= today ? end : today });
+        const plRaw = await zohoGet(z, "reports/profitandloss", { from_date: fyStart, to_date: end <= today ? end : today });
         const netProfit = netProfitFromReport((plRaw.profit_and_loss ?? []) as Array<{ name?: string; total?: number }>);
         const { data: acctRows } = await supabase.from("zoho_entities").select("zoho_id, name").eq("kind", "account").in("zoho_id", [cfg.ct_expense_account_id, cfg.ct_payable_account_id]);
         const acctName = (id: string) => (acctRows ?? []).find((a) => String(a.zoho_id) === id)?.name ?? null;
@@ -716,9 +694,9 @@ Deno.serve(async (req) => {
     let faAssetsCount = 0;
     let faTypes: Array<Record<string, unknown>> = [];
     try {
-      const faRaw = await zohoGet(token, "fixedassets", { filter_by: "Status.Active", per_page: "200" });
+      const faRaw = await zohoGet(z, "fixedassets", { filter_by: "Status.Active", per_page: "200" });
       faAssetsCount = ((faRaw.fixedassets ?? []) as Array<unknown>).length;
-      const tRaw = await zohoGet(token, "fixedassettypes");
+      const tRaw = await zohoGet(z, "fixedassettypes");
       faTypes = ((tRaw.fixed_asset_types ?? []) as Array<Record<string, unknown>>).map((t) => ({ fixed_asset_type_id: t.fixed_asset_type_id, name: t.fixed_asset_type_name ?? t.name }));
     } catch { /* module off or unreachable — the create action reports Zoho's words */ }
     const faNudge = faDepreciationNudge(faAssetsCount, posted, month);
@@ -729,7 +707,7 @@ Deno.serve(async (req) => {
     let hygiene: Record<string, unknown> = {};
     let suspenseNudges: Nudge[] = [];
     try {
-      const coaRaw = await zohoGet(token, "chartofaccounts", { showbalance: "true", per_page: "200" });
+      const coaRaw = await zohoGet(z, "chartofaccounts", { showbalance: "true", per_page: "200" });
       const accounts: HygieneAccount[] = ((coaRaw.chartofaccounts ?? []) as Array<Record<string, unknown>>).map((a) => ({
         account_id: String(a.account_id ?? ""), account_name: String(a.account_name ?? ""), account_type: String(a.account_type ?? ""),
         current_balance: Number(a.current_balance ?? 0) || 0, is_active: Boolean(a.is_active ?? true),
@@ -747,7 +725,7 @@ Deno.serve(async (req) => {
       const unused: Array<{ account_id: string; account_name: string; note: string }> = [];
       for (const c of candidates) {
         try {
-          const txRaw = await zohoGet(token, "chartofaccounts/transactions", { account_id: c.account_id, per_page: "1" });
+          const txRaw = await zohoGet(z, "chartofaccounts/transactions", { account_id: c.account_id, per_page: "1" });
           const any = (((txRaw.transactions ?? []) as Array<unknown>).length) > 0;
           if (!any) unused.push({ account_id: c.account_id, account_name: c.account_name, note: `${c.account_name} has never been posted to — deactivate it in Zoho if it was created by mistake.` });
         } catch { break; /* endpoint unavailable — say nothing rather than guess */ }
@@ -770,7 +748,7 @@ Deno.serve(async (req) => {
     }
 
     // --- Item 4: bank reconciliation at period end, per bank account.
-    const reconciliations = await reconcileForAccounts(supabase, token, companyId, null, start, end, today);
+    const reconciliations = await reconcileForAccounts(supabase, z, companyId, null, start, end, today);
 
     // --- Item 10: lock status for the month (informational; the actions do the work).
     const lockBlockers: string[] = [];

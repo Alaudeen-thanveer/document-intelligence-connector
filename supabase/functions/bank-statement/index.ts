@@ -37,6 +37,7 @@ import { buildFeedRequest, extractZohoId, suggestFromZohoMatches, uncategorizedT
 import { isProposableAsZohoRule, zohoRuleBodyForPattern, type ZohoBankRule } from "./zoho_rules.ts";
 import { attachTargetFor, buildLineEvidence, textToPdf } from "./evidence.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
@@ -56,32 +57,18 @@ function getSupabase(): SupabaseClient {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 }
-function apiBase(): string {
-  return Deno.env.get("ZOHO_API_BASE_URL")?.trim() || "https://www.zohoapis.com/books/v3";
-}
 
 // --------------------------------------------------------------- Zoho auth
-async function getAccessToken(supabase: SupabaseClient): Promise<string> {
-  const existing = Deno.env.get("ZOHO_ACCESS_TOKEN")?.trim();
-  if (existing) return existing;
-  const { data } = await supabase.from("zoho_oauth_tokens").select("access_token, expires_at").eq("id", 1).maybeSingle();
-  if (data?.access_token && new Date(String(data.expires_at)).getTime() > Date.now() + 120_000) return String(data.access_token);
-  const accountsUrl = Deno.env.get("ZOHO_ACCOUNTS_URL")?.trim() || "https://accounts.zoho.com";
-  const res = await fetch(`${accountsUrl}/oauth/v2/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      refresh_token: requireEnv("ZOHO_REFRESH_TOKEN"), client_id: requireEnv("ZOHO_CLIENT_ID"),
-      client_secret: requireEnv("ZOHO_CLIENT_SECRET"), grant_type: "refresh_token",
-    }),
-  });
-  const payload = await res.json();
-  if (!res.ok || !payload?.access_token) throw new Error(`Zoho token refresh failed (${res.status}): ${JSON.stringify(payload)}`);
-  const token = String(payload.access_token);
-  await supabase.from("zoho_oauth_tokens").upsert({
-    id: 1, access_token: token, expires_at: new Date(Date.now() + 55 * 60_000).toISOString(), updated_at: new Date().toISOString(),
-  });
-  return token;
+/**
+ * The company's own Zoho organisation and a z for it. This used to read
+ * ZOHO_REFRESH_TOKEN and ZOHO_ORGANIZATION_ID from the environment, which is
+ * one organisation for the whole deployment — see _shared/zoho_auth.ts.
+ */
+async function getAccessToken(
+  supabase: SupabaseClient,
+  companyId: string,
+): Promise<ZohoAuth> {
+  return await zohoAuthFor(supabase, companyId);
 }
 
 // ------------------------------------------------------------ PDF → rows
@@ -229,7 +216,7 @@ async function loadRecorded(supabase: SupabaseClient, companyId: string, stateme
 async function attachStatementEvidence(
   supabase: SupabaseClient,
   zohoFetch: typeof fetch,
-  token: string,
+  z: ZohoAuth,
   line: { line_no: number; txn_date: string; description: string; reference: string | null; side: "debit" | "credit"; amount: number },
   stmt: { bank_account_name: string | null; bank_account_zoho_id: string; period_start: string | null; period_end: string | null; source: string; original_name: string | null; currency: string | null; file_url: string | null },
   kind: string,
@@ -241,8 +228,8 @@ async function attachStatementEvidence(
   const upload = async (bytes: Uint8Array, contentType: string, filename: string) => {
     const form = new FormData();
     form.append(target.field, new Blob([bytes as BlobPart], { type: contentType }), filename);
-    const res = await zohoFetch(`${apiBase()}/${target.path}?organization_id=${encodeURIComponent(requireEnv("ZOHO_ORGANIZATION_ID"))}`, {
-      method: "POST", headers: { Authorization: `Zoho-oauthtoken ${token}` }, body: form,
+    const res = await zohoFetch(`${z.apiBase}/${target.path}?organization_id=${encodeURIComponent(z.organizationId)}`, {
+      method: "POST", headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` }, body: form,
     });
     const raw = await res.json().catch(() => ({})) as Record<string, unknown>;
     return { ok: res.ok && (raw.code == null || raw.code === 0), message: String(raw.message ?? res.status) };
@@ -297,11 +284,11 @@ async function computeAndStoreSuggestions(
   let openDocs: OpenDoc[] = [];
   let openCredits: OpenCredit[] = [];
   try {
-    const token = await getAccessToken(supabase);
-    const org = requireEnv("ZOHO_ORGANIZATION_ID");
+    const z = await getAccessToken(supabase, companyId);
+    const org = z.organizationId;
     [openDocs, openCredits] = await Promise.all([
-      fetchOpenDocuments(zohoFetch, apiBase(), org, token),
-      fetchOpenCredits(zohoFetch, apiBase(), org, token),
+      fetchOpenDocuments(zohoFetch, z.apiBase, org, z.accessToken),
+      fetchOpenCredits(zohoFetch, z.apiBase, org, z.accessToken),
     ]);
   } catch (err) {
     console.warn("open documents unavailable; suggesting from patterns only:", err instanceof Error ? err.message : err);
@@ -325,14 +312,15 @@ async function computeAndStoreSuggestions(
   const feedIds = new Map((feedRows ?? []).map((r) => [String(r.id), String(r.zoho_uncategorized_id)]));
   let zohoMatched = 0;
   if (feedIds.size) {
-    let token: string | null = null;
-    try { token = await getAccessToken(supabase); } catch { token = null; }
-    const org = Deno.env.get("ZOHO_ORGANIZATION_ID")?.trim() ?? "";
-    for (let i = 0; i < list.length && token; i++) {
+    let z: ZohoAuth | null = null;
+    try { z = await getAccessToken(supabase, companyId); } catch { z = null; }
+    // The organisation travels with the resolved connection now.
+    const org = z?.organizationId ?? "";
+    for (let i = 0; i < list.length && z; i++) {
       const uncatId = feedIds.get(String(list[i].id));
       if (!uncatId) continue;
       try {
-        const res = await zohoFetch(`${apiBase()}/banktransactions/uncategorized/${encodeURIComponent(uncatId)}/match?organization_id=${encodeURIComponent(org)}`, { headers: { Authorization: `Zoho-oauthtoken ${token}` } });
+        const res = await zohoFetch(`${z.apiBase}/banktransactions/uncategorized/${encodeURIComponent(uncatId)}/match?organization_id=${encodeURIComponent(org)}`, { headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` } });
         const j = await res.json().catch(() => ({}));
         const cands = ((j as { matching_transactions?: ZohoMatchCandidate[] }).matching_transactions ?? []).slice(0, 10);
         await supabase.from("bank_statement_lines").update({ zoho_match_candidates: cands }).eq("id", list[i].id);
@@ -387,7 +375,9 @@ Deno.serve(async (req) => {
   // unless this does. No default company: a fallback is how a bug
   // becomes a cross-client leak instead of an error.
   const tenant = await companyForCaller(auth, {
-    companyId: input.company_id ?? null,
+    // input is Record<string, unknown> here, so this needs narrowing rather
+    // than a cast — a non-string company_id must read as "none named".
+    companyId: typeof input.company_id === "string" ? input.company_id : null,
     errorBody: (m) => ({ error: m }),
   });
   if (isCompanyFail(tenant)) return tenant.response;
@@ -544,7 +534,7 @@ Deno.serve(async (req) => {
       if (Array.isArray(input.line_ids) && input.line_ids.length) q = q.in("id", input.line_ids as string[]);
       const { data: lines } = await q.order("line_no");
       if (!lines?.length) return jsonResponse({ ok: true, pushed: 0, failed: 0, results: [], note: "no confirmed lines to push" });
-      const token = await getAccessToken(supabase);
+      const z = await getAccessToken(supabase, companyId);
       const { data: feeAcct } = await supabase.from("zoho_entities").select("zoho_id").eq("kind", "account").ilike("name", "bank fees%").limit(1).maybeSingle();
       // Period lock (item 10): a line dated inside a locked period must not
       // create anything in the books. Hard per-line refusal; unlock to change.
@@ -565,15 +555,15 @@ Deno.serve(async (req) => {
             const cands = ((line as { zoho_match_candidates?: ZohoMatchCandidate[] | null }).zoho_match_candidates ?? []);
             const matchedType = cands.find((c) => String(c.transaction_id) === String(line.chosen_ref_zoho_id))?.transaction_type ?? null;
             const req = buildFeedRequest({ ...(line as never), matched_transaction_type: matchedType }, st.bank_account_zoho_id, null);
-            const res = await meter.fetch(`${apiBase()}/${req.path}?organization_id=${encodeURIComponent(requireEnv("ZOHO_ORGANIZATION_ID"))}`, {
-              method: "POST", headers: { Authorization: `Zoho-oauthtoken ${token}`, ...(req.body ? { "Content-Type": "application/json" } : {}) }, body: req.body ? JSON.stringify(req.body) : undefined,
+            const res = await meter.fetch(`${z.apiBase}/${req.path}?organization_id=${encodeURIComponent(z.organizationId)}`, {
+              method: "POST", headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}`, ...(req.body ? { "Content-Type": "application/json" } : {}) }, body: req.body ? JSON.stringify(req.body) : undefined,
             });
             const raw = await res.json().catch(() => ({})) as Record<string, unknown>;
             if (!res.ok || (raw.code != null && raw.code !== 0)) throw new Error(`Zoho ${req.path.split("/").slice(-1)[0]} rejected: ${raw.message ?? res.status}${raw.code != null ? ` (code ${raw.code})` : ""}`);
             r = { zoho_id: extractZohoId(raw) ?? (req.kind === "match" ? String(line.chosen_ref_zoho_id) : String((line as { zoho_uncategorized_id: string }).zoho_uncategorized_id)), payload: raw, extra: [], kind: req.kind };
             void sug;
           } else {
-            r = await pushLine(meter.fetch, apiBase(), requireEnv("ZOHO_ORGANIZATION_ID"), token, line as never, st.bank_account_zoho_id, { bankChargesAccountId: feeAcct?.zoho_id ? String(feeAcct.zoho_id) : null });
+            r = await pushLine(meter.fetch, z.apiBase, z.organizationId, z, line as never, st.bank_account_zoho_id, { bankChargesAccountId: feeAcct?.zoho_id ? String(feeAcct.zoho_id) : null });
           }
           // The statement is the evidence — attach it (file, else a text
           // note with the line) to the record just created. Feed-mode lines
@@ -582,7 +572,7 @@ Deno.serve(async (req) => {
           if (!(line as { zoho_uncategorized_id?: string | null }).zoho_uncategorized_id && r.zoho_id && (line as { chosen_txn_kind?: string }).chosen_txn_kind !== "already_recorded") {
             const { data: stmtRow } = await supabase.from("bank_statements").select("bank_account_name, bank_account_zoho_id, period_start, period_end, source, original_name, currency, file_url").eq("id", String((line as { statement_id: string }).statement_id)).maybeSingle();
             if (stmtRow) {
-              attach = await attachStatementEvidence(supabase, meter.fetch, token,
+              attach = await attachStatementEvidence(supabase, meter.fetch, z,
                 { line_no: Number(line.line_no), txn_date: String(line.txn_date), description: String(line.description ?? ""), reference: (line.reference as string | null) ?? null, side: line.side as "debit" | "credit", amount: Number(line.amount) },
                 { bank_account_name: (stmtRow.bank_account_name as string | null) ?? null, bank_account_zoho_id: String(stmtRow.bank_account_zoho_id), period_start: (stmtRow.period_start as string | null) ?? null, period_end: (stmtRow.period_end as string | null) ?? null, source: String(stmtRow.source), original_name: (stmtRow.original_name as string | null) ?? null, currency: (stmtRow.currency as string | null) ?? null, file_url: (stmtRow.file_url as string | null) ?? null },
                 String((line as { chosen_txn_kind?: string }).chosen_txn_kind ?? r.kind), r.zoho_id, actor);
@@ -605,13 +595,13 @@ Deno.serve(async (req) => {
     if (action === "pull_feed") {
       const bankAccountId = String(input.bank_account_zoho_id ?? "").trim();
       if (!bankAccountId) return jsonResponse({ ok: false, error: "bank_account_zoho_id is required — pick the bank account whose Zoho feed to pull" }, 400);
-      const token = await getAccessToken(supabase);
-      const org = requireEnv("ZOHO_ORGANIZATION_ID");
+      const z = await getAccessToken(supabase, companyId);
+      const org = z.organizationId;
       const rows: ZohoUncategorizedRow[] = [];
       let page = 1;
       while (page <= 10) {
         const qs = new URLSearchParams({ organization_id: org, account_id: bankAccountId, per_page: "200", page: String(page), ...(input.date_start ? { date_start: String(input.date_start) } : {}) });
-        const res = await meter.fetch(`${apiBase()}/banktransactions/uncategorized?${qs}`, { headers: { Authorization: `Zoho-oauthtoken ${token}` } });
+        const res = await meter.fetch(`${z.apiBase}/banktransactions/uncategorized?${qs}`, { headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` } });
         const j = await res.json().catch(() => ({}));
         if (!res.ok || (j.code != null && j.code !== 0)) return jsonResponse({ ok: false, error: `Zoho uncategorised list failed: ${j.message ?? res.status}` }, 502);
         rows.push(...(((j as Record<string, unknown>).transactions as ZohoUncategorizedRow[]) ?? []));
@@ -673,9 +663,9 @@ Deno.serve(async (req) => {
       const v = isProposableAsZohoRule({ ...p, zoho_rule_id: row.zoho_rule_id as string | null, suggestion_status: row.suggestion_status as string });
       if (!v.ok) return jsonResponse({ ok: false, error: `Not proposable as a Zoho rule: ${v.why}` }, 422);
       const body = zohoRuleBodyForPattern(p, { bankAccountIds: Array.isArray(input.bank_account_ids) ? (input.bank_account_ids as string[]) : undefined });
-      const token = await getAccessToken(supabase);
+      const z = await getAccessToken(supabase, companyId);
       const post = async (b: Record<string, unknown>) => {
-        const res = await meter.fetch(`${apiBase()}/bankaccounts/rules?organization_id=${encodeURIComponent(requireEnv("ZOHO_ORGANIZATION_ID"))}`, { method: "POST", headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+        const res = await meter.fetch(`${z.apiBase}/bankaccounts/rules?organization_id=${encodeURIComponent(z.organizationId)}`, { method: "POST", headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}`, "Content-Type": "application/json" }, body: JSON.stringify(b) });
         const raw = await res.json().catch(() => ({})) as Record<string, unknown>;
         return { ok: res.ok && (raw.code == null || raw.code === 0), status: res.status, raw };
       };
@@ -707,8 +697,8 @@ Deno.serve(async (req) => {
       const pk = String(input.party_kind ?? "");
       const pid = String(input.party_zoho_id ?? "");
       if (!pk || !pid) return jsonResponse({ ok: false, error: "party_kind and party_zoho_id required" }, 400);
-      const token = await getAccessToken(supabase);
-      const credits = (await fetchOpenCredits(meter.fetch, apiBase(), requireEnv("ZOHO_ORGANIZATION_ID"), token))
+      const z = await getAccessToken(supabase, companyId);
+      const credits = (await fetchOpenCredits(meter.fetch, z.apiBase, z.organizationId, z.accessToken))
         .filter((c) => c.party_kind === pk && c.party_zoho_id === pid);
       return jsonResponse({ ok: true, credits, total: credits.reduce((t, c) => t + c.balance, 0), usage: meter.summary() });
     }

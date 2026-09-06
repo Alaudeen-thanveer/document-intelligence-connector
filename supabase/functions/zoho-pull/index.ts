@@ -9,6 +9,7 @@ import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
 /** Set per request; every Zoho call goes through it so usage is metered. */
 let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
@@ -86,94 +87,28 @@ function getSupabase(): SupabaseClient {
   });
 }
 
-function apiBase(): string {
-  return (
-    Deno.env.get("ZOHO_API_BASE_URL")?.trim() ||
-    "https://www.zohoapis.com/books/v3"
-  );
+
+
+
+
+/**
+ * The calling company's own Zoho organisation and a token for it. This used
+ * to read ZOHO_REFRESH_TOKEN and ZOHO_ORGANIZATION_ID from the environment,
+ * which is one organisation for the whole deployment — see
+ * _shared/zoho_auth.ts, which also holds the token cache, now per company.
+ */
+async function getZoho(companyId: string): Promise<ZohoAuth> {
+  return await zohoAuthFor(getSupabase(), companyId);
 }
 
-function orgId(): string {
-  return requireEnv("ZOHO_ORGANIZATION_ID");
-}
-
-/** Exchange refresh token for a new access token (OAuth2). */
-async function refreshAccessToken(): Promise<string> {
-  const clientId = requireEnv("ZOHO_CLIENT_ID");
-  const clientSecret = requireEnv("ZOHO_CLIENT_SECRET");
-  const refreshToken = requireEnv("ZOHO_REFRESH_TOKEN");
-  const accountsUrl =
-    Deno.env.get("ZOHO_ACCOUNTS_URL")?.trim() || "https://accounts.zoho.com";
-
-  const params = new URLSearchParams({
-    refresh_token: refreshToken,
-    client_id: clientId,
-    client_secret: clientSecret,
-    grant_type: "refresh_token",
-  });
-
-  const res = await fetch(`${accountsUrl}/oauth/v2/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: params,
-  });
-
-  const payload = await res.json();
-  if (!res.ok || !payload?.access_token) {
-    throw new Error(
-      `Zoho token refresh failed (${res.status}): ${JSON.stringify(payload)}`,
-    );
-  }
-  return String(payload.access_token);
-}
-
-/** Best-effort write-through of the token cache (service-role only table). */
-async function cacheAccessToken(token: string): Promise<void> {
-  try {
-    const supabase = getSupabase();
-    await supabase.from("zoho_oauth_tokens").upsert({
-      id: 1,
-      access_token: token,
-      expires_at: new Date(Date.now() + 55 * 60_000).toISOString(),
-      updated_at: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.warn(
-      "zoho_oauth_tokens cache write failed:",
-      err instanceof Error ? err.message : String(err),
-    );
-  }
-}
-
-async function getAccessToken(): Promise<string> {
-  const existing = Deno.env.get("ZOHO_ACCESS_TOKEN")?.trim();
-  if (existing) return existing;
-  // Cached token when still valid — Zoho throttles the refresh endpoint
-  // hard, and a refresh per function call locks the connection out.
-  try {
-    const supabase = getSupabase();
-    const { data } = await supabase
-      .from("zoho_oauth_tokens")
-      .select("access_token, expires_at")
-      .eq("id", 1)
-      .maybeSingle();
-    if (
-      data?.access_token &&
-      new Date(String(data.expires_at)).getTime() > Date.now() + 120_000
-    ) {
-      return String(data.access_token);
-    }
-  } catch {
-    // Cache is an optimization only.
-  }
-  const token = await refreshAccessToken();
-  await cacheAccessToken(token);
-  return token;
+/** Same, but past the cache — for a retry after Zoho refused the token. */
+async function getZoho2(companyId: string): Promise<ZohoAuth> {
+  return await zohoAuthFor(getSupabase(), companyId, { forceRefresh: true });
 }
 
 /** Fetch every page of a Zoho list endpoint (per_page=200). */
 async function fetchAllPages(
-  accessToken: string,
+  z: ZohoAuth,
   path: string,
   listKey: string,
   extraParams = "",
@@ -182,11 +117,11 @@ async function fetchAllPages(
   let page = 1;
 
   while (page <= 25) {
-    const url = `${apiBase()}/${path}?organization_id=${
-      encodeURIComponent(orgId())
+    const url = `${z.apiBase}/${path}?organization_id=${
+      encodeURIComponent(z.organizationId)
     }&per_page=200&page=${page}${extraParams}`;
     const res = await zohoFetch(url, {
-      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+      headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` },
     });
     const raw = await res.json();
     if (!res.ok) {
@@ -215,12 +150,12 @@ async function fetchAllPages(
 }
 
 async function fetchKind(
-  accessToken: string,
+  z: ZohoAuth,
   kind: EntityKind,
 ): Promise<EntityRow[]> {
   if (kind === "account") {
     const accounts = await fetchAllPages(
-      accessToken,
+      z,
       "chartofaccounts",
       "chartofaccounts",
     );
@@ -241,14 +176,14 @@ async function fetchKind(
     // The org's own bank rules: explicit habits the bookkeeper wrote down.
     // Read as high-weight evidence for statement-line suggestions, and so
     // we never propose a rule that already exists.
-    const list = await fetchAllPages(accessToken, "bankaccounts/rules", "rules");
+    const list = await fetchAllPages(z, "bankaccounts/rules", "rules");
     // The list view omits vendor_id / customer_id / auto_categorize (verified
     // live on the .ae DC) — enrich each rule from its detail. Rules are few.
     const rules: Array<Record<string, unknown>> = [];
     for (const l of list) {
       if (!l.rule_id) continue;
       try {
-        const res = await zohoFetch(`${apiBase()}/bankaccounts/rules/${l.rule_id}?organization_id=${encodeURIComponent(orgId())}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+        const res = await zohoFetch(`${z.apiBase}/bankaccounts/rules/${l.rule_id}?organization_id=${encodeURIComponent(z.organizationId)}`, { headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` } });
         const raw = await res.json() as { rule?: Record<string, unknown> };
         rules.push({ ...l, ...(raw.rule ?? {}) });
       } catch {
@@ -282,7 +217,7 @@ async function fetchKind(
   if (kind === "purchase_order") {
     // Open purchase orders with their lines — the "what was ordered" side of
     // the three-way match. Only POs that can still be billed; capped.
-    const list = await fetchAllPages(accessToken, "purchaseorders", "purchaseorders");
+    const list = await fetchAllPages(z, "purchaseorders", "purchaseorders");
     const open = list.filter((p) => !/closed|cancelled|billed$/i.test(String(p.status ?? "")) && String(p.status ?? "") !== "draft").slice(0, 200);
     const rows: EntityRow[] = [];
     for (const p of open) {
@@ -290,7 +225,7 @@ async function fetchKind(
       if (!id) continue;
       let lines: Array<Record<string, unknown>> = [];
       try {
-        const res = await zohoFetch(`${apiBase()}/purchaseorders/${id}?organization_id=${encodeURIComponent(orgId())}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+        const res = await zohoFetch(`${z.apiBase}/purchaseorders/${id}?organization_id=${encodeURIComponent(z.organizationId)}`, { headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` } });
         const raw = await res.json();
         lines = ((raw as { purchaseorder?: { line_items?: Array<Record<string, unknown>> } }).purchaseorder?.line_items ?? []).map((li) => ({
           line_item_id: li.line_item_id ?? null, name: li.name ?? null, description: li.description ?? null,
@@ -315,7 +250,7 @@ async function fetchKind(
   if (kind === "reporting_tag") {
     // Note: the older `settings/tags` endpoint is retired (400 "no longer
     // available", verified on the .in DC); `reportingtags` returns { tags: [] }.
-    const tags = await fetchAllPages(accessToken, "reportingtags", "tags");
+    const tags = await fetchAllPages(z, "reportingtags", "tags");
     // The list view carries no options; they live on the detail endpoint.
     // Options are what a bill/invoice line actually gets tagged with, so
     // fetch each tag's detail (tags are few — a handful per org).
@@ -330,11 +265,11 @@ async function fetchKind(
       let preference: "line_item" | "transaction" = "line_item";
       let isDraft: unknown = t.is_draft ?? null;
       try {
-        const detailUrl = `${apiBase()}/reportingtags/${id}?organization_id=${
-          encodeURIComponent(orgId())
+        const detailUrl = `${z.apiBase}/reportingtags/${id}?organization_id=${
+          encodeURIComponent(z.organizationId)
         }`;
         const res = await zohoFetch(detailUrl, {
-          headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+          headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` },
         });
         const raw = await res.json();
         const tag = (raw as { tag?: Record<string, unknown> })?.tag ?? {};
@@ -377,7 +312,7 @@ async function fetchKind(
 
   if (kind === "currency") {
     const currencies = await fetchAllPages(
-      accessToken,
+      z,
       "settings/currencies",
       "currencies",
     );
@@ -397,7 +332,7 @@ async function fetchKind(
   }
 
   if (kind === "project") {
-    const projects = await fetchAllPages(accessToken, "projects", "projects");
+    const projects = await fetchAllPages(z, "projects", "projects");
     return projects
       .map((p) => ({
         kind: "project" as const,
@@ -413,7 +348,7 @@ async function fetchKind(
   }
 
   if (kind === "tax") {
-    const taxes = await fetchAllPages(accessToken, "settings/taxes", "taxes");
+    const taxes = await fetchAllPages(z, "settings/taxes", "taxes");
     return taxes
       .map((t) => ({
         kind: "tax" as const,
@@ -429,7 +364,7 @@ async function fetchKind(
 
   if (kind === "bank_account") {
     const banks = await fetchAllPages(
-      accessToken,
+      z,
       "bankaccounts",
       "bankaccounts",
     );
@@ -449,7 +384,7 @@ async function fetchKind(
 
   if (kind === "payment_term") {
     const terms = await fetchAllPages(
-      accessToken,
+      z,
       "settings/paymentterms",
       "payment_terms",
     );
@@ -469,7 +404,7 @@ async function fetchKind(
   }
 
   if (kind === "item") {
-    const items = await fetchAllPages(accessToken, "items", "items");
+    const items = await fetchAllPages(z, "items", "items");
     return items
       .map((i) => ({
         kind: "item" as const,
@@ -485,7 +420,7 @@ async function fetchKind(
   }
 
   if (kind === "user") {
-    const users = await fetchAllPages(accessToken, "users", "users");
+    const users = await fetchAllPages(z, "users", "users");
     return users
       .map((u) => ({
         kind: "user" as const,
@@ -501,7 +436,7 @@ async function fetchKind(
   }
 
   const contacts = await fetchAllPages(
-    accessToken,
+    z,
     "contacts",
     "contacts",
     `&contact_type=${kind}`,
@@ -515,7 +450,7 @@ async function fetchKind(
     const id = String(c.contact_id ?? "");
     if (!id) continue;
     try {
-      const res = await zohoFetch(`${apiBase()}/contacts/${id}?organization_id=${encodeURIComponent(orgId())}`, { headers: { Authorization: `Zoho-oauthtoken ${accessToken}` } });
+      const res = await zohoFetch(`${z.apiBase}/contacts/${id}?organization_id=${encodeURIComponent(z.organizationId)}`, { headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` } });
       const raw = await res.json() as { contact?: Record<string, unknown> };
       const d = raw.contact ?? {};
       detailByContact.set(id, {
@@ -599,21 +534,21 @@ Deno.serve(async (req) => {
       meterContextFromRequest(req, "sync", "zoho-pull"),
     );
     zohoFetch = meter.fetch;
-    let accessToken = await getAccessToken();
+    let z = await getZoho(companyId);
     const counts: Record<string, number> = {};
 
     for (const kind of kinds) {
       let rows: EntityRow[];
       try {
-        rows = await fetchKind(accessToken, kind);
+        rows = await fetchKind(z, kind);
       } catch (err) {
         // One retry with a fresh token on auth/transient failure.
         const msg = err instanceof Error ? err.message : String(err);
         if (/\((401|403|5\d\d)\)/.test(msg)) {
           console.log(`zoho-pull ${kind} failed (${msg}); retrying once`);
-          accessToken = await refreshAccessToken();
-          await cacheAccessToken(accessToken);
-          rows = await fetchKind(accessToken, kind);
+          // A cached token can be revoked before it expires; ask for a new one.
+          z = await getZoho2(companyId);
+          rows = await fetchKind(z, kind);
         } else {
           throw err;
         }
