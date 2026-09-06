@@ -249,29 +249,6 @@ async function findBillByNumber(
 }
 
 
-
-/** Cached token when still valid — Zoho throttles the refresh endpoint
- * hard, and a refresh per function call locks the connection out. */
-async function readCachedAccessToken(): Promise<string | null> {
-  try {
-    const supabase = getSupabase();
-    const { data } = await supabase
-      .from("zoho_oauth_tokens")
-      .select("access_token, expires_at")
-      .eq("id", 1)
-      .maybeSingle();
-    if (
-      data?.access_token &&
-      new Date(String(data.expires_at)).getTime() > Date.now() + 120_000
-    ) {
-      return String(data.access_token);
-    }
-  } catch {
-    // Cache is an optimization only.
-  }
-  return null;
-}
-
 /**
  * The calling company's own Zoho organisation and a token for it. This used
  * to read ZOHO_REFRESH_TOKEN and ZOHO_ORGANIZATION_ID from the environment,

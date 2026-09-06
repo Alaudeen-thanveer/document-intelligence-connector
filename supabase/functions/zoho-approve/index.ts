@@ -212,22 +212,6 @@ async function markDocument(
   }
 }
 
-async function cacheAccessToken(token: string): Promise<void> {
-  try {
-    await getServiceClient().from("zoho_oauth_tokens").upsert({
-      id: 1,
-      access_token: token,
-      expires_at: new Date(Date.now() + 55 * 60_000).toISOString(),
-      updated_at: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.warn(
-      "zoho_oauth_tokens cache write failed:",
-      err instanceof Error ? err.message : String(err),
-    );
-  }
-}
-
 
 /**
  * The calling company's own Zoho organisation and a token for it. This used
