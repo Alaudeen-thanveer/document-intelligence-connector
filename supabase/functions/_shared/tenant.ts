@@ -19,6 +19,7 @@
  * identifier they asked for.
  */
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2";
+import { corsHeaders } from "./cors.ts";
 import type { AuthOk } from "./require_user.ts";
 
 export type CompanyOk = { companyId: string };
@@ -30,11 +31,7 @@ export function isCompanyFail(
   return "response" in r;
 }
 
-const DEFAULT_CORS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, content-type, apikey, x-client-info, x-action-id, x-actor",
-};
+const DEFAULT_CORS = corsHeaders();
 
 export type CompanyOptions = {
   /** A company the request named, if it named one. */

@@ -2,6 +2,7 @@
 // Secrets come from Deno.env (local --env-file / hosted supabase secrets).
 // Never returns a Zoho token. Always scopes the invoice by the caller's company.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { corsHeaders } from "../_shared/cors.ts";
 import { blobPart } from "../_shared/bytes.ts";
 import { checkEInvoiceReadiness, type EInvoiceFinding } from "./einvoice.ts";
 import { creditCheck, type CreditCheckResult } from "../cashflow/cash.ts";
@@ -22,11 +23,7 @@ import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, content-type, apikey, x-client-info, x-supabase-api-version, x-action-id, x-actor",
-};
+const CORS_HEADERS = corsHeaders("authorization, content-type, apikey, x-client-info, x-supabase-api-version, x-action-id, x-actor");
 
 type PostAs = "bill" | "invoice" | "expense";
 

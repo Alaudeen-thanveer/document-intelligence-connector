@@ -6,13 +6,10 @@
 // Auth: Mailgun HMAC signature only (not a user JWT). After verify, calls
 // ingest with service_role. Do not require Sign-in here.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { corsHeaders } from "../_shared/cors.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, content-type, apikey, x-client-info",
-};
+const CORS_HEADERS = corsHeaders("authorization, content-type, apikey, x-client-info");
 
 const ALLOWED_TYPES = new Set([
   "application/pdf",

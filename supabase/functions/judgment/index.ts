@@ -10,6 +10,7 @@
  * Input: { document_id: string }
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { corsHeaders } from "../_shared/cors.ts";
 import { matchPurchaseOrder, type PurchaseOrder, type PoMatchResult } from "./po_match.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import {
@@ -43,7 +44,7 @@ interface JudgmentInput {
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...corsHeaders() },
   });
 }
 
@@ -298,11 +299,7 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers":
-          "authorization, content-type, apikey, x-client-info, x-action-id, x-actor",
-      },
+      headers: corsHeaders(),
     });
   }
 

@@ -2,15 +2,12 @@
 // Uploads to the invoices bucket (if bytes provided), creates a documents
 // row, then runs extract + judgment. One path only; no parallel pipeline.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { corsHeaders } from "../_shared/cors.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, content-type, apikey, x-client-info, x-action-id, x-actor",
-};
+const CORS_HEADERS = corsHeaders();
 
 type IngestSource = "upload" | "email" | "webhook";
 
