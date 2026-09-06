@@ -128,24 +128,12 @@ Deno.serve(async (req) => {
   });
   if (isCompanyFail(tenant)) return tenant.response;
 
-  let companyId = tenant.companyId;
-  if (auth.user) {
-    const claim = auth.user.app_metadata?.company_id;
-    if (typeof claim === "string" && claim.trim()) {
-      companyId = claim.trim();
-    } else {
-      return jsonResponse(
-        {
-          ok: false,
-          error:
-            "No company_id on this account. Ask an admin to add you to company_members and set app_metadata.company_id, then sign out/in.",
-        },
-        403,
-      );
-    }
-  } else if (input.company_id?.trim()) {
-    companyId = input.company_id.trim();
-  }
+  // The guard's answer is the answer. This used to be overridden by a
+  // company_id stamped on the login account — computed the right company,
+  // then threw it away — and refused anyone without a stamp. A person who
+  // serves several clients has one login; the request names the client
+  // (the browser sends the company it is showing), and membership decides.
+  const companyId = tenant.companyId;
 
   if (!input.file_base64 && !input.file_url) {
     return jsonResponse(
