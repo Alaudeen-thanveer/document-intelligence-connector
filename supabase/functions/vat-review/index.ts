@@ -5,6 +5,7 @@
 // Input: { period_end?: "yyyy-mm-dd" }  — defaults to the last COMPLETED
 // VAT period per company_config (vat_period_months / vat_period_anchor_month).
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { corsHeaders } from "../_shared/cors.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
@@ -14,10 +15,7 @@ import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
 let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
 
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, content-type, apikey, x-client-info",
-};
+const CORS_HEADERS = corsHeaders("authorization, content-type, apikey, x-client-info");
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...CORS_HEADERS } });
 }

@@ -1,6 +1,7 @@
 // Push a human-approved invoice bill to Zoho Books (sandbox org via env).
 // Uses existing OAuth refresh + single retry. Never hardcode credentials.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { corsHeaders } from "../_shared/cors.ts";
 import { blobPart } from "../_shared/bytes.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
@@ -63,7 +64,7 @@ interface PushInput {
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...corsHeaders() },
   });
 }
 
@@ -662,11 +663,7 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers":
-          "authorization, content-type, apikey, x-client-info",
-      },
+      headers: corsHeaders("authorization, content-type, apikey, x-client-info"),
     });
   }
 

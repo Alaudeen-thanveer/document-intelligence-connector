@@ -5,6 +5,7 @@
 //
 // Input: { month?: "yyyy-mm" }  (default: current month)
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { corsHeaders } from "../_shared/cors.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
@@ -48,11 +49,7 @@ function fingerprintLines(
   return [...parts].sort().join("+");
 }
 
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, content-type, apikey, x-client-info",
-};
+const CORS_HEADERS = corsHeaders("authorization, content-type, apikey, x-client-info");
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {

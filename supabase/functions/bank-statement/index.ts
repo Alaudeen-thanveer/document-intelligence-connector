@@ -22,6 +22,7 @@
 // The email path calls `ingest` with source 'email' and the body/attachment
 // text — same code, different tag.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { corsHeaders } from "../_shared/cors.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { GoogleGenerativeAI } from "npm:@google/generative-ai@0.24.1";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
@@ -39,10 +40,7 @@ import { attachTargetFor, buildLineEvidence, textToPdf } from "./evidence.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
-const CORS_HEADERS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, content-type, apikey, x-client-info, x-action-id, x-actor",
-};
+const CORS_HEADERS = corsHeaders();
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...CORS_HEADERS } });

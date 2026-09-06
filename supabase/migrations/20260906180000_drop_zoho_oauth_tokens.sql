@@ -1,0 +1,14 @@
+-- The single-row Zoho token cache goes.
+--
+-- zoho_oauth_tokens held one access token for the whole deployment — one
+-- Zoho login for every company. Gate 2 replaced it with zoho_access_tokens,
+-- one row per company, and the migration that did so could only *notice*
+-- this table: it could not know whether scripts/zoho-connect.mjs had been
+-- run yet to carry the old credentials across, so it left the drop to a
+-- person. Since then the last two functions that touched this table were
+-- deleted (PR #22), nothing reads or writes it, and every environment that
+-- has reached this migration has run the connect script or never needed to.
+--
+-- On a fresh database this is a no-op after the create in 20260814220000;
+-- on an existing one it removes a table holding a stale token.
+drop table if exists public.zoho_oauth_tokens;

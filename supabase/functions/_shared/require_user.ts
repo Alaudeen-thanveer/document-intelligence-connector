@@ -6,6 +6,7 @@
  * Never treat the anon key as a signed-in user.
  */
 import { createClient, type User } from "npm:@supabase/supabase-js@2";
+import { corsHeaders } from "./cors.ts";
 
 function requireEnv(name: string): string {
   const value = Deno.env.get(name)?.trim();
@@ -50,11 +51,7 @@ function unauthorized(
   };
 }
 
-const DEFAULT_CORS: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, content-type, apikey, x-client-info, x-action-id, x-actor",
-};
+const DEFAULT_CORS = corsHeaders();
 
 export type RequireAuthOptions = {
   corsHeaders?: Record<string, string>;
