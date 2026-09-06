@@ -16,7 +16,7 @@ import { ageInvoices, buildChaseList, buildPaymentRun, creditCheck, validatePaym
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
-let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
+let zohoFetch: typeof fetch = fetch;
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",

@@ -5,6 +5,7 @@
 // Secrets (never hardcoded): MINDEE_API_KEY, GEMINI_API_KEY
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import { blobPart } from "../_shared/bytes.ts";
 import {
   extractLineItemsWithGemini,
   reExtractFieldWithGemini,
@@ -220,7 +221,7 @@ async function callMindeeV1(
   filename: string,
 ): Promise<{ prediction: Record<string, unknown>; raw: unknown }> {
   const form = new FormData();
-  form.append("document", new Blob([bytes], { type: contentType }), filename);
+  form.append("document", new Blob([blobPart(bytes)], { type: contentType }), filename);
 
   const res = await fetch(MINDEE_V1_INVOICE_URL, {
     method: "POST",
@@ -247,7 +248,7 @@ async function callMindeeV2(
 ): Promise<{ prediction: Record<string, unknown>; raw: unknown }> {
   const form = new FormData();
   form.append("model_id", modelId);
-  form.append("file", new Blob([bytes], { type: contentType }), filename);
+  form.append("file", new Blob([blobPart(bytes)], { type: contentType }), filename);
 
   // V2 keys are not JWTs — Authorization must be the raw API key only (no Token/Bearer).
   const enqueueRes = await fetch(MINDEE_V2_ENQUEUE_URL, {

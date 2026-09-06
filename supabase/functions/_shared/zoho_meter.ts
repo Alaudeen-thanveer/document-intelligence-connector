@@ -90,11 +90,18 @@ export function createZohoMeter(supabase: SupabaseClient, ctx: MeterContext) {
   return {
     action_id: actionId,
     /** Drop-in for fetch(); logs after the response arrives. */
-    async fetch(url: string, init?: RequestInit): Promise<Response> {
+    async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+      // Same parameter type as fetch itself, so this can stand in for it
+      // anywhere a helper is typed `typeof fetch`. The log wants a string.
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+        ? input.href
+        : input.url;
       const method = (init?.method ?? "GET").toUpperCase();
       const started = performance.now();
       try {
-        const res = await fetch(url, init);
+        const res = await fetch(input, init);
         // Log without awaiting the insert on the hot path.
         void log(method, url, res.status, started);
         return res;

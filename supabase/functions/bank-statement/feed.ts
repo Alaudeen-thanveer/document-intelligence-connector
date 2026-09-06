@@ -69,7 +69,7 @@ const r2 = (n: number) => Math.round(n * 100) / 100;
 export function uncategorizedToLines(rows: ZohoUncategorizedRow[]): FeedLine[] {
   return rows
     .filter((r) => r && r.transaction_id && r.date)
-    .map((r, i) => {
+    .map((r, i): FeedLine => {
       const description = [r.description, r.payee, r.reference_number].map((x) => (x == null ? "" : String(x).trim())).find(Boolean) ?? `Zoho transaction ${r.transaction_id}`;
       return {
         line_no: i + 1,
