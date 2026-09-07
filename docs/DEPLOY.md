@@ -78,6 +78,17 @@ npx supabase functions deploy
 npx supabase functions deploy inbound-email --no-verify-jwt
 ```
 
+Each function deploys as its `index.ts` plus everything that file imports:
+the modules beside it in its own directory, everything under `_shared/`,
+and in a few places a module from another function's directory
+(`zoho-approve` uses `zoho-push/mapping.ts`, `cashflow/cash.ts` and
+`month-end/schedules.ts`; `cashflow` uses `bank-statement/suggest.ts`;
+`bank-statement` uses `bookkeeping-learn/bank_patterns.ts`). So a change to
+any file under `_shared/`, or to one of those cross-used modules, is a
+change to every function that imports it. Deploy them all — the bare
+`functions deploy` above does — rather than only the one you edited.
+"What is where" below says which files those are.
+
 Every function verifies the caller itself (`_shared/require_user.ts`), so
 the gateway's JWT check is redundant but harmless — except for
 `inbound-email`, which Mailgun calls with an HMAC signature and no JWT. It
@@ -89,6 +100,74 @@ Then type-check what was deployed, from the same commit:
 ```
 npm run typecheck:functions      # must say: All functions type-check.
 ```
+
+## What is where
+
+Since 7 September the three longest functions are a handler (`index.ts`)
+beside modules named for what they hold. When something needs changing,
+this is where to look — and, per the note in step 4, which other
+functions to redeploy with it.
+
+**`_shared/`** — imported by every function.
+
+| File | Holds |
+|---|---|
+| `require_user.ts` | who is calling: a real user token, or the service role for sibling calls |
+| `tenant.ts` | which company that caller may act on — membership decides; 404, never 403 |
+| `cors.ts` | which website may call the functions from a browser (`ALLOWED_ORIGIN`) |
+| `zoho_auth.ts` | a company's Zoho organisation and access token, refreshed from Vault |
+| `zoho_meter.ts` | the API-usage log every Zoho call goes through |
+| `bytes.ts` | a byte array `Blob` will accept |
+
+**`zoho-approve/`** — approve a document and post it to Zoho Books.
+
+| File | Holds |
+|---|---|
+| `index.ts` | the request path: sign-in, whose invoice, guards, the bill / invoice / expense branches |
+| `types.ts` | what the review UI sends, what it gets back, the reconciliation outcome |
+| `zoho_client.ts` | the metered fetch, the token, retry-once-on-auth-failure, create and apply-credits calls |
+| `money.ts` | VAT → `tax_id`, currency → `currency_id`, do the lines add up, which emirate for place of supply |
+| `documents.ts` | the source document's bytes, and attaching them to the Zoho record |
+| `entities.ts` | synced vendors and accounts, per-party default accounts |
+| `audit.ts` | the audit row and the document's status |
+| `einvoice.ts` | UAE e-invoice field readiness (informs, never issues) |
+
+**`zoho-push/`** — the system-side push (scripts and siblings; accepts the service role).
+
+| File | Holds |
+|---|---|
+| `index.ts` | the request path, with bill / invoice / expense branches |
+| `types.ts` | what the request carries |
+| `zoho_client.ts` | every create / attach / lookup call this function makes to Zoho |
+| `bill_body.ts` | the bill as Zoho's create call takes it |
+| `money.ts` | the per-party default account; currency and VAT → Zoho ids |
+| `documents.ts` | the source document's bytes |
+| `guards.ts` | a human approved it, every judgment passed, is the file attached |
+| `mapping.ts` | extracted fields → the mapped bill (used by `zoho-approve` too) |
+| `match-entities.ts` | matching vendor and accounts against the synced masters |
+
+**`bookkeeping-learn/`** — reads a company's Zoho history and proposes rules.
+
+| File | Holds |
+|---|---|
+| `index.ts` | the request path: read documents, analyse, read bank transactions |
+| `types.ts` | what the Rules screen sends |
+| `zoho_history.ts` | the token, a GET with gentle backoff, listing document ids, Zoho payload → `HistoryDoc` |
+| `bank_history.ts` | bank transactions: caching them per account, cached history → bank observations |
+| `analyze`, `recurrence`, `timing`, `attachments`, `tags_projects`, `journal_patterns`, `bank_patterns` | the analysis layers, separate since before the split |
+
+**`apps/web/src/components/review/`** — not a function; built into the web app.
+
+| File | Holds |
+|---|---|
+| `model.ts` | an editable line, how reporting tags apply, the UAE VAT treatments |
+| `RecordSection.tsx` | "The record": vendor, number, dates, currency, total |
+| `TaxSection.tsx` | "Tax": VAT amount and treatment |
+| `LinesSection.tsx` | "Lines": the editable line grid and its footer arithmetic |
+
+`ReviewPanel.tsx` keeps the state, the effects, the handlers and the Posting section.
+
+`npm run typecheck:functions` checks each function's `index.ts` and, through it, every module it imports — sibling and shared alike — so a broken sibling module fails the check under the function that uses it.
 
 ## 5. Connect each company to its Zoho organisation
 
