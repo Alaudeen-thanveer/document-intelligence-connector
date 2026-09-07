@@ -33,8 +33,8 @@ async function authHeaders(actionId: string): Promise<HeadersInit> {
  * The company this browser is showing. Row-level security decides what the
  * signed-in person sees through current_company_id(), so an upload sent
  * with this id lands where the grid already shows it. A person in several
- * companies gets the one the database shows them; without it, the ingest
- * guard has to refuse with "name the company" for anyone in two or more.
+ * companies gets the one they chose in the header; before they choose,
+ * there is none, and the guard refuses with "name the company".
  */
 export async function currentCompanyId(): Promise<string | null> {
   const { data, error } = await supabase.rpc("current_company_id");
@@ -65,10 +65,19 @@ export async function callEdgeFunction(
   body: Record<string, unknown>,
   opts?: { actionId?: string },
 ): Promise<{ ok: boolean; status: number; body: Record<string, unknown> }> {
+  // Say which company the call is for, unless the caller already did.
+  // Every function resolves the company through the same guard, which
+  // must be told when a person belongs to several; this is the company
+  // the app is showing (the one chosen in the header). Functions that
+  // take the company from a document id ignore it. If the lookup fails
+  // the call goes without, and the guard answers.
+  const sent = "company_id" in body
+    ? body
+    : { ...body, company_id: (await currentCompanyId().catch(() => null)) ?? undefined };
   const res = await fetch(`${functionsUrl}/${name}`, {
     method: "POST",
     headers: await authHeaders(opts?.actionId ?? newActionId()),
-    body: JSON.stringify(body),
+    body: JSON.stringify(sent),
   });
   const text = await res.text();
   let payload: Record<string, unknown> = {};

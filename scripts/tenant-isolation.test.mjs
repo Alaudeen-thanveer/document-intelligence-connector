@@ -467,3 +467,57 @@ test("ingest admits a member of two companies who names A and carries no company
     await who.drop();
   }
 });
+
+/**
+ * The company switcher. A person who belongs to several companies used to
+ * be shown one of them by accident of ordering — the company they were
+ * added to FIRST — with nothing on screen saying which and nothing able to
+ * change it. Now: nothing until they choose; exactly the company they
+ * chose; a company they are not in cannot be chosen (and the refusal does
+ * not confirm it exists); and an edge call that names no company goes to
+ * the chosen one.
+ */
+test("a member of two companies sees only the company they chose", async () => {
+  const who = await makeMultiMember();
+  const rpc = (name, body) =>
+    asUser(who.token, `/rest/v1/rpc/${name}`, { method: "POST", body: JSON.stringify(body ?? {}) });
+  try {
+    // Nothing chosen: nothing shown.
+    let rows = await asUser(who.token, "/rest/v1/documents?select=id").then((r) => r.json());
+    assert.deepEqual(rows, [], `saw ${rows.length} document(s) before choosing a company`);
+
+    // Choose A: A's document appears.
+    let res = await rpc("set_current_company", { p_company_id: A.company });
+    assert.equal(res.status, 200, `could not choose A: ${await res.text()}`);
+    rows = await asUser(who.token, `/rest/v1/documents?id=eq.${A.documentId}&select=id`).then((r) => r.json());
+    assert.equal(rows.length, 1, "chose A but cannot see A's document");
+
+    // Choose B: A's document is gone.
+    res = await rpc("set_current_company", { p_company_id: B.company });
+    assert.equal(res.status, 200, `could not choose B: ${await res.text()}`);
+    rows = await asUser(who.token, `/rest/v1/documents?id=eq.${A.documentId}&select=id`).then((r) => r.json());
+    assert.deepEqual(rows, [], "chose B but still sees A's document");
+
+    // A company they are not in: refused, without confirming it exists.
+    res = await rpc("set_current_company", { p_company_id: randomUUID() });
+    const refusal = await res.text();
+    assert.notEqual(res.status, 200, "chose a company they are not a member of");
+    assert.ok(/not found/i.test(refusal), `refusal should say not found, said: ${refusal.slice(0, 120)}`);
+
+    // The picker's list: both companies, B current.
+    const mine = await rpc("my_companies").then((r) => r.json());
+    assert.deepEqual(mine.map((c) => c.company_id).sort(), [A.company, B.company].sort());
+    assert.equal(mine.find((c) => c.current)?.company_id, B.company, "my_companies does not flag the chosen one");
+
+    // The edge guard: a call that names no company goes to the chosen one
+    // rather than answering "name the company".
+    res = await asUser(who.token, "/functions/v1/vat-review", { method: "POST", body: JSON.stringify({}) });
+    const text = await res.text();
+    assert.ok(
+      !refusedByGuard(res.status, text),
+      `vat-review with no company named did not use the chosen company: ${res.status} ${text.slice(0, 200)}`,
+    );
+  } finally {
+    await who.drop();
+  }
+});

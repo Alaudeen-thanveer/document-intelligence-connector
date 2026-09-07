@@ -126,6 +126,17 @@ export async function companyForCaller(
 
   if (!target) {
     if (mine.length === 1) return { companyId: mine[0] };
+    // Several companies and none named: the one this person chose in the
+    // app, if they chose one and are still a member of it. The choice is
+    // written only by set_current_company(), which checks membership; it is
+    // checked again here in case that membership has since been removed.
+    const { data: chosen } = await supabase
+      .from("user_company_selection")
+      .select("company_id")
+      .eq("user_id", userId)
+      .maybeSingle();
+    const picked = chosen?.company_id ? String(chosen.company_id) : null;
+    if (picked && mine.includes(picked)) return { companyId: picked };
     return refuse(400, "Name the company this applies to", opts);
   }
 
