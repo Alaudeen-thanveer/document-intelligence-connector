@@ -29,7 +29,7 @@ fix the cause and run it again; it resumes from the first unapplied file.
 
 What the chain leaves you with, and what to check:
 
-- 33 tables, every one with row-level security on. `select count(*) from
+- 34 tables, every one with row-level security on. `select count(*) from
   pg_tables where schemaname = 'public' and not rowsecurity;` must be 0.
 - The `invoices` storage bucket **private**. The migration that makes it so
   raises if it is still public; if `db push` succeeds, it is private.
@@ -113,7 +113,7 @@ functions to redeploy with it.
 | File | Holds |
 |---|---|
 | `require_user.ts` | who is calling: a real user token, or the service role for sibling calls |
-| `tenant.ts` | which company that caller may act on — membership decides; 404, never 403 |
+| `tenant.ts` | which company that caller may act on — membership decides, and a person in several who names none gets the one they chose; 404, never 403 |
 | `cors.ts` | which website may call the functions from a browser (`ALLOWED_ORIGIN`) |
 | `zoho_auth.ts` | a company's Zoho organisation and access token, refreshed from Vault |
 | `zoho_meter.ts` | the API-usage log every Zoho call goes through |
@@ -181,6 +181,16 @@ This writes the company's organisation id to `zoho_connections` and its
 refresh token into Vault. Until it has run for a company, every Zoho action
 for that company fails with "not connected" — that is the intended state
 for a company that has not been connected, not a fault.
+
+### People who serve several companies
+
+A person is added to a company with a `company_members` row. Someone in
+several companies chooses which one they are working in from the picker
+in the app's header; until they choose, they see nothing, on purpose. The
+choice is kept per person (`user_company_selection`, written only by
+`set_current_company()`, which checks membership) and every page and
+every function call follows it. The picker shows `company_config.company_name`;
+set it when a company is created, or the slug shows instead.
 
 ## 6. The web app
 

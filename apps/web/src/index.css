@@ -2531,3 +2531,26 @@ a.btn {
 .vat-checks {
   max-height: none;
 }
+
+/* The company a person is working in: a label when they belong to one,
+   a picker when they belong to several. Sits before the reviewer name. */
+.appbar-company {
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 6px;
+  white-space: nowrap;
+}
+.appbar-company-muted { opacity: 0.7; }
+.appbar-company select {
+  font: inherit;
+  font-size: 13px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  max-width: 16rem;
+}
+.appbar-company-error { font-size: 12px; opacity: 0.85; }

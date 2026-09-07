@@ -5,6 +5,7 @@ import { useMonthEndAttention } from "../hooks/useMonthEndAttention";
 import { TABS } from "../nav";
 import { setActor } from "../lib/functions";
 import { SettingsDrawer } from "./SettingsDrawer";
+import { CompanySwitcher } from "../components/CompanySwitcher";
 
 export interface AppOutletContext {
   reviewerName: string;
@@ -56,6 +57,7 @@ export function AppLayout({ session }: { session: Session }) {
         </nav>
 
         <div className="appbar-who">
+          <CompanySwitcher />
           <span className="appbar-whoname">
             <span className="appbar-who1">{reviewerName}</span>
             <span className="appbar-who2">{email}</span>
