@@ -2,6 +2,16 @@ import { useEffect, useState, useRef } from "react";
 import { callEdgeFunction } from "../lib/functions";
 import { todayLocalISO } from "../lib/dates";
 import { PanelSection } from "./PanelSection";
+import { RecordSection } from "./review/RecordSection";
+import { TaxSection } from "./review/TaxSection";
+import { LinesSection } from "./review/LinesSection";
+import {
+  nextLineKey,
+  tagMeta,
+  TAX_TREATMENTS,
+  type EditableLine,
+  type PostAs,
+} from "./review/model";
 import { supabase } from "../lib/supabase";
 import { entityAccountType, findByName } from "../lib/zoho";
 import { useZohoEntities } from "../hooks/useZohoEntities";
@@ -11,82 +21,6 @@ import type {
   JudgmentResultRow,
 } from "../types";
 import { isFlaggedStatus } from "../types";
-
-type PostAs = "bill" | "expense" | "invoice";
-
-/** One editable invoice line in the review form. */
-interface EditableLine {
-  key: string;
-  description: string;
-  quantity: string;
-  rate: string;
-  accountId: string;
-  projectId: string;
-  /** tag_id → tag_option_id */
-  tags: Record<string, string>;
-}
-
-let lineKeyCounter = 0;
-function nextLineKey(): string {
-  lineKeyCounter += 1;
-  return `line-${lineKeyCounter}`;
-}
-
-/**
- * A reporting tag in Zoho is applied either per LINE ITEM or once per
- * TRANSACTION (Zoho: multi_preference_entities.preference). We mirror that
- * exactly: line-level tags get a selector on every line; transaction-level
- * tags get ONE selector in the header and are applied uniformly to every
- * line on push — so two lines can never carry different values for a
- * transaction-level tag. Draft / inactive tags, or tags with no options,
- * cannot be applied in Zoho and are not offered.
- */
-interface TagMeta {
-  zoho_id: string;
-  name: string;
-  preference: "line_item" | "transaction";
-  options: Array<{ id: string; name: string }>;
-}
-function tagMeta(
-  rows: Array<{ zoho_id: string; name: string; extra: Record<string, unknown> | null }>,
-): TagMeta[] {
-  return rows
-    .map((t) => {
-      const extra = (t.extra ?? {}) as {
-        preference?: unknown;
-        is_active?: unknown;
-        is_draft?: unknown;
-        options?: Array<{ id: string | null; name: string | null }>;
-      };
-      const options = (extra.options ?? [])
-        .filter((o): o is { id: string; name: string | null } => !!o.id)
-        .map((o) => ({ id: o.id, name: o.name ?? o.id }));
-      const usable = extra.is_active !== false && extra.is_draft !== true &&
-        options.length > 0;
-      return usable
-        ? {
-          zoho_id: t.zoho_id,
-          name: t.name,
-          preference: extra.preference === "transaction"
-            ? "transaction" as const
-            : "line_item" as const,
-          options,
-        }
-        : null;
-    })
-    .filter((t): t is TagMeta => t !== null);
-}
-
-/** UAE-edition VAT treatments (transaction-level; Zoho validates). */
-const TAX_TREATMENTS: Array<{ value: string; label: string }> = [
-  { value: "vat_registered", label: "VAT registered" },
-  { value: "vat_not_registered", label: "VAT not registered" },
-  { value: "gcc_vat_registered", label: "GCC VAT registered" },
-  { value: "gcc_vat_not_registered", label: "GCC VAT not registered" },
-  { value: "non_gcc", label: "Non GCC" },
-  { value: "dz_vat_registered", label: "Designated zone (registered)" },
-  { value: "dz_vat_not_registered", label: "Designated zone (not registered)" },
-];
 
 interface Props {
   document: DocumentRow | null;
@@ -962,340 +896,45 @@ export function ReviewPanel({
         </PanelSection>
       )}
 
-      <PanelSection id="record" title="The record">
-        {!extracted ? (
-          <div>
-            <p className="muted">
-              Nothing has been read from this document yet — uploading it does
-              not read it. Extracting needs Mindee and the edge functions.
-            </p>
-            <button
-              type="button"
-              className="btn primary"
-              style={{ marginTop: "0.75rem" }}
-              disabled={!!busy}
-              onClick={() => void runExtractAndJudgment()}
-            >
-              {busy === "process" ? "Processing…" : "Run extract + judgment"}
-            </button>
-          </div>
-        ) : (
-          <div className="form-grid">
-            <label>
-              Vendor
-              <input
-                value={vendorRaw}
-                onChange={(e) => setVendorRaw(e.target.value)}
-                placeholder="as printed on the document"
-              />
-            </label>
-            <label>
-              Invoice number
-              <input
-                value={invoiceNumber}
-                onChange={(e) => setInvoiceNumber(e.target.value)}
-                placeholder="as printed, e.g. INV-2210"
-              />
-            </label>
-            <label>
-              Invoice date
-              <input
-                type="date"
-                value={invoiceDate ?? ""}
-                onChange={(e) => setInvoiceDate(e.target.value)}
-              />
-            </label>
-            <label>
-              Due date
-              <input
-                type="date"
-                value={dueDate}
-                onChange={(e) => setDueDate(e.target.value)}
-              />
-            </label>
-            <label>
-              Currency
-              <input
-                value={currency}
-                onChange={(e) => setCurrency(e.target.value.toUpperCase())}
-                placeholder="AED"
-                maxLength={3}
-              />
-            </label>
-            <label>
-              Total amount
-              <input
-                value={totalAmount}
-                onChange={(e) => setTotalAmount(e.target.value)}
-                inputMode="decimal"
-                placeholder="0.00, including VAT"
-              />
-            </label>
-          </div>
-        )}
-      </PanelSection>
+      <RecordSection
+        extracted={extracted}
+        busy={busy}
+        runExtractAndJudgment={runExtractAndJudgment}
+        vendorRaw={vendorRaw}
+        setVendorRaw={setVendorRaw}
+        invoiceNumber={invoiceNumber}
+        setInvoiceNumber={setInvoiceNumber}
+        invoiceDate={invoiceDate}
+        setInvoiceDate={setInvoiceDate}
+        dueDate={dueDate}
+        setDueDate={setDueDate}
+        currency={currency}
+        setCurrency={setCurrency}
+        totalAmount={totalAmount}
+        setTotalAmount={setTotalAmount}
+      />
 
       {extracted && (
-        <PanelSection
-          id="tax"
-          title="Tax"
-          note={
-            taxAmount.trim() === ""
-              ? "No VAT on the document"
-              : `VAT ${taxAmount}`
-          }
-        >
-          <div className="form-grid">
-            <label>
-              VAT amount
-              <input
-                value={taxAmount}
-                onChange={(e) => setTaxAmount(e.target.value)}
-                inputMode="decimal"
-                placeholder="blank = no VAT on document"
-              />
-            </label>
-            <label>
-              Tax treatment
-              <select
-                value={taxTreatment}
-                onChange={(e) => setTaxTreatment(e.target.value)}
-              >
-                <option value="">
-                  {partyTreatmentLabel
-                    ? `— party default (${partyTreatmentLabel}) —`
-                    : "— party default —"}
-                </option>
-                {TAX_TREATMENTS.map((t) => (
-                  <option key={t.value} value={t.value}>
-                    {t.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-          {taxTreatment && partyTreatment && taxTreatment !== partyTreatment && (
-            <p className="muted">
-              Overriding this party's default treatment for this transaction
-              only — the party master in Zoho is not changed.
-            </p>
-          )}
-        </PanelSection>
+        <TaxSection
+          taxAmount={taxAmount}
+          setTaxAmount={setTaxAmount}
+          taxTreatment={taxTreatment}
+          setTaxTreatment={setTaxTreatment}
+          partyTreatment={partyTreatment}
+          partyTreatmentLabel={partyTreatmentLabel}
+        />
       )}
 
       {extracted && (
-        <PanelSection
-          id="lines"
-          title="Lines"
-          note={lineItems.length ? `${lineItems.length}` : "None read"}
-          defaultOpen={lineItems.length > 0}
-        >
-          {lineItems.length === 0 && (
-            <p className="muted">
-              No line items captured — the whole amount posts as one line.
-              Add lines to split it.
-            </p>
-          )}
-          {lineItems.length > 0 && (
-            <div className="line-item-head" aria-hidden="true">
-              <span>Description</span>
-              <span>Qty</span>
-              <span>Rate</span>
-            </div>
-          )}
-          {lineItems.map((li, idx) => (
-            <div key={li.key} className="line-item-row">
-              <input
-                className="li-desc"
-                aria-label={`Line ${idx + 1} description`}
-                value={li.description}
-                placeholder={`Line ${idx + 1} description`}
-                onChange={(e) =>
-                  setLineItems((prev) =>
-                    prev.map((p) =>
-                      p.key === li.key
-                        ? { ...p, description: e.target.value }
-                        : p,
-                    ),
-                  )
-                }
-              />
-              <input
-                className="li-qty"
-                aria-label={`Line ${idx + 1} quantity`}
-                value={li.quantity}
-                inputMode="decimal"
-                placeholder="Qty"
-                onChange={(e) =>
-                  setLineItems((prev) =>
-                    prev.map((p) =>
-                      p.key === li.key
-                        ? { ...p, quantity: e.target.value }
-                        : p,
-                    ),
-                  )
-                }
-              />
-              <input
-                className="li-rate"
-                aria-label={`Line ${idx + 1} rate`}
-                value={li.rate}
-                inputMode="decimal"
-                placeholder="Rate"
-                onChange={(e) =>
-                  setLineItems((prev) =>
-                    prev.map((p) =>
-                      p.key === li.key ? { ...p, rate: e.target.value } : p,
-                    ),
-                  )
-                }
-              />
-              <select
-                className="li-account"
-                aria-label={`Line ${idx + 1} account`}
-                value={li.accountId}
-                onChange={(e) =>
-                  setLineItems((prev) =>
-                    prev.map((p) =>
-                      p.key === li.key
-                        ? { ...p, accountId: e.target.value }
-                        : p,
-                    ),
-                  )
-                }
-              >
-                <option value="">— account: use default —</option>
-                {accountOptions.map((a) => (
-                  <option key={a.zoho_id} value={a.zoho_id}>
-                    {a.name}
-                  </option>
-                ))}
-              </select>
-              {(zoho.projects.length > 0 || lineTags.length > 0) && (
-                <div className="li-dims">
-                  {zoho.projects.length > 0 && (
-                    <select
-                      className="li-project"
-                      value={li.projectId}
-                      title="Project"
-                      onChange={(e) =>
-                        setLineItems((prev) =>
-                          prev.map((p) =>
-                            p.key === li.key
-                              ? { ...p, projectId: e.target.value }
-                              : p,
-                          ),
-                        )
-                      }
-                    >
-                      <option value="">— project —</option>
-                      {zoho.projects.map((pr) => (
-                        <option key={pr.zoho_id} value={pr.zoho_id}>
-                          {pr.name}
-                        </option>
-                      ))}
-                    </select>
-                  )}
-                  {lineTags.map((tag) => {
-                    const options = tag.options;
-                    return (
-                      <select
-                        key={tag.zoho_id}
-                        className="li-tag"
-                        value={li.tags[tag.zoho_id] ?? ""}
-                        title={tag.name}
-                        onChange={(e) =>
-                          setLineItems((prev) =>
-                            prev.map((p) =>
-                              p.key === li.key
-                                ? {
-                                  ...p,
-                                  tags: { ...p.tags, [tag.zoho_id]: e.target.value },
-                                }
-                                : p,
-                            ),
-                          )
-                        }
-                      >
-                        <option value="">— {tag.name} —</option>
-                        {options.map((o) => (
-                          <option key={o.id} value={o.id}>
-                            {o.name}
-                          </option>
-                        ))}
-                      </select>
-                    );
-                  })}
-                </div>
-              )}
-              <span className="li-amount">
-                {(() => {
-                  const q = Number(li.quantity) || 1;
-                  const r = Number(li.rate);
-                  return Number.isFinite(r) && li.rate.trim() !== ""
-                    ? (q * r).toFixed(2)
-                    : "—";
-                })()}
-              </span>
-              <button
-                type="button"
-                className="btn ghost btn-small"
-                onClick={() =>
-                  setLineItems((prev) => prev.filter((p) => p.key !== li.key))
-                }
-              >
-                ✕
-              </button>
-            </div>
-          ))}
-          <div className="line-items-footer">
-            <button
-              type="button"
-              className="btn ghost btn-small"
-              onClick={() =>
-                setLineItems((prev) => [
-                  ...prev,
-                  {
-                    key: nextLineKey(),
-                    description: "",
-                    quantity: "1",
-                    rate: "",
-                    accountId: "",
-                    projectId: "",
-                    tags: {},
-                  },
-                ])
-              }
-            >
-              + Add line
-            </button>
-            {lineItems.length > 0 && (
-              <span className="muted">
-                {(() => {
-                  const sum = lineItems.reduce((acc, li) => {
-                    const q = Number(li.quantity) || 1;
-                    const r = Number(li.rate);
-                    return acc +
-                      (Number.isFinite(r) && li.rate.trim() !== "" ? q * r : 0);
-                  }, 0);
-                  const vat = taxAmount.trim() === "" ? 0 : Number(taxAmount);
-                  const total = totalAmount.trim() === ""
-                    ? null
-                    : Number(totalAmount);
-                  const expected = sum + (Number.isFinite(vat) ? vat : 0);
-                  const mismatch = total != null &&
-                    Math.abs(expected - total) > 0.01;
-                  return `Lines ${sum.toFixed(2)} + VAT ${
-                    (Number.isFinite(vat) ? vat : 0).toFixed(2)
-                  } = ${expected.toFixed(2)}` +
-                    (mismatch
-                      ? ` — does not match total ${total?.toFixed(2)}`
-                      : "");
-                })()}
-              </span>
-            )}
-          </div>
-        </PanelSection>
+        <LinesSection
+          lineItems={lineItems}
+          setLineItems={setLineItems}
+          accountOptions={accountOptions}
+          zoho={zoho}
+          lineTags={lineTags}
+          taxAmount={taxAmount}
+          totalAmount={totalAmount}
+        />
       )}
 
       <PanelSection id="posting" title="Posting">
