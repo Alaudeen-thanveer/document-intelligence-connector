@@ -1,4 +1,8 @@
-# Putting this on a hosted Supabase project
+# Putting Alfin on a hosted Supabase project
+
+The product is **Alfin**. The repository, its edge functions and its tables
+keep the name `document-intelligence-connector`; only what a person sees
+(the header, the browser tab, the sign-in page) says Alfin.
 
 Nothing is hosted yet. This is the list for the day it is, written so that
 the person doing it does not have to remember what the code assumes. Every
@@ -43,7 +47,7 @@ Edge functions read these from the project's secrets, never from a file:
 
 ```
 npx supabase secrets set \
-  ALLOWED_ORIGIN=https://<the app's address, no trailing slash> \
+  ALLOWED_ORIGIN=https://<Alfin's address, no trailing slash> \
   ZOHO_CLIENT_ID=... ZOHO_CLIENT_SECRET=... \
   ZOHO_API_BASE_URL=https://www.zohoapis.ae/books/v3 \
   MINDEE_API_KEY=... MINDEE_MODEL_ID=... \
