@@ -35,7 +35,7 @@ export function AppLayout({ session }: { session: Session }) {
           />
           <span className="appbar-brand">
             <i className="appbar-dot" aria-hidden="true" />
-            <span className="appbar-name">Verity</span>
+            <span className="appbar-name">Alfin</span>
           </span>
         </div>
 

@@ -23,7 +23,7 @@ export function SignInPage() {
     <div className="app-shell">
       <div className="atmosphere" aria-hidden="true" />
       <div className="signin-wrap">
-        <p className="brand">Document Intelligence Connector</p>
+        <p className="brand">Alfin</p>
         <h1>Sign in</h1>
         <p className="muted">
           Use the local Supabase user (Studio → Authentication). Approve
