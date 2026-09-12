@@ -1152,17 +1152,32 @@ a {
   gap: 9px;
   flex: none;
 }
-.appbar-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 3px;
+/* The wordmark: lowercase, the dot on the i in ledger green — the same
+   green that means "posted" everywhere else in the app. The i is a
+   dotless ı so the dot is ours to place and colour. */
+.wordmark {
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  text-transform: lowercase;
+  white-space: nowrap;
+}
+.wordmark-i {
+  position: relative;
+  display: inline-block;
+}
+.wordmark-i::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 0.06em;
+  width: 0.2em;
+  height: 0.2em;
+  border-radius: 50%;
   background: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  transform: translateX(-50%);
 }
 .appbar-name {
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: -0.03em;
+  font-size: 19px;
 }
 .appbar-icon {
   width: 38px;

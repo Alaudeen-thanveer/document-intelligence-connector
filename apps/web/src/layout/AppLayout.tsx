@@ -6,6 +6,7 @@ import { TABS } from "../nav";
 import { setActor } from "../lib/functions";
 import { SettingsDrawer } from "./SettingsDrawer";
 import { CompanySwitcher } from "../components/CompanySwitcher";
+import { Wordmark } from "../components/Wordmark";
 
 export interface AppOutletContext {
   reviewerName: string;
@@ -34,8 +35,7 @@ export function AppLayout({ session }: { session: Session }) {
             onReviewerName={setReviewerName}
           />
           <span className="appbar-brand">
-            <i className="appbar-dot" aria-hidden="true" />
-            <span className="appbar-name">Alfin</span>
+            <Wordmark className="appbar-name" />
           </span>
         </div>
 
