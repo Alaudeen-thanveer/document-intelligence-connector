@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from "react";
+import { Wordmark } from "./Wordmark";
 import { supabase } from "../lib/supabase";
 
 export function SignInPage() {
@@ -23,7 +24,7 @@ export function SignInPage() {
     <div className="app-shell">
       <div className="atmosphere" aria-hidden="true" />
       <div className="signin-wrap">
-        <p className="brand">Alfin</p>
+        <p className="brand"><Wordmark /></p>
         <h1>Sign in</h1>
         <p className="muted">
           Use the local Supabase user (Studio → Authentication). Approve
