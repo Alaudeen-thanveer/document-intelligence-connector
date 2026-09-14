@@ -42,11 +42,11 @@ import {
   buildBankPatterns,
 } from "./bank_patterns.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { dataClient, systemClient } from "../_shared/db.ts";
 import type { LearnInput } from "./types.ts";
 import {
   type DocKind,
   getAccessToken,
-  getSupabase,
   KIND_META,
   listIds,
   setZohoFetch,
@@ -84,9 +84,9 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: "Invalid JSON body" }, 400);
   }
 
-  // Runs with the service role, so nothing below checks who is asking
-  // unless this does. No default company: a fallback is how a bug
-  // becomes a cross-client leak instead of an error.
+  // Membership decides the company. No default company: a fallback is how
+  // a bug becomes a cross-client leak instead of an error. Everything below
+  // runs as the caller, under row-level security.
   const tenant = await companyForCaller(auth, {
     companyId: input.company_id ?? null,
     errorBody: (m) => ({ error: m }),
@@ -95,8 +95,11 @@ Deno.serve(async (req) => {
   const companyId = tenant.companyId;
   const monthsBack = Math.max(1, Math.min(60, input.months_back ?? 24));
   const cap = Math.max(1, Math.min(2000, input.max_docs_per_kind ?? 500));
-  const supabase = getSupabase();
-  const meter = createZohoMeter(supabase, {
+  // The caller's own identity: RLS scopes every read and write to their company.
+  const supabase = dataClient(auth, companyId);
+  // Vault token, usage log, and learned bank patterns (not browser-insertable) are system records.
+  const system = systemClient();
+  const meter = createZohoMeter(system, {
     ...meterContextFromRequest(req, "learn", "bookkeeping-learn"),
     company_id: companyId,
   });
@@ -118,7 +121,7 @@ Deno.serve(async (req) => {
     let bankTransactionsFetched = 0;
 
     if (!input.reanalyze_only) {
-      const z = await getAccessToken(supabase, companyId);
+      const z = await getAccessToken(system, companyId);
       const from = new Date();
       from.setMonth(from.getMonth() - monthsBack);
       const fromDate = from.toISOString().slice(0, 10);
@@ -630,7 +633,7 @@ Deno.serve(async (req) => {
       const keep = existing?.suggestion_status && existing.suggestion_status !== "proposed"
         ? existing.suggestion_status
         : "proposed";
-      const { error } = await supabase.from("bk_bank_patterns").upsert({
+      const { error } = await system.from("bk_bank_patterns").upsert({
         company_id: companyId,
         ...bp,
         first_seen: bp.first_seen || null,

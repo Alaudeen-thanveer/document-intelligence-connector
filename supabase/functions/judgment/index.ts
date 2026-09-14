@@ -12,7 +12,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { corsHeaders } from "../_shared/cors.ts";
 import { matchPurchaseOrder, type PurchaseOrder, type PoMatchResult } from "./po_match.ts";
-import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import {
   checkAmountAboveThresholdNoPo,
   checkDuplicate,
@@ -31,6 +31,7 @@ import {
 } from "./learned_checks.ts";
 import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { dataClient, systemClient } from "../_shared/db.ts";
 
 // No default company. A document without one is a broken record, not a
 // reason to act on somebody else's books.
@@ -48,16 +49,6 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function getSupabase(): SupabaseClient {
-  const url = Deno.env.get("SUPABASE_URL");
-  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!url || !key) {
-    throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required");
-  }
-  return createClient(url, key, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
 
 function parseAmount(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
@@ -149,7 +140,7 @@ async function checkPurchaseOrderMatch(
   ctx: { company_id: string; po_number: string | null; vendor_raw: string | null; total_amount: number | null; tax_amount: number | null; extracted_fields_id: string; po_variance_pct: number; po_variance_amount: number },
   vendorZohoId: string | null,
 ): Promise<{ result: CheckResult; detail: PoMatchResult }> {
-  const { data: poRows } = await supabase.from("zoho_entities").select("zoho_id, name, extra").eq("kind", "purchase_order");
+  const { data: poRows } = await supabase.from("zoho_entities").select("zoho_id, name, extra").eq("company_id", ctx.company_id).eq("kind", "purchase_order");
   const pos: PurchaseOrder[] = (poRows ?? []).map((r) => {
     const e = (r.extra as Record<string, unknown>) ?? {};
     return {
@@ -182,6 +173,7 @@ function normName(value: string): string {
  */
 async function resolveVendorZohoId(
   supabase: SupabaseClient,
+  companyId: string,
   vendorRaw: string | null,
 ): Promise<{ zoho_id: string; name: string } | null> {
   const q = vendorRaw ? normName(vendorRaw) : "";
@@ -189,6 +181,7 @@ async function resolveVendorZohoId(
   const { data } = await supabase
     .from("zoho_entities")
     .select("zoho_id, name")
+    .eq("company_id", companyId)
     .eq("kind", "vendor");
   for (const v of data ?? []) {
     if (normName(String(v.name)) === q) {
@@ -202,6 +195,7 @@ async function resolveVendorZohoId(
   const { data: profiles } = await supabase
     .from("bk_party_profiles")
     .select("party_zoho_id, party_name")
+    .eq("company_id", companyId)
     .eq("party_kind", "vendor");
   for (const p of profiles ?? []) {
     if (normName(String(p.party_name)) === q) {
@@ -258,6 +252,7 @@ async function loadVendorPeers(
 
 async function persistResults(
   supabase: SupabaseClient,
+  system: SupabaseClient,
   documentId: string,
   results: Array<{ rule_name: string; result: CheckResult }>,
 ): Promise<Array<{ id: string; rule_name: string; passed: boolean; notes: string }>> {
@@ -265,12 +260,14 @@ async function persistResults(
   // learned_* rows from a previous run whose check has since been
   // disabled — otherwise a stale failure would linger on the document.
   const ruleNames = results.map((r) => r.rule_name);
-  await supabase
+  // Clearing prior results is a system act (the browser's role cannot delete
+  // judgment rows); the document was verified as the caller's before this.
+  await system
     .from("judgment_results")
     .delete()
     .eq("document_id", documentId)
     .in("rule_name", ruleNames);
-  await supabase
+  await system
     .from("judgment_results")
     .delete()
     .eq("document_id", documentId)
@@ -322,8 +319,8 @@ Deno.serve(async (req) => {
   }
 
   // The caller handed us a document id. Establish that it is theirs before
-  // reading anything off it — this function runs with the service role, so
-  // nothing else will.
+  // reading anything off it; after that the function runs as the caller, so
+  // row-level security applies as well.
   const tenant = await companyForCaller(auth, {
     documentId: input.document_id,
     errorBody: (m) => ({ error: m }),
@@ -331,13 +328,16 @@ Deno.serve(async (req) => {
   if (isCompanyFail(tenant)) return tenant.response;
 
   try {
-    const supabase = getSupabase();
+    // The caller's own identity when a person asked; the service role only
+    // for the ingest pipeline behind inbound email.
+    const supabase = dataClient(auth, tenant.companyId);
+    const system = systemClient();
     const ctx = await loadContext(supabase, input.document_id);
 
     // Learned per-vendor checks: only those a human ENABLED, only for the
     // vendor this document matches. Absent a match or any enabled check,
     // the engine behaves exactly as before.
-    const vendor = await resolveVendorZohoId(supabase, ctx.vendor_raw);
+    const vendor = await resolveVendorZohoId(supabase, ctx.company_id, ctx.vendor_raw);
     const enabled = vendor
       ? await loadEnabledChecks(supabase, ctx.company_id, vendor.zoho_id)
       : [];
@@ -391,7 +391,7 @@ Deno.serve(async (req) => {
     }
     if (strictness) learnedApplied.push("supporting_document_strictness");
 
-    const stored = await persistResults(supabase, input.document_id, packaged);
+    const stored = await persistResults(supabase, system, input.document_id, packaged);
 
     const allPassed = packaged.every((p) => p.result.passed);
     // Record the verdict on the document — but a document that is already

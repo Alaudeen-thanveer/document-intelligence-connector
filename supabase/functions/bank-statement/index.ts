@@ -23,7 +23,7 @@
 // text — same code, different tag.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { corsHeaders } from "../_shared/cors.ts";
-import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { GoogleGenerativeAI } from "npm:@google/generative-ai@0.24.1";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
@@ -39,6 +39,7 @@ import { isProposableAsZohoRule, zohoRuleBodyForPattern, type ZohoBankRule } fro
 import { attachTargetFor, buildLineEvidence, textToPdf } from "./evidence.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
+import { dataClient, systemClient } from "../_shared/db.ts";
 import { companyObjectPath, loadCompanyFile, StoredFileRefused, storageRef } from "../_shared/storage.ts";
 import { assertSafeFile, UnsafeFile } from "../_shared/file_safety.ts";
 
@@ -52,11 +53,6 @@ function requireEnv(name: string): string {
   if (!v) throw new Error(`${name} is not set`);
   return v;
 }
-function getSupabase(): SupabaseClient {
-  return createClient(requireEnv("SUPABASE_URL"), requireEnv("SUPABASE_SERVICE_ROLE_KEY"), {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
 
 // --------------------------------------------------------------- Zoho auth
 /**
@@ -65,10 +61,11 @@ function getSupabase(): SupabaseClient {
  * one organisation for the whole deployment — see _shared/zoho_auth.ts.
  */
 async function getAccessToken(
-  supabase: SupabaseClient,
+  _supabase: SupabaseClient,
   companyId: string,
 ): Promise<ZohoAuth> {
-  return await zohoAuthFor(supabase, companyId);
+  // The token lives in Vault: always the system client, whoever is calling.
+  return await zohoAuthFor(systemClient(), companyId);
 }
 
 // ------------------------------------------------------------ PDF → rows
@@ -131,8 +128,8 @@ async function loadPatterns(supabase: SupabaseClient, companyId: string): Promis
   })) as BankPattern[];
 }
 
-async function loadParties(supabase: SupabaseClient): Promise<PartyRef[]> {
-  const { data } = await supabase.from("zoho_entities").select("kind, zoho_id, name").in("kind", ["vendor", "customer"]);
+async function loadParties(supabase: SupabaseClient, companyId: string): Promise<PartyRef[]> {
+  const { data } = await supabase.from("zoho_entities").select("kind, zoho_id, name").eq("company_id", companyId).in("kind", ["vendor", "customer"]);
   return (data ?? []).map((r) => ({ kind: r.kind as "vendor" | "customer", zoho_id: String(r.zoho_id), name: String(r.name) }));
 }
 
@@ -178,7 +175,7 @@ async function loadRecorded(supabase: SupabaseClient, companyId: string, stateme
     });
   }
   // Documents pushed as expenses.
-  const { data: syncs } = await supabase.from("erp_sync_log").select("document_id, external_doc_id, synced_at").eq("external_kind", "expenses");
+  const { data: syncs } = await supabase.from("erp_sync_log").select("document_id, external_doc_id, synced_at, documents!inner(company_id)").eq("documents.company_id", companyId).eq("external_kind", "expenses");
   if (syncs?.length) {
     const ids = syncs.map((x) => String(x.document_id));
     const { data: fields } = await supabase.from("extracted_fields").select("document_id, vendor_raw, total_amount, invoice_date").in("document_id", ids);
@@ -268,17 +265,17 @@ async function computeAndStoreSuggestions(
   supabase: SupabaseClient, zohoFetch: typeof fetch, companyId: string, statementId: string,
 ): Promise<{ suggested: number; open: number; open_docs: number; zoho_matched?: number }> {
   const { data: lines } = await supabase.from("bank_statement_lines")
-    .select("id, line_no, txn_date, description, reference, side, amount").eq("statement_id", statementId).eq("status", "open").order("line_no");
+    .select("id, line_no, txn_date, description, reference, side, amount").eq("company_id", companyId).eq("statement_id", statementId).eq("status", "open").order("line_no");
   const list = (lines ?? []) as Array<LineForSuggest & { id: string }>;
   if (!list.length) return { suggested: 0, open: 0, open_docs: 0 };
 
   const [patterns, parties, policies, recorded, stmt] = await Promise.all([
-    loadPatterns(supabase, companyId), loadParties(supabase), loadPolicies(supabase, companyId),
-    loadRecorded(supabase, companyId, statementId), supabase.from("bank_statements").select("currency, bank_account_zoho_id").eq("id", statementId).maybeSingle(),
+    loadPatterns(supabase, companyId), loadParties(supabase, companyId), loadPolicies(supabase, companyId),
+    loadRecorded(supabase, companyId, statementId), supabase.from("bank_statements").select("currency, bank_account_zoho_id").eq("company_id", companyId).eq("id", statementId).maybeSingle(),
   ]);
   let currency = (stmt.data?.currency as string | null) ?? null;
   if (!currency && stmt.data?.bank_account_zoho_id) {
-    const { data: acct } = await supabase.from("zoho_entities").select("extra").eq("kind", "bank_account").eq("zoho_id", String(stmt.data.bank_account_zoho_id)).maybeSingle();
+    const { data: acct } = await supabase.from("zoho_entities").select("extra").eq("company_id", companyId).eq("kind", "bank_account").eq("zoho_id", String(stmt.data.bank_account_zoho_id)).maybeSingle();
     currency = ((acct?.extra as Record<string, unknown> | null)?.currency_code as string | undefined) ?? null;
   }
   currency = currency ?? "AED";
@@ -295,12 +292,12 @@ async function computeAndStoreSuggestions(
     console.warn("open documents unavailable; suggesting from patterns only:", err instanceof Error ? err.message : err);
   }
   // The org's own bank rules (synced as zoho_entities kind bank_rule) and feed payees.
-  const { data: ruleRows } = await supabase.from("zoho_entities").select("zoho_id, name, extra").eq("kind", "bank_rule");
+  const { data: ruleRows } = await supabase.from("zoho_entities").select("zoho_id, name, extra").eq("company_id", companyId).eq("kind", "bank_rule");
   const zohoRules: ZohoBankRule[] = (ruleRows ?? []).map((r) => {
     const extra = (r.extra as Record<string, unknown>) ?? {};
     return { ...extra, rule_id: String(r.zoho_id), rule_name: String(r.name), criterion: (extra.criterion as ZohoBankRule["criterion"]) ?? [] } as ZohoBankRule;
   });
-  const { data: payeeRows } = await supabase.from("bank_statement_lines").select("line_no, zoho_payee").eq("statement_id", statementId).not("zoho_payee", "is", null);
+  const { data: payeeRows } = await supabase.from("bank_statement_lines").select("line_no, zoho_payee").eq("company_id", companyId).eq("statement_id", statementId).not("zoho_payee", "is", null);
   const payees: Record<number, string | null> = Object.fromEntries((payeeRows ?? []).map((r) => [Number(r.line_no), (r.zoho_payee as string | null) ?? null]));
   const suggestions = suggestForLines(list, { patterns, parties, openDocs, openCredits, recorded, policies, currency, today: new Date().toISOString().slice(0, 10), zohoRules, bankAccountId: stmt.data?.bank_account_zoho_id ? String(stmt.data.bank_account_zoho_id) : null, payees });
 
@@ -309,7 +306,7 @@ async function computeAndStoreSuggestions(
   // That is the duplicate control when the statement lives in Zoho, so it
   // outranks everything except our own already-recorded link.
   const { data: feedRows } = await supabase.from("bank_statement_lines").select("id, zoho_uncategorized_id")
-    .eq("statement_id", statementId).not("zoho_uncategorized_id", "is", null);
+    .eq("company_id", companyId).eq("statement_id", statementId).not("zoho_uncategorized_id", "is", null);
   const feedIds = new Map((feedRows ?? []).map((r) => [String(r.id), String(r.zoho_uncategorized_id)]));
   let zohoMatched = 0;
   if (feedIds.size) {
@@ -324,7 +321,7 @@ async function computeAndStoreSuggestions(
         const res = await zohoFetch(`${z.apiBase}/banktransactions/uncategorized/${encodeURIComponent(uncatId)}/match?organization_id=${encodeURIComponent(org)}`, { headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` } });
         const j = await res.json().catch(() => ({}));
         const cands = ((j as { matching_transactions?: ZohoMatchCandidate[] }).matching_transactions ?? []).slice(0, 10);
-        await supabase.from("bank_statement_lines").update({ zoho_match_candidates: cands }).eq("id", list[i].id);
+        await supabase.from("bank_statement_lines").update({ zoho_match_candidates: cands }).eq("id", list[i].id).eq("company_id", companyId);
         if (cands.length && suggestions[i]?.source !== "already_recorded") {
           const m = suggestFromZohoMatches(list[i], cands, policies.already_recorded_window_days);
           if (m) { suggestions[i] = m; zohoMatched++; }
@@ -338,7 +335,7 @@ async function computeAndStoreSuggestions(
   let suggested = 0;
   for (let i = 0; i < list.length; i++) {
     const s: Suggestion | null = suggestions[i];
-    await supabase.from("bank_statement_lines").update({ suggestion: s }).eq("id", list[i].id);
+    await supabase.from("bank_statement_lines").update({ suggestion: s }).eq("id", list[i].id).eq("company_id", companyId);
     if (s) suggested++;
   }
   return { suggested, open: list.length - suggested, open_docs: openDocs.length, zoho_matched: zohoMatched };
@@ -372,9 +369,9 @@ Deno.serve(async (req) => {
     return jsonResponse({ ok: false, error: "Sign in required" }, 401);
   }
 
-  // Runs with the service role, so nothing below checks who is asking
-  // unless this does. No default company: a fallback is how a bug
-  // becomes a cross-client leak instead of an error.
+  // Membership decides the company. No default company: a fallback is how
+  // a bug becomes a cross-client leak instead of an error. Everything below
+  // runs as the caller, under row-level security.
   const tenant = await companyForCaller(auth, {
     // input is Record<string, unknown> here, so this needs narrowing rather
     // than a cast — a non-string company_id must read as "none named".
@@ -385,8 +382,13 @@ Deno.serve(async (req) => {
   const companyId = tenant.companyId;
   const actor = auth.user?.email?.split("@")[0]
     ?? (req.headers.get("x-actor")?.trim() || (auth.isServiceRole ? "mailbox" : "reviewer"));
-  const supabase = getSupabase();
-  const meter = createZohoMeter(supabase, { ...meterContextFromRequest(req, `bank-${action || "unknown"}`, "bank-statement"), company_id: companyId });
+  // The caller's own identity, so RLS scopes every read and write to their
+  // company; the service role only for the mailbox pipeline (source email),
+  // a background job with no person behind it.
+  const supabase = dataClient(auth, companyId);
+  // The usage log and the Zoho master-data cache are system records.
+  const system = systemClient();
+  const meter = createZohoMeter(system, { ...meterContextFromRequest(req, `bank-${action || "unknown"}`, "bank-statement"), company_id: companyId });
 
   try {
     // ------------------------------------------------------------ ingest
@@ -427,7 +429,7 @@ Deno.serve(async (req) => {
         return jsonResponse({ ok: false, error: "No transaction rows found", skipped: parsed.skipped, parse: { delimiter: parsed.delimiter, columns: parsed.columns } }, 422);
       }
 
-      const { data: acct } = await supabase.from("zoho_entities").select("name").eq("kind", "bank_account").eq("zoho_id", bankAccountId).maybeSingle();
+      const { data: acct } = await supabase.from("zoho_entities").select("name").eq("company_id", companyId).eq("kind", "bank_account").eq("zoho_id", bankAccountId).maybeSingle();
       const dates = parsed.lines.map((l) => l.txn_date).sort();
       const { data: st, error: stErr } = await supabase.from("bank_statements").insert({
         company_id: companyId, bank_account_zoho_id: bankAccountId,
@@ -449,7 +451,7 @@ Deno.serve(async (req) => {
       if (lErr) throw new Error(`could not save lines: ${lErr.message}`);
 
       const sug = await computeAndStoreSuggestions(supabase, meter.fetch, companyId, st.id);
-      const { data: outLines } = await supabase.from("bank_statement_lines").select("*").eq("statement_id", st.id).order("line_no");
+      const { data: outLines } = await supabase.from("bank_statement_lines").select("*").eq("company_id", companyId).eq("statement_id", st.id).order("line_no");
       return jsonResponse({
         ok: true, statement_id: st.id, lines: outLines ?? [], line_count: parsed.lines.length,
         skipped: parsed.skipped, parse: { delimiter: parsed.delimiter, columns: parsed.columns },
@@ -462,7 +464,7 @@ Deno.serve(async (req) => {
       const statementId = String(input.statement_id ?? "");
       if (!statementId) return jsonResponse({ ok: false, error: "statement_id required" }, 400);
       const sug = await computeAndStoreSuggestions(supabase, meter.fetch, companyId, statementId);
-      const { data: outLines } = await supabase.from("bank_statement_lines").select("*").eq("statement_id", statementId).order("line_no");
+      const { data: outLines } = await supabase.from("bank_statement_lines").select("*").eq("company_id", companyId).eq("statement_id", statementId).order("line_no");
       return jsonResponse({ ok: true, statement_id: statementId, lines: outLines ?? [], suggestions: sug, usage: meter.summary() });
     }
 
@@ -470,19 +472,19 @@ Deno.serve(async (req) => {
     if (action === "confirm") {
       const lineId = String(input.line_id ?? "");
       if (!lineId) return jsonResponse({ ok: false, error: "line_id required" }, 400);
-      const { data: line } = await supabase.from("bank_statement_lines").select("*").eq("id", lineId).maybeSingle();
+      const { data: line } = await supabase.from("bank_statement_lines").select("*").eq("company_id", companyId).eq("id", lineId).maybeSingle();
       if (!line) return jsonResponse({ ok: false, error: "line not found" }, 404);
       if (line.status === "posted") return jsonResponse({ ok: false, error: "already posted to Zoho" }, 409);
 
       if (input.skip) {
-        await supabase.from("bank_statement_lines").update({ status: "skipped", decided_by: actor, decided_at: new Date().toISOString() }).eq("id", lineId);
+        await supabase.from("bank_statement_lines").update({ status: "skipped", decided_by: actor, decided_at: new Date().toISOString() }).eq("id", lineId).eq("company_id", companyId);
         return jsonResponse({ ok: true, line_id: lineId, status: "skipped" });
       }
       const kind = String(input.chosen_txn_kind ?? "");
       if (!kind) return jsonResponse({ ok: false, error: "chosen_txn_kind required" }, 400);
       if (kind === "exclude" && !line.zoho_uncategorized_id) {
         // File mode has nothing in Zoho to exclude: an excluded line is simply skipped here.
-        await supabase.from("bank_statement_lines").update({ status: "skipped", chosen_txn_kind: "exclude", decided_by: actor, decided_at: new Date().toISOString() }).eq("id", lineId);
+        await supabase.from("bank_statement_lines").update({ status: "skipped", chosen_txn_kind: "exclude", decided_by: actor, decided_at: new Date().toISOString() }).eq("id", lineId).eq("company_id", companyId);
         return jsonResponse({ ok: true, line_id: lineId, status: "skipped", decision: "filled_blank" });
       }
       const s = (line.suggestion ?? null) as Suggestion | null;
@@ -539,19 +541,19 @@ Deno.serve(async (req) => {
         ? "accepted_suggestion" : "changed_suggestion";
       await supabase.from("bank_statement_lines").update({
         ...chosen, status: "confirmed", decision, decided_by: actor, decided_at: new Date().toISOString(), error: null,
-      }).eq("id", lineId);
+      }).eq("id", lineId).eq("company_id", companyId);
       return jsonResponse({ ok: true, line_id: lineId, status: "confirmed", decision });
     }
 
     // -------------------------------------------------------------- push
     if (action === "push") {
-      let q = supabase.from("bank_statement_lines").select("*, bank_statements!inner(bank_account_zoho_id, bank_account_name, currency)").eq("status", "confirmed");
+      let q = supabase.from("bank_statement_lines").select("*, bank_statements!inner(bank_account_zoho_id, bank_account_name, currency)").eq("company_id", companyId).eq("status", "confirmed");
       if (input.statement_id) q = q.eq("statement_id", String(input.statement_id));
       if (Array.isArray(input.line_ids) && input.line_ids.length) q = q.in("id", input.line_ids as string[]);
       const { data: lines } = await q.order("line_no");
       if (!lines?.length) return jsonResponse({ ok: true, pushed: 0, failed: 0, results: [], note: "no confirmed lines to push" });
       const z = await getAccessToken(supabase, companyId);
-      const { data: feeAcct } = await supabase.from("zoho_entities").select("zoho_id").eq("kind", "account").ilike("name", "bank fees%").limit(1).maybeSingle();
+      const { data: feeAcct } = await supabase.from("zoho_entities").select("zoho_id").eq("company_id", companyId).eq("kind", "account").ilike("name", "bank fees%").limit(1).maybeSingle();
       // Period lock (item 10): a line dated inside a locked period must not
       // create anything in the books. Hard per-line refusal; unlock to change.
       const { data: lockRow } = await supabase.from("company_config").select("locked_until").eq("company_id", companyId).maybeSingle();
@@ -586,7 +588,7 @@ Deno.serve(async (req) => {
           // already live in Zoho with the bank feed as their source.
           let attach: { attached: boolean; filename?: string; error?: string } | null = null;
           if (!(line as { zoho_uncategorized_id?: string | null }).zoho_uncategorized_id && r.zoho_id && (line as { chosen_txn_kind?: string }).chosen_txn_kind !== "already_recorded") {
-            const { data: stmtRow } = await supabase.from("bank_statements").select("bank_account_name, bank_account_zoho_id, period_start, period_end, source, original_name, currency, file_url").eq("id", String((line as { statement_id: string }).statement_id)).maybeSingle();
+            const { data: stmtRow } = await supabase.from("bank_statements").select("bank_account_name, bank_account_zoho_id, period_start, period_end, source, original_name, currency, file_url").eq("company_id", companyId).eq("id", String((line as { statement_id: string }).statement_id)).maybeSingle();
             if (stmtRow) {
               attach = await attachStatementEvidence(supabase, meter.fetch, z,
                 { line_no: Number(line.line_no), txn_date: String(line.txn_date), description: String(line.description ?? ""), reference: (line.reference as string | null) ?? null, side: line.side as "debit" | "credit", amount: Number(line.amount) },
@@ -594,12 +596,12 @@ Deno.serve(async (req) => {
                 String((line as { chosen_txn_kind?: string }).chosen_txn_kind ?? r.kind), r.zoho_id, actor, companyId);
             }
           }
-          await supabase.from("bank_statement_lines").update({ status: "posted", zoho_txn_id: r.zoho_id, zoho_payload: r.payload, zoho_extra_ids: r.extra, posted_at: new Date().toISOString(), error: null }).eq("id", line.id);
+          await supabase.from("bank_statement_lines").update({ status: "posted", zoho_txn_id: r.zoho_id, zoho_payload: r.payload, zoho_extra_ids: r.extra, posted_at: new Date().toISOString(), error: null }).eq("id", line.id).eq("company_id", companyId);
           results.push({ line_id: line.id, line_no: line.line_no, ok: true, zoho_id: r.zoho_id, kind: r.kind, extra: r.extra, attached: attach?.attached ?? null, attach_error: attach && !attach.attached ? attach.error ?? null : null });
           pushed++;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          await supabase.from("bank_statement_lines").update({ status: "failed", error: message }).eq("id", line.id);
+          await supabase.from("bank_statement_lines").update({ status: "failed", error: message }).eq("id", line.id).eq("company_id", companyId);
           results.push({ line_id: line.id, line_no: line.line_no, ok: false, error: message });
           failed++;
         }
@@ -652,7 +654,7 @@ Deno.serve(async (req) => {
       })));
       if (lErr) throw new Error(`could not save lines: ${lErr.message}`);
       const sug = await computeAndStoreSuggestions(supabase, meter.fetch, companyId, st.id);
-      const { data: outLines } = await supabase.from("bank_statement_lines").select("*").eq("statement_id", st.id).order("line_no");
+      const { data: outLines } = await supabase.from("bank_statement_lines").select("*").eq("company_id", companyId).eq("statement_id", st.id).order("line_no");
       return jsonResponse({ ok: true, statement_id: st.id, lines: outLines ?? [], line_count: lines.length, already_pulled: rows.length - fresh.length, suggestions: sug, usage: meter.summary() });
     }
 
@@ -702,7 +704,7 @@ Deno.serve(async (req) => {
       const rule = (raw.rule ?? raw.bank_rule ?? {}) as Record<string, unknown>;
       const ruleId = rule.rule_id ? String(rule.rule_id) : null;
       await supabase.from("bk_bank_patterns").update({ zoho_rule_id: ruleId ?? "created", zoho_rule_created_at: new Date().toISOString(), zoho_rule_created_by: actor }).eq("id", patternId);
-      if (ruleId) await supabase.from("zoho_entities").upsert({ company_id: companyId, kind: "bank_rule", zoho_id: ruleId, name: String(rule.rule_name ?? sent.rule_name), extra: { ...sent, rule_id: ruleId, is_active: true } }, { onConflict: "company_id,kind,zoho_id" });
+      if (ruleId) await system.from("zoho_entities").upsert({ company_id: companyId, kind: "bank_rule", zoho_id: ruleId, name: String(rule.rule_name ?? sent.rule_name), extra: { ...sent, rule_id: ruleId, is_active: true } }, { onConflict: "company_id,kind,zoho_id" });
       return jsonResponse({ ok: true, zoho_rule_id: ruleId, rule, body: sent, usage: meter.summary() });
     }
 

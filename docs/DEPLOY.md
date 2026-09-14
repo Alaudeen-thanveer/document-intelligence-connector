@@ -104,11 +104,17 @@ change to every function that imports it. Deploy them all — the bare
 `functions deploy` above does — rather than only the one you edited.
 "What is where" below says which files those are.
 
-Every function verifies the caller itself (`_shared/require_user.ts`), so
-the gateway's JWT check is redundant but harmless — except for
-`inbound-email`, which Mailgun calls with an HMAC signature and no JWT. It
-must be deployed with `--no-verify-jwt` or every inbound email is refused
-at the gateway before the function sees it.
+Every function verifies the caller itself (`_shared/require_user.ts`) and
+then acts **as that caller** (`_shared/db.ts`): database reads and writes
+carry the person's own JWT, so row-level security applies inside functions
+too, and the approval trail records who acted. The service role is used
+only for background jobs with no person behind them (the mailbox pipeline)
+and for the system's own records (Vault tokens, audit and sync logs, the
+Zoho master-data cache, usage log). Keep the gateway's JWT check on for
+every function as a second wall — except `inbound-email`, which Mailgun
+calls with an HMAC signature and no JWT. It must be deployed with
+`--no-verify-jwt` (pinned in `config.toml`) or every inbound email is
+refused at the gateway before the function sees it.
 
 Then type-check what was deployed, from the same commit:
 

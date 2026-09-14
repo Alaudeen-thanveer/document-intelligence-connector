@@ -22,7 +22,8 @@ function zohoFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Respon
   return current(input, init);
 }
 
-export function getSupabase(): SupabaseClient {
+/** The service role, for Vault token access only — see _shared/db.ts. */
+function getSupabase(): SupabaseClient {
   const url = Deno.env.get("SUPABASE_URL");
   const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   if (!url || !key) {

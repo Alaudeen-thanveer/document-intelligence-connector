@@ -14,7 +14,7 @@
 // PDF or image before they reach ingest (which scans them for malware).
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { corsHeaders } from "../_shared/cors.ts";
-import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import { systemClient } from "../_shared/db.ts";
 import { verifyMailgunWebhook } from "../_shared/mailgun.ts";
 import { MAX_FILE_BYTES, sniffFileType } from "../_shared/file_safety.ts";
 
@@ -39,13 +39,13 @@ function requireEnv(name: string): string {
   return v;
 }
 
-function getSupabase(): SupabaseClient {
-  return createClient(
-    requireEnv("SUPABASE_URL"),
-    requireEnv("SUPABASE_SERVICE_ROLE_KEY"),
-    { auth: { persistSession: false, autoRefreshToken: false } },
-  );
-}
+/**
+ * A background job: no person is behind a Mailgun webhook, so this is one of
+ * the few places the service role is the right identity. It reads only the
+ * recipient's company id and webhook receipts, and hands the attachments to
+ * ingest, which files them under that company.
+ */
+const getSupabase = systemClient;
 
 function normalizeRecipient(raw: string): string {
   // "Name <addr@dom>" or plain addr; take first address if comma-separated.

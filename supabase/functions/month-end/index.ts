@@ -6,9 +6,10 @@
 // Input: { month?: "yyyy-mm" }  (default: current month)
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { corsHeaders } from "../_shared/cors.ts";
-import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
+import { dataClient, systemClient } from "../_shared/db.ts";
 
 /** Set per request; every Zoho call goes through it so usage is metered. */
 let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
@@ -61,11 +62,6 @@ function requireEnv(name: string): string {
   const v = Deno.env.get(name)?.trim();
   if (!v) throw new Error(`${name} is not set`);
   return v;
-}
-function getSupabase(): SupabaseClient {
-  return createClient(requireEnv("SUPABASE_URL"), requireEnv("SUPABASE_SERVICE_ROLE_KEY"), {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
 }
 
 /**
@@ -201,9 +197,9 @@ Deno.serve(async (req) => {
   }
   const today = new Date().toISOString().slice(0, 10);
   const month = /^\d{4}-\d{2}$/.test(input.month ?? "") ? input.month! : today.slice(0, 7);
-  // Runs with the service role, so nothing below checks who is asking
-  // unless this does. No default company: a fallback is how a bug
-  // becomes a cross-client leak instead of an error.
+  // Membership decides the company. No default company: a fallback is how
+  // a bug becomes a cross-client leak instead of an error. Everything below
+  // runs as the caller, under row-level security.
   const tenant = await companyForCaller(auth, {
     companyId: input.company_id ?? null,
     errorBody: (m) => ({ error: m }),
@@ -213,13 +209,16 @@ Deno.serve(async (req) => {
   const { start, end } = monthBounds(month);
 
   try {
-    const supabase = getSupabase();
-    const meter = createZohoMeter(supabase, {
+    // The caller's own identity: RLS scopes every read and write to their company.
+    const supabase = dataClient(auth, companyId);
+    // Vault token, usage log, audit log and system-created proposals are system records.
+    const system = systemClient();
+    const meter = createZohoMeter(system, {
       ...meterContextFromRequest(req, "month-end", "month-end"),
       company_id: companyId,
     });
     zohoFetch = meter.fetch;
-    const z = await getAccessToken(supabase, companyId);
+    const z = await getAccessToken(system, companyId);
     const actor = (auth.user?.email as string | undefined) ?? "reviewer";
     const action = input.action ?? "nudges";
     const { data: cfg } = await supabase.from("company_config")
@@ -227,7 +226,7 @@ Deno.serve(async (req) => {
       .eq("company_id", companyId).maybeSingle();
     const lockedUntil: string | null = cfg?.locked_until ? String(cfg.locked_until) : null;
     const audit = (act: string, detail: Record<string, unknown>) =>
-      supabase.from("audit_log").insert({ company_id: companyId, actor_type: "human", actor_id: auth.user?.id ?? null, action: act, detail: { ...detail, actor } }).then(() => {}, () => {});
+      system.from("audit_log").insert({ company_id: companyId, actor_type: "human", actor_id: auth.user?.id ?? null, action: act, detail: { ...detail, actor } }).then(() => {}, () => {});
 
     // ------------------------------------------- period lock (item 10)
     // Zoho's .ae API exposes no transaction-locking endpoint (verified), so
@@ -317,7 +316,7 @@ Deno.serve(async (req) => {
         const { data } = await supabase.from("bk_schedules").update(row).eq("id", input.schedule_id).eq("company_id", companyId).in("status", ["proposed", "active"]).select("*").maybeSingle();
         saved = data;
       } else {
-        const { data } = await supabase.from("bk_schedules").insert({ ...row, company_id: companyId, source_kind: "manual", created_by: actor }).select("*").maybeSingle();
+        const { data } = await system.from("bk_schedules").insert({ ...row, company_id: companyId, source_kind: "manual", created_by: actor }).select("*").maybeSingle();
         saved = data;
       }
       if (!saved) return jsonResponse({ ok: false, error: "Schedule not found (or already done/dismissed)." }, 404);
@@ -391,7 +390,7 @@ Deno.serve(async (req) => {
       if (!r.can_reconcile || !r.reconcile_body) return jsonResponse({ ok: false, error: `Not ready to reconcile: ${r.note}`, reconciliation: r }, 409);
       const res = await zohoPost(z, `bankaccounts/${accountId}/reconciliations`, r.reconcile_body);
       if (!res.ok) return jsonResponse({ ok: false, error: `Zoho refused the reconciliation: ${res.raw.message ?? res.status}`, reconciliation: r, body: r.reconcile_body }, 502);
-      await supabase.from("audit_log").insert({ company_id: companyId, actor_type: "human", actor_id: auth.user?.id ?? null, action: "bank_reconciled", detail: { bank_account_zoho_id: accountId, period: month, closing_balance: r.statement_closing, transactions: (r.reconcile_body.transactions_to_be_reconciled as string[]).length, actor } }).then(() => {}, () => {});
+      await system.from("audit_log").insert({ company_id: companyId, actor_type: "human", actor_id: auth.user?.id ?? null, action: "bank_reconciled", detail: { bank_account_zoho_id: accountId, period: month, closing_balance: r.statement_closing, transactions: (r.reconcile_body.transactions_to_be_reconciled as string[]).length, actor } }).then(() => {}, () => {});
       return jsonResponse({ ok: true, reconciliation: r, zoho: res.raw, usage: meter.summary() });
     }
     // Post a proposed journal (reviewer may have edited amounts/date/notes).
@@ -424,7 +423,7 @@ Deno.serve(async (req) => {
           await supabase.from("bk_schedules").update({ status: "done" }).eq("id", prop.schedule_id);
         }
       }
-      await supabase.from("audit_log").insert({ company_id: companyId, actor_type: "human", actor_id: auth.user?.id ?? null, action: "journal_posted", detail: { proposal_id: proposalId, zoho_journal_id: journalId, total: built.total, journal_date: built.body.journal_date, actor } }).then(() => {}, () => {});
+      await system.from("audit_log").insert({ company_id: companyId, actor_type: "human", actor_id: auth.user?.id ?? null, action: "journal_posted", detail: { proposal_id: proposalId, zoho_journal_id: journalId, total: built.total, journal_date: built.body.journal_date, actor } }).then(() => {}, () => {});
       return jsonResponse({ ok: true, zoho_journal_id: journalId, journal, usage: meter.summary() });
     }
 
@@ -617,7 +616,7 @@ Deno.serve(async (req) => {
       if (existing) { journalProposals.push(existing); continue; }
       const draft = buildJournalProposal({ id: String(fp.id), fingerprint: String(fp.fingerprint), label: String(fp.label), accounts: (fp.accounts as PatternForProposal["accounts"]) ?? [], amount_median: fp.amount_median == null ? null : Number(fp.amount_median), expected_day_min: fp.expected_day_min == null ? null : Number(fp.expected_day_min), expected_day_max: fp.expected_day_max == null ? null : Number(fp.expected_day_max), recurring_note: (fp.recurring_note as string | null) ?? null }, month, today);
       if (!draft) continue;
-      const { data: ins } = await supabase.from("bk_journal_proposals").insert({ company_id: companyId, pattern_id: draft.pattern_id, period: month, journal_date: draft.journal_date, reference_number: draft.reference_number, notes: draft.notes, lines: draft.lines, total: draft.total, status: "proposed" }).select("*").maybeSingle();
+      const { data: ins } = await system.from("bk_journal_proposals").insert({ company_id: companyId, pattern_id: draft.pattern_id, period: month, journal_date: draft.journal_date, reference_number: draft.reference_number, notes: draft.notes, lines: draft.lines, total: draft.total, status: "proposed" }).select("*").maybeSingle();
       if (ins) journalProposals.push(ins);
     }
 
@@ -646,7 +645,7 @@ Deno.serve(async (req) => {
         const { data: existingCt } = await supabase.from("bk_journal_proposals").select("*").eq("company_id", companyId).eq("kind", "ct_provision").eq("period", month).maybeSingle();
         if (existingCt) journalProposals.push(existingCt);
         else if (result.lines && result.top_up > 0) {
-          const { data: ins } = await supabase.from("bk_journal_proposals").insert({
+          const { data: ins } = await system.from("bk_journal_proposals").insert({
             company_id: companyId, pattern_id: null, kind: "ct_provision", period: month,
             journal_date: end <= today ? end : today, reference_number: `DIC-CT-${month}`,
             notes: result.notes, lines: result.lines, total: result.top_up, status: "proposed",
@@ -670,7 +669,7 @@ Deno.serve(async (req) => {
       if (sr.status === "active") {
         const row: ScheduleRow = { id: String(sr.id), kind: sr.kind as "prepayment" | "accrual", label: String(sr.label), bs_account_id: String(sr.bs_account_id), bs_account_name: (sr.bs_account_name as string | null) ?? null, pl_account_id: String(sr.pl_account_id), pl_account_name: (sr.pl_account_name as string | null) ?? null, total: Number(sr.total), months: Number(sr.months), start_period: String(sr.start_period) };
         for (const due of dueScheduleEntries(row, proposedPeriods, month, today)) {
-          const { data: ins, error: insErr } = await supabase.from("bk_journal_proposals").insert({
+          const { data: ins, error: insErr } = await system.from("bk_journal_proposals").insert({
             company_id: companyId, pattern_id: null, kind: "schedule", schedule_id: sr.id, period: due.period,
             journal_date: due.journal_date, reference_number: due.reference_number, notes: due.notes,
             lines: due.lines, total: due.amount, status: "proposed",

@@ -15,11 +15,11 @@ import {
 import { matchEntities } from "../zoho-push/match-entities.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { dataClient, systemClient } from "../_shared/db.ts";
 import type { ApproveInput, ApproveResult, PostAs } from "./types.ts";
 import { writeAudit, markDocument } from "./audit.ts";
 import {
   applyCreditsToDoc,
-  getServiceClient,
   publicError,
   result_contact,
   setZohoFetch,
@@ -89,8 +89,13 @@ Deno.serve(async (req) => {
   if (isCompanyFail(tenant)) return tenant.response;
   const companyId = tenant.companyId;
 
-  const supabase = getServiceClient();
-  const meter = createZohoMeter(supabase, {
+  // The approver's own identity: RLS scopes every read and write to their
+  // company, and the approval trail records them as the actor.
+  const supabase = dataClient(auth, companyId);
+  // The audit log, ERP sync log, usage log and system-created follow-up
+  // proposals are system records the browser's role cannot write.
+  const system = systemClient();
+  const meter = createZohoMeter(system, {
     ...meterContextFromRequest(req, "push", "zoho-approve"),
     company_id: companyId,
     actor: user.email ?? user.id,
@@ -101,7 +106,7 @@ Deno.serve(async (req) => {
     await markDocument(supabase, invoiceId, companyId, {
       status: "sync_failed",
     });
-    await writeAudit(supabase, {
+    await writeAudit(system, {
       company_id: companyId,
       invoice_id: invoiceId,
       actor_id: user.id,
@@ -545,7 +550,7 @@ Deno.serve(async (req) => {
         followups = detectFollowups(billLineSnapshot, accMap);
         const billNo = mapped.invoice_number?.trim() || zohoId;
         for (const a of followups.assets) {
-          await supabase.from("bk_asset_proposals").upsert({
+          await system.from("bk_asset_proposals").upsert({
             company_id: companyId, document_id: invoiceId, bill_zoho_id: zohoId, bill_number: billNo,
             line_description: a.description, amount: a.amount, asset_account_id: a.account_id, asset_account_name: a.account_name,
             purchase_date: mapped.date ?? null, status: "proposed",
@@ -555,7 +560,7 @@ Deno.serve(async (req) => {
           const startPeriod = String(mapped.date ?? new Date().toISOString().slice(0, 10)).slice(0, 7);
           const { data: existing } = await supabase.from("bk_schedules").select("id").eq("company_id", companyId).eq("source_zoho_id", zohoId).eq("label", pnew.description).maybeSingle();
           if (existing) continue;
-          await supabase.from("bk_schedules").insert({
+          await system.from("bk_schedules").insert({
             company_id: companyId, kind: "prepayment", label: pnew.description, source_kind: "bill", source_zoho_id: zohoId, source_number: billNo,
             bs_account_id: pnew.account_id, bs_account_name: pnew.account_name,
             // The P&L side is the reviewer's choice — left empty on purpose;
@@ -573,7 +578,7 @@ Deno.serve(async (req) => {
       status: "synced",
       zoho_bill_id: zohoId,
     });
-    await supabase.from("erp_sync_log").insert({
+    await system.from("erp_sync_log").insert({
       document_id: invoiceId,
       source_type: "push",
       erp_name: "zoho_books",
@@ -605,7 +610,7 @@ Deno.serve(async (req) => {
         creditsApplied = { applied: 0, ok: false, response: publicError(err) };
       }
     }
-    await writeAudit(supabase, {
+    await writeAudit(system, {
       company_id: companyId,
       invoice_id: invoiceId,
       actor_id: user.id,

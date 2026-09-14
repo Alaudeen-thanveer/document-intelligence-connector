@@ -6,11 +6,12 @@
 // VAT period per company_config (vat_period_months / vat_period_anchor_month).
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { corsHeaders } from "../_shared/cors.ts";
-import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
 import { buildForm201, vatPeriodFor, type VatDoc } from "./form201.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { dataClient, systemClient } from "../_shared/db.ts";
 import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
 let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
@@ -23,9 +24,6 @@ function requireEnv(name: string): string {
   const v = Deno.env.get(name)?.trim();
   if (!v) throw new Error(`${name} is not set`);
   return v;
-}
-function getSupabase(): SupabaseClient {
-  return createClient(requireEnv("SUPABASE_URL"), requireEnv("SUPABASE_SERVICE_ROLE_KEY"), { auth: { persistSession: false, autoRefreshToken: false } });
 }
 
 /**
@@ -121,9 +119,9 @@ Deno.serve(async (req) => {
   } catch {
     return jsonResponse({ error: "Invalid JSON body" }, 400);
   }
-  // Runs with the service role, so nothing below checks who is asking
-  // unless this does. No default company: a fallback is how a bug
-  // becomes a cross-client leak instead of an error.
+  // Membership decides the company. No default company: a fallback is how
+  // a bug becomes a cross-client leak instead of an error. Everything below
+  // runs as the caller, under row-level security.
   const tenant = await companyForCaller(auth, {
     companyId: input.company_id ?? null,
     errorBody: (m) => ({ error: m }),
@@ -133,10 +131,13 @@ Deno.serve(async (req) => {
   const today = new Date().toISOString().slice(0, 10);
 
   try {
-    const supabase = getSupabase();
-    const meter = createZohoMeter(supabase, { ...meterContextFromRequest(req, "vat-review", "vat-review"), company_id: companyId });
+    // The caller's own identity: RLS scopes every read to their company.
+    const supabase = dataClient(auth, companyId);
+    // Vault token and the usage log are system records.
+    const system = systemClient();
+    const meter = createZohoMeter(system, { ...meterContextFromRequest(req, "vat-review", "vat-review"), company_id: companyId });
     zohoFetch = meter.fetch;
-    const token = await getAccessToken(supabase, companyId);
+    const token = await getAccessToken(system, companyId);
 
     const { data: config } = await supabase.from("company_config")
       .select("vat_period_months, vat_period_anchor_month, vat_filing_due_days")

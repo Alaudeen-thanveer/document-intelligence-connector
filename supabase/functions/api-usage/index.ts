@@ -10,10 +10,11 @@
 // Input: { window_days?: number }  (default 7 — for the per-day chart)
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { corsHeaders } from "../_shared/cors.ts";
-import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { dataClient, systemClient } from "../_shared/db.ts";
 import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
 const CORS_HEADERS = corsHeaders();
@@ -57,11 +58,6 @@ function requireEnv(name: string): string {
   if (!v) throw new Error(`${name} is not set`);
   return v;
 }
-function getSupabase(): SupabaseClient {
-  return createClient(requireEnv("SUPABASE_URL"), requireEnv("SUPABASE_SERVICE_ROLE_KEY"), {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
 
 /**
  * The company's own Zoho organisation and a token for it. This used to read
@@ -89,9 +85,9 @@ Deno.serve(async (req) => {
   } catch {
     return jsonResponse({ error: "Invalid JSON body" }, 400);
   }
-  // Runs with the service role, so nothing below checks who is asking
-  // unless this does. No default company: a fallback is how a bug
-  // becomes a cross-client leak instead of an error.
+  // Membership decides the company. No default company: a fallback is how
+  // a bug becomes a cross-client leak instead of an error. Everything below
+  // runs as the caller, under row-level security.
   const tenant = await companyForCaller(auth, {
     companyId: input.company_id ?? null,
     errorBody: (m) => ({ error: m }),
@@ -101,7 +97,10 @@ Deno.serve(async (req) => {
   const windowDays = Math.max(1, Math.min(90, input.window_days ?? 7));
 
   try {
-    const supabase = getSupabase();
+    // The caller's own identity: RLS scopes every read to their company.
+    const supabase = dataClient(auth, companyId);
+    // Vault token and the usage log are system records.
+    const system = systemClient();
 
     // --- Plan: read from Zoho (one metered call, tagged "usage-dashboard").
     // Cached in company_config-adjacent memory would be nicer; for now one
@@ -110,11 +109,11 @@ Deno.serve(async (req) => {
     let orgName: string | null = null;
     let planError: string | null = null;
     try {
-      const meter = createZohoMeter(supabase, {
+      const meter = createZohoMeter(system, {
         ...meterContextFromRequest(req, "usage-dashboard", "api-usage"),
         company_id: companyId,
       });
-      const z = await getAccessToken(supabase, companyId);
+      const z = await getAccessToken(system, companyId);
       const apiBase = Deno.env.get("ZOHO_API_BASE_URL")?.trim() || "https://www.zohoapis.com/books/v3";
       const res = await meter.fetch(`${apiBase}/organizations`, {
         headers: { Authorization: `Zoho-oauthtoken ${z.accessToken}` },

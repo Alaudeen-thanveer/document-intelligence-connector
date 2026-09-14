@@ -29,6 +29,7 @@ function requireEnv(name: string): string {
 
 
 
+/** Vault token access only — see _shared/db.ts. */
 export function getServiceClient(): SupabaseClient {
   return createClient(
     requireEnv("SUPABASE_URL"),

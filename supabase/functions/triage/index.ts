@@ -4,7 +4,8 @@
 // Auth: not exposed to the browser. Callers must use service_role (or a user
 // JWT). Anon Bearer is rejected — Situation B.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
+import { dataClient } from "../_shared/db.ts";
 import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 import { companyObjectPath, loadCompanyFile, StoredFileRefused, storageRef } from "../_shared/storage.ts";
@@ -259,17 +260,6 @@ async function classifyWithLlm(page1Text: string): Promise<Classification> {
   };
 }
 
-function getSupabase(): SupabaseClient {
-  const supabaseUrl = Deno.env.get("SUPABASE_URL");
-  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!supabaseUrl || !serviceKey) {
-    throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set");
-  }
-  return createClient(supabaseUrl, serviceKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
-
 async function persistClassification(
   supabase: SupabaseClient,
   input: TriageInput,
@@ -352,7 +342,9 @@ Deno.serve(async (req) => {
   }
 
   try {
-    const supabase = getSupabase();
+    // The caller's own identity when a person asked; the service role only
+    // for a machine caller with no person behind it.
+    const supabase = dataClient(auth, companyId);
     let classification = classifyByHeuristics(input.filename, input.sender);
 
     if (

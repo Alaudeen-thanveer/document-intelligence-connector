@@ -419,3 +419,69 @@ test("a row inserted without company_id lands in the caller's company, or nowher
   });
   assert.ok(orphan.status >= 400, `a document with no company was accepted (${orphan.status})`);
 });
+
+// --- 5. edge functions act as the caller, not as the service role ----------
+test("bank push, suggest and confirm cannot reach another company's lines", async () => {
+  const [st] = await svc("/rest/v1/bank_statements", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({ company_id: A.company, bank_account_zoho_id: "sec-bank", source: "paste", line_count: 1 }),
+  }).then((r) => r.json());
+  assert.ok(st?.id, "could not seed A's statement");
+  const [line] = await svc("/rest/v1/bank_statement_lines", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({ statement_id: st.id, company_id: A.company, line_no: 1, txn_date: "2026-08-01", description: "SEC PROBE A", side: "debit", amount: 123.45, status: "confirmed", chosen_txn_kind: "expense" }),
+  }).then((r) => r.json());
+  assert.ok(line?.id, "could not seed A's line");
+  try {
+    const push = await asUser(B)("/functions/v1/bank-statement", { method: "POST", body: JSON.stringify({ action: "push", company_id: B.company }) });
+    const pushText = await push.text();
+    assert.ok(!pushText.includes(line.id), `B's push returned A's line: ${pushText.slice(0, 200)}`);
+
+    const suggest = await asUser(B)("/functions/v1/bank-statement", { method: "POST", body: JSON.stringify({ action: "suggest", company_id: B.company, statement_id: st.id }) });
+    const suggestText = await suggest.text();
+    assert.ok(!suggestText.includes("SEC PROBE A"), `B's suggest returned A's lines: ${suggestText.slice(0, 200)}`);
+
+    const confirm = await asUser(B)("/functions/v1/bank-statement", {
+      method: "POST",
+      body: JSON.stringify({ action: "confirm", company_id: B.company, line_id: line.id, chosen_txn_kind: "expense", chosen_account_id: "attacker" }),
+    });
+    assert.equal(confirm.status, 404, `B confirmed A's line: ${await confirm.text()}`);
+
+    const [after] = await svc(`/rest/v1/bank_statement_lines?id=eq.${line.id}&select=status,chosen_account_id,suggestion,error`).then((r) => r.json());
+    assert.equal(after.status, "confirmed", "B's calls changed A's line status");
+    assert.equal(after.chosen_account_id, null, "B's confirm changed A's line");
+    assert.equal(after.error, null, "B's push touched A's line");
+  } finally {
+    await svc(`/rest/v1/bank_statement_lines?id=eq.${line.id}`, { method: "DELETE" });
+    await svc(`/rest/v1/bank_statements?id=eq.${st.id}`, { method: "DELETE" });
+  }
+});
+
+test("a function's write is attributed to the signed-in caller, not the service role", async () => {
+  const [doc] = await svc("/rest/v1/documents", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({ company_id: A.company, source: "upload", file_url: `storage://invoices/${A.company}/attrib-probe.pdf`, status: "needs_review", doc_type: "invoice" }),
+  }).then((r) => r.json());
+  assert.ok(doc?.id);
+  // Not connected to Zoho, so approve fails and marks the document — as the caller.
+  await asUser(A)("/functions/v1/zoho-approve", { method: "POST", body: JSON.stringify({ invoice_id: doc.id }) }).then((r) => r.text());
+  const events = await svc(`/rest/v1/approval_events?document_id=eq.${doc.id}&order=id`).then((r) => r.json());
+  const byFunction = events.filter((e) => e.action === "document_status_changed");
+  assert.ok(byFunction.length > 0, `zoho-approve left no status event: ${JSON.stringify(events)}`);
+  for (const e of byFunction) {
+    assert.equal(e.actor_role, "authenticated", `a function wrote as ${e.actor_role}`);
+    assert.equal(e.actor_user_id, A.userId, "the function's write is not attributed to the caller");
+  }
+});
+
+test("naming a company the caller is not a member of in x-company-id widens nothing", async () => {
+  await svc("/rest/v1/documents", {
+    method: "POST",
+    body: JSON.stringify({ company_id: B.company, source: "upload", file_url: `storage://invoices/${B.company}/hdr-probe.pdf`, status: "needs_review", doc_type: "invoice" }),
+  });
+  const rows = await asUser(A)(`/rest/v1/documents?company_id=eq.${B.company}&select=id`, { headers: { "x-company-id": B.company } }).then((r) => r.json());
+  assert.deepEqual(rows, [], "x-company-id opened another company's documents");
+});

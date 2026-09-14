@@ -9,12 +9,13 @@
 //   record_payments → { payments: [{vendor_id, date, paid_through_account_id, bills:[{bill_id, amount_applied}]}] }
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { corsHeaders } from "../_shared/cors.ts";
-import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
 import { fetchOpenCredits, fetchOpenDocuments } from "../bank-statement/suggest.ts";
 import { ageInvoices, buildChaseList, buildPaymentRun, creditCheck, validatePayment, type OpenInvoiceLike, type PayBehaviour } from "./cash.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { dataClient, systemClient } from "../_shared/db.ts";
 import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 
 let zohoFetch: typeof fetch = fetch;
@@ -27,9 +28,6 @@ function requireEnv(name: string): string {
   const v = Deno.env.get(name)?.trim();
   if (!v) throw new Error(`${name} is not set`);
   return v;
-}
-function getSupabase(): SupabaseClient {
-  return createClient(requireEnv("SUPABASE_URL"), requireEnv("SUPABASE_SERVICE_ROLE_KEY"), { auth: { persistSession: false, autoRefreshToken: false } });
 }
 
 /**
@@ -74,9 +72,9 @@ Deno.serve(async (req) => {
   } catch {
     return jsonResponse({ error: "Invalid JSON body" }, 400);
   }
-  // Runs with the service role, so nothing below checks who is asking
-  // unless this does. No default company: a fallback is how a bug
-  // becomes a cross-client leak instead of an error.
+  // Membership decides the company. No default company: a fallback is how
+  // a bug becomes a cross-client leak instead of an error. Everything below
+  // runs as the caller, under row-level security.
   const tenant = await companyForCaller(auth, {
     companyId: input.company_id ?? null,
     errorBody: (m) => ({ error: m }),
@@ -88,17 +86,20 @@ Deno.serve(async (req) => {
   const actor = (auth.user?.email as string | undefined) ?? "reviewer";
 
   try {
-    const supabase = getSupabase();
-    const meter = createZohoMeter(supabase, { ...meterContextFromRequest(req, "cashflow", `cashflow-${action}`), company_id: companyId });
+    // The caller's own identity: RLS scopes every read to their company.
+    const supabase = dataClient(auth, companyId);
+    // Vault token, the usage log and the audit log are system records.
+    const system = systemClient();
+    const meter = createZohoMeter(system, { ...meterContextFromRequest(req, "cashflow", `cashflow-${action}`), company_id: companyId });
     zohoFetch = meter.fetch;
-    const z = await getAccessToken(supabase, companyId);
+    const z = await getAccessToken(system, companyId);
     const orgId = z.organizationId;
     const { data: cfg } = await supabase.from("company_config")
       .select("payment_run_horizon_days, credit_limits, locked_until")
       .eq("company_id", companyId).maybeSingle();
     const lockedUntil = cfg?.locked_until ? String(cfg.locked_until) : null;
     const audit = (act: string, detail: Record<string, unknown>) =>
-      supabase.from("audit_log").insert({ company_id: companyId, actor_type: "human", actor_id: auth.user?.id ?? null, action: act, detail: { ...detail, actor } }).then(() => {}, () => {});
+      system.from("audit_log").insert({ company_id: companyId, actor_type: "human", actor_id: auth.user?.id ?? null, action: act, detail: { ...detail, actor } }).then(() => {}, () => {});
 
     // ------------------------------------------------------ collections
     if (action === "collections") {

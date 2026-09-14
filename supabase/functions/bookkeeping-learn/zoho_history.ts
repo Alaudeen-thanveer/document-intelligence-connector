@@ -4,7 +4,7 @@
  * the HistoryDoc the analysis layers consume. Bank transactions have their
  * own module; this one is the party->account documents.
  */
-import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
 import type { HistoryDoc } from "./analyze.ts";
 import { parseZohoLineTags } from "./tags_projects.ts";
@@ -65,17 +65,6 @@ export const KIND_META: Record<
     rootKey: "payment",
   },
 };
-
-export function getSupabase(): SupabaseClient {
-  const url = Deno.env.get("SUPABASE_URL");
-  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!url || !key) {
-    throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set");
-  }
-  return createClient(url, key, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
 
 
 // ---------------------------------------------------------------------------

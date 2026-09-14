@@ -1,9 +1,15 @@
 /**
  * Situation B: human-triggered edges require a real Supabase Auth user JWT.
- * Internal sibling calls (ingest → extract/judgment, inbound-email → ingest)
- * may authenticate with the service_role key instead.
+ * Internal sibling calls from background jobs (inbound-email → ingest →
+ * extract/judgment) may authenticate with the service_role key instead.
  *
  * Never treat the anon key as a signed-in user.
+ *
+ * The service role is recognised ONLY by an exact, constant-time match with
+ * SUPABASE_SERVICE_ROLE_KEY. It used to be recognised by decoding the JWT
+ * payload and reading `role` — without checking the signature — so any
+ * hand-made token saying "service_role" was treated as the system itself and
+ * could name any company. Only the gateway's JWT check stood in the way.
  */
 import { createClient, type User } from "npm:@supabase/supabase-js@2";
 import { corsHeaders } from "./cors.ts";
@@ -14,7 +20,22 @@ function requireEnv(name: string): string {
   return value;
 }
 
-function jwtRole(token: string): string | null {
+/** Equal strings, compared without an early exit. */
+function constantTimeEqual(a: string, b: string): boolean {
+  const enc = new TextEncoder();
+  const x = enc.encode(a);
+  const y = enc.encode(b);
+  let diff = x.length ^ y.length;
+  const n = Math.max(x.length, y.length);
+  for (let i = 0; i < n; i++) diff |= (x[i] ?? 0) ^ (y[i] ?? 0);
+  return diff === 0;
+}
+
+/**
+ * The `role` a token CLAIMS. Unverified: used only to refuse the anon key
+ * early, never to grant anything.
+ */
+function claimedRole(token: string): string | null {
   try {
     const parts = token.split(".");
     if (parts.length < 2) return null;
@@ -79,10 +100,7 @@ export async function requireAuth(
   }
 
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")?.trim() ?? "";
-  const role = jwtRole(token);
-  const isServiceRole =
-    (serviceKey.length > 0 && token === serviceKey) ||
-    role === "service_role";
+  const isServiceRole = serviceKey.length > 0 && constantTimeEqual(token, serviceKey);
 
   if (isServiceRole) {
     if (!opts?.allowServiceRole) {
@@ -91,8 +109,9 @@ export async function requireAuth(
     return { token, user: null, isServiceRole: true };
   }
 
-  // Anon key must not pass as a "user".
-  if (role === "anon") {
+  // Anon key must not pass as a "user". Anything else — including a token
+  // that merely claims service_role — must be a real session Auth accepts.
+  if (claimedRole(token) === "anon") {
     return unauthorized("Sign in required", cors, opts?.errorBody);
   }
 

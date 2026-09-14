@@ -5,7 +5,7 @@
 // Secrets (never hardcoded): MINDEE_API_KEY, GEMINI_API_KEY
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { corsHeaders } from "../_shared/cors.ts";
-import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { blobPart } from "../_shared/bytes.ts";
 import {
   extractLineItemsWithGemini,
@@ -14,6 +14,7 @@ import {
 import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 import { loadCompanyFile } from "../_shared/storage.ts";
+import { dataClient } from "../_shared/db.ts";
 
 const DEFAULT_EXTRACTION_CONFIDENCE_THRESHOLD = 0.8;
 const MINDEE_V1_INVOICE_URL =
@@ -73,16 +74,6 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-function getSupabase(): SupabaseClient {
-  const url = Deno.env.get("SUPABASE_URL");
-  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!url || !key) {
-    throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set");
-  }
-  return createClient(url, key, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
 
 function asNumber(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
@@ -770,8 +761,8 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: "document_id is required" }, 400);
   }
 
-  // This function runs with the service role, which bypasses row-level
-  // security — so establish the document is the caller's before touching it.
+  // Establish the document is the caller's before touching it; everything
+  // after runs as the caller, so row-level security applies too.
   const tenant = await companyForCaller(auth, {
     documentId: input.document_id,
     errorBody: (m) => ({ error: m }),
@@ -781,7 +772,10 @@ Deno.serve(async (req) => {
   const warnings: string[] = [];
 
   try {
-    const supabase = getSupabase();
+    // The caller's own identity when a person asked (RLS applies, and the
+    // file is signed under their storage policy); the service role only for
+    // the ingest pipeline behind inbound email.
+    const supabase = dataClient(auth, tenant.companyId);
 
     const { data: doc, error: docError } = await supabase
       .from("documents")

@@ -1,10 +1,11 @@
 /**
  * Which company is this caller allowed to act on?
  *
- * Edge functions run with the service role, which bypasses row-level security
- * by design. So RLS — which is airtight at the database — protects nothing
- * here, and the only thing standing between two clients is the function
- * asking who is calling. Before this module existed, most functions took
+ * Edge functions used to run everything with the service role, which bypasses
+ * row-level security, so the only thing standing between two clients was the
+ * function asking who is calling. They now act as the caller (_shared/db.ts)
+ * once this module has named the company, so RLS applies as a second wall —
+ * but this remains the first. Before this module existed, most functions took
  * `company_id` from the request body, or read it off whichever document id
  * they were handed, and acted on it. A signed-in user of any client could
  * read and change another client's records.
@@ -60,7 +61,11 @@ function refuse(
   };
 }
 
-/** A service-role client, for reading membership and the target document. */
+/**
+ * A service-role client, for reading membership and the target document's
+ * company — the authorisation decision itself, which cannot depend on the
+ * company RLS has not yet been told about. Nothing else is read here.
+ */
 function serviceClient(): SupabaseClient {
   const url = Deno.env.get("SUPABASE_URL")?.trim();
   const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")?.trim();

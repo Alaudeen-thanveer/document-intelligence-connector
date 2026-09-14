@@ -3,8 +3,8 @@
 // row, then runs extract + judgment. One path only; no parallel pipeline.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { corsHeaders } from "../_shared/cors.ts";
-import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
-import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
+import { type AuthOk, isAuthFail, requireAuth } from "../_shared/require_user.ts";
+import { dataClient, siblingHeaders } from "../_shared/db.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 import { assertSafeFile, MAX_FILE_BYTES, UnsafeFile } from "../_shared/file_safety.ts";
 import { companyObjectPath, StoredFileRefused, storageRef } from "../_shared/storage.ts";
@@ -43,14 +43,6 @@ function requireEnv(name: string): string {
   return v;
 }
 
-function getSupabase(): SupabaseClient {
-  return createClient(
-    requireEnv("SUPABASE_URL"),
-    requireEnv("SUPABASE_SERVICE_ROLE_KEY"),
-    { auth: { persistSession: false, autoRefreshToken: false } },
-  );
-}
-
 function sanitizeFilename(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120) || "document.pdf";
 }
@@ -62,18 +54,23 @@ function decodeBase64(b64: string): Uint8Array {
   return out;
 }
 
+/**
+ * Hand off to extract / judgment AS THE SAME CALLER: a person's JWT is passed
+ * through, so the sibling acts as them under row-level security; only the
+ * mailbox pipeline (a background job) continues as the service role.
+ */
 async function callSibling(
   name: "extract" | "judgment",
   body: Record<string, unknown>,
+  auth: AuthOk,
+  companyId: string,
 ): Promise<Record<string, unknown>> {
   const base = requireEnv("SUPABASE_URL").replace(/\/$/, "");
-  const key = requireEnv("SUPABASE_SERVICE_ROLE_KEY");
   const res = await fetch(`${base}/functions/v1/${name}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${key}`,
-      apikey: key,
+      ...siblingHeaders(auth, companyId),
     },
     body: JSON.stringify(body),
   });
@@ -148,7 +145,9 @@ Deno.serve(async (req) => {
   }
 
   try {
-    const supabase = getSupabase();
+    // The uploader's own identity (RLS and the storage policy apply to the
+    // upload and the row); the service role only for the mailbox pipeline.
+    const supabase = dataClient(auth, companyId);
     let fileUrl = "";
 
     if (input.file_base64) {
@@ -197,10 +196,10 @@ Deno.serve(async (req) => {
     }
 
     const documentId = doc.id as string;
-    const extract = await callSibling("extract", { document_id: documentId });
+    const extract = await callSibling("extract", { document_id: documentId }, auth, companyId);
     let judgment: Record<string, unknown> | null = null;
     if (!input.skip_judgment) {
-      judgment = await callSibling("judgment", { document_id: documentId });
+      judgment = await callSibling("judgment", { document_id: documentId }, auth, companyId);
     }
 
     const { data: finalDoc } = await supabase

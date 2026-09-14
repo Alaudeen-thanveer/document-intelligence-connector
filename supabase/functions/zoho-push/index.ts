@@ -26,7 +26,6 @@ import {
   fetchAccountsFromZoho,
   fetchVendorsFromZoho,
   findBillByNumber,
-  getSupabase,
   getZoho,
   getZohoBill,
   resultOk,
@@ -37,6 +36,7 @@ import {
 import { toZohoBillBody } from "./bill_body.ts";
 import { lookupDefaultAccountRule, resolveCurrencyAndTax } from "./money.ts";
 import { loadDocumentBytes } from "./documents.ts";
+import { dataClient, systemClient } from "../_shared/db.ts";
 import { assertHumanApproved, assertJudgmentsPassed, attachmentPresent } from "./guards.ts";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -82,8 +82,8 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: "document_id is required" }, 400);
   }
 
-  // This function runs with the service role, which bypasses row-level
-  // security — so establish the document is the caller's before touching it.
+  // Establish the document is the caller's before touching it; everything
+  // after runs as the caller, so row-level security applies too.
   const tenant = await companyForCaller(auth, {
     documentId: input.document_id,
     errorBody: (m) => ({ error: m }),
@@ -96,10 +96,13 @@ Deno.serve(async (req) => {
   let zAuth = await getZoho(companyId);
 
   try {
-    const supabase = getSupabase();
+    // The caller's own identity: RLS scopes every read and write to their company.
+    const supabase = dataClient(auth, companyId);
+    // The ERP sync log and the usage log are system records.
+    const system = systemClient();
     const meter = createZohoMeter(
-      supabase,
-      meterContextFromRequest(req, "push", "zoho-push"),
+      system,
+      { ...meterContextFromRequest(req, "push", "zoho-push"), company_id: companyId },
     );
     setZohoFetch(meter.fetch);
 
@@ -425,7 +428,7 @@ Deno.serve(async (req) => {
 
       // Record the sync before the attachment upload so a failed upload
       // cannot lead to a duplicate document on re-push.
-      const { data: syncRow, error: syncError } = await supabase
+      const { data: syncRow, error: syncError } = await system
         .from("erp_sync_log")
         .insert({
           document_id: input.document_id,
@@ -880,7 +883,7 @@ Deno.serve(async (req) => {
     );
     const attachInfo = attachmentPresent(getResult.raw);
 
-    const { data: syncRow, error: syncError } = await supabase
+    const { data: syncRow, error: syncError } = await system
       .from("erp_sync_log")
       .insert({
         document_id: input.document_id,

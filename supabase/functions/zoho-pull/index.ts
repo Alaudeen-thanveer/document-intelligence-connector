@@ -6,11 +6,12 @@
 // Credentials come only from environment variables — never hardcoded.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { corsHeaders } from "../_shared/cors.ts";
-import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { createZohoMeter, meterContextFromRequest } from "../_shared/zoho_meter.ts";
 import { isAuthFail, requireUser } from "../_shared/require_user.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
+import { systemClient } from "../_shared/db.ts";
 
 /** Set per request; every Zoho call goes through it so usage is metered. */
 let zohoFetch: (url: string, init?: RequestInit) => Promise<Response> = fetch;
@@ -73,16 +74,14 @@ function requireEnv(name: string): string {
   return value;
 }
 
-function getSupabase(): SupabaseClient {
-  const url = Deno.env.get("SUPABASE_URL");
-  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!url || !key) {
-    throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set");
-  }
-  return createClient(url, key, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
+/**
+ * This function reads nothing of the person's: it replaces the company's
+ * Zoho master-data cache (zoho_entities), which the browser's role can read
+ * but deliberately cannot write. That cache, the Vault token and the usage
+ * log are system records, so the service role is used for them only, always
+ * filtered by the company companyForCaller verified.
+ */
+const getSupabase = systemClient;
 
 
 
@@ -521,14 +520,17 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: "Invalid JSON body" }, 400);
   }
 
-  const kinds: EntityKind[] =
-    input.kinds && input.kinds.length > 0 ? input.kinds : ALL_KINDS;
+  // Only known kinds: each one is put into a Zoho request path and a query.
+  const kinds: EntityKind[] = Array.isArray(input.kinds) && input.kinds.length > 0
+    ? input.kinds.filter((k): k is EntityKind => (ALL_KINDS as string[]).includes(String(k)))
+    : ALL_KINDS;
+  if (kinds.length === 0) return jsonResponse({ ok: false, error: "No known kinds requested" }, 400);
 
   try {
     const supabase = getSupabase();
     const meter = createZohoMeter(
       supabase,
-      meterContextFromRequest(req, "sync", "zoho-pull"),
+      { ...meterContextFromRequest(req, "sync", "zoho-pull"), company_id: companyId },
     );
     zohoFetch = meter.fetch;
     let z = await getZoho(companyId);
