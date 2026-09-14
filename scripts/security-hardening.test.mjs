@@ -286,3 +286,70 @@ test("the invoices bucket is private and limits size and type", async () => {
   assert.ok(bucket.file_size_limit > 0 && bucket.file_size_limit <= 52428800);
   assert.deepEqual([...bucket.allowed_mime_types].sort(), ["application/pdf", "image/jpeg", "image/png", "image/webp"]);
 });
+
+// --- 3. approvals leave an append-only, attributable record ------------------
+test("an override and an approval made from the browser are recorded with the verified user", async () => {
+  const doc = await asUser(A)("/rest/v1/documents", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({ company_id: A.company, source: "upload", file_url: `storage://invoices/${A.company}/approval-probe.pdf`, status: "needs_review", doc_type: "invoice" }),
+  }).then((r) => r.json());
+  A.approvalDoc = doc?.[0]?.id;
+  assert.ok(A.approvalDoc, JSON.stringify(doc));
+
+  const check = await asUser(A)("/rest/v1/judgment_results", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({ document_id: A.approvalDoc, rule_name: "total_matches_lines", passed: false }),
+  }).then((r) => r.json());
+  assert.ok(check?.[0]?.id, JSON.stringify(check));
+
+  await asUser(A)(`/rest/v1/judgment_results?id=eq.${check[0].id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ passed: true, reviewed_by: "Somebody Else Entirely", notes: "override: reason" }),
+  });
+  await asUser(A)(`/rest/v1/documents?id=eq.${A.approvalDoc}`, { method: "PATCH", body: JSON.stringify({ status: "approved" }) });
+
+  const events = await asUser(A)(`/rest/v1/approval_events?document_id=eq.${A.approvalDoc}&order=id`).then((r) => r.json());
+  const override = events.find((e) => e.action === "check_overridden");
+  const approval = events.find((e) => e.action === "document_status_changed" && e.to_state === "approved");
+  assert.ok(override, `no override event: ${JSON.stringify(events)}`);
+  assert.ok(approval, `no approval event: ${JSON.stringify(events)}`);
+  assert.equal(override.actor_user_id, A.userId, "the override is not attributed to the signed-in user");
+  assert.equal(override.actor_label_self_reported, "Somebody Else Entirely");
+  assert.equal(approval.actor_user_id, A.userId);
+
+  const verify = await asUser(A)("/rest/v1/rpc/approval_events_verify", { method: "POST", body: JSON.stringify({ p_company_id: A.company }) }).then((r) => r.json());
+  assert.deepEqual(verify, [], `chain reported broken: ${JSON.stringify(verify)}`);
+});
+
+test("approval events cannot be written, changed or deleted by anyone", async () => {
+  const [event] = await svc(`/rest/v1/approval_events?company_id=eq.${A.company}&limit=1`).then((r) => r.json());
+  assert.ok(event, "no approval event to try against");
+  for (const [who, fetcher] of [["a member", asUser(A)], ["the service role", svc]]) {
+    const ins = await fetcher("/rest/v1/approval_events", {
+      method: "POST",
+      body: JSON.stringify({ company_id: A.company, subject_table: "documents", subject_id: "x", action: "forged", actor_role: "authenticated", row_hash: "\x00" }),
+    });
+    assert.ok(ins.status >= 400, `${who} inserted an approval event (${ins.status})`);
+    await fetcher(`/rest/v1/approval_events?id=eq.${event.id}`, { method: "PATCH", body: JSON.stringify({ to_state: "forged" }) });
+    await fetcher(`/rest/v1/approval_events?id=eq.${event.id}`, { method: "DELETE" });
+  }
+  const [still] = await svc(`/rest/v1/approval_events?id=eq.${event.id}`).then((r) => r.json());
+  assert.deepEqual(still, event, "an approval event was changed or removed");
+});
+
+test("another company sees none of the approval record, and cannot verify it", async () => {
+  const events = await asUser(B)(`/rest/v1/approval_events?company_id=eq.${A.company}`).then((r) => r.json());
+  assert.deepEqual(events, []);
+  const res = await asUser(B)("/rest/v1/rpc/approval_events_verify", { method: "POST", body: JSON.stringify({ p_company_id: A.company }) });
+  assert.notEqual(res.status, 200);
+});
+
+test("a member cannot forge audit_log rows from the browser", async () => {
+  const res = await asUser(A)("/rest/v1/audit_log", {
+    method: "POST",
+    body: JSON.stringify({ company_id: A.company, actor_type: "human", action: "approved", detail: { forged: true } }),
+  });
+  assert.ok(res.status >= 400, `browser inserted into audit_log (${res.status})`);
+});
