@@ -68,7 +68,16 @@ to echo the request's origin against a list, a small change in one file.
 
 **`MAILGUN_WEBHOOK_SKIP_VERIFY`** must not be set. It turns off the check
 that an inbound email really came from Mailgun. It exists for one local
-accuracy script and nothing else.
+accuracy script and nothing else, and is ignored on anything but a local
+stack. Signed webhooks must also be under five minutes old and are accepted
+once per token.
+
+**`MALWARE_SCAN_URL`** (and `MALWARE_SCAN_TOKEN`) name the scanner every
+stored file goes through (`_shared/file_safety.ts` has the contract). With
+none set, a hosted project **refuses every upload and inbound attachment** —
+deliberately. `MALWARE_SCAN_REQUIRED=false` accepts files unscanned; set it
+only as a conscious decision. A self-hosted stack whose `SUPABASE_URL` is
+`http://kong:8000` must also set `SECURITY_ENV=production`.
 
 **`ZOHO_REFRESH_TOKEN` and `ZOHO_ORGANIZATION_ID`** are not read by
 anything any more. Each company's organisation and token are connected per

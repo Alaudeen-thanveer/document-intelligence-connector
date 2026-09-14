@@ -5,26 +5,20 @@
  */
 import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { blobPart } from "../_shared/bytes.ts";
+import { loadCompanyFile } from "../_shared/storage.ts";
 import { publicError, withZohoRetry, zohoFetch } from "./zoho_client.ts";
 
-/** The document's bytes: private storage ref (storage://invoices/path), legacy public URL, or a fetchable URL. */
+/**
+ * The document's bytes: this company's folder of the document store only,
+ * through a short-lived signed URL. Never an arbitrary URL — a row pointing
+ * elsewhere used to be fetched, or another company's file downloaded.
+ */
 export async function loadDocumentBytes(
   supabase: SupabaseClient,
   fileUrl: string,
+  companyId: string,
 ): Promise<{ bytes: Uint8Array; contentType: string; filename: string }> {
-  let path: string | null = null;
-  if (fileUrl.startsWith("storage://invoices/")) path = fileUrl.slice("storage://invoices/".length);
-  const publicMarker = "/storage/v1/object/public/invoices/";
-  const idx = fileUrl.indexOf(publicMarker);
-  if (!path && idx >= 0) path = decodeURIComponent(fileUrl.slice(idx + publicMarker.length));
-  if (path) {
-    const { data, error } = await supabase.storage.from("invoices").download(path);
-    if (error || !data) throw new Error(`storage download failed: ${error?.message ?? "no data"}`);
-    return { bytes: new Uint8Array(await data.arrayBuffer()), contentType: data.type || "application/pdf", filename: path.split("/").pop() || "document.pdf" };
-  }
-  const res = await fetch(fileUrl);
-  if (!res.ok) throw new Error(`fetch document failed (${res.status})`);
-  return { bytes: new Uint8Array(await res.arrayBuffer()), contentType: res.headers.get("content-type") ?? "application/pdf", filename: fileUrl.split("/").pop()?.split("?")[0] || "document.pdf" };
+  return await loadCompanyFile(supabase, fileUrl, companyId);
 }
 
 /** Attach the source document to the Zoho record. Best effort; never undoes the document. */
@@ -37,7 +31,7 @@ export async function attachDocument(
 ): Promise<{ uploaded: boolean; filename?: string; error?: string }> {
   if (!fileUrl) return { uploaded: false, error: "no file on document" };
   try {
-    const file = await loadDocumentBytes(supabase, fileUrl);
+    const file = await loadDocumentBytes(supabase, fileUrl, companyId);
     const result = await withZohoRetry(companyId, async (z) => {
       const form = new FormData();
       form.append(fieldName, new Blob([blobPart(file.bytes)], { type: file.contentType }), file.filename);

@@ -13,6 +13,7 @@ import {
 } from "./gemini_fallback.ts";
 import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { loadCompanyFile } from "../_shared/storage.ts";
 
 const DEFAULT_EXTRACTION_CONFIDENCE_THRESHOLD = 0.8;
 const MINDEE_V1_INVOICE_URL =
@@ -133,58 +134,17 @@ function resolveOcrConfidence(
   return 1;
 }
 
-/** Load invoice bytes; prefer Storage client so Docker-local 127.0.0.1 URLs work. */
+/**
+ * Load invoice bytes from the document store: this company's folder only,
+ * through a short-lived signed URL. Never an arbitrary URL — see
+ * _shared/storage.ts.
+ */
 async function loadDocumentBytes(
   supabase: SupabaseClient,
   fileUrl: string,
+  companyId: string,
 ): Promise<{ bytes: Uint8Array; contentType: string; filename: string }> {
-  const markers = [
-    "/storage/v1/object/public/invoices/",
-    "/storage/v1/object/sign/invoices/",
-    "/storage/v1/object/authenticated/invoices/",
-    "storage://invoices/",
-  ];
-  let path: string | null = null;
-  for (const marker of markers) {
-    const idx = fileUrl.indexOf(marker);
-    if (idx >= 0) {
-      path = decodeURIComponent(fileUrl.slice(idx + marker.length).split("?")[0]);
-      break;
-    }
-  }
-  if (!path && !fileUrl.includes("://") && fileUrl.includes("/")) {
-    path = fileUrl.split("?")[0];
-  }
-
-  if (path) {
-    const { data, error } = await supabase.storage.from("invoices").download(path);
-    if (error || !data) {
-      throw new Error(`storage download failed: ${error?.message ?? "no data"}`);
-    }
-    const bytes = new Uint8Array(await data.arrayBuffer());
-    return {
-      bytes,
-      contentType: data.type || "application/pdf",
-      filename: path.split("/").pop() || "document.pdf",
-    };
-  }
-
-  // Rewrite host loopback for functions running inside Docker.
-  const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "http://127.0.0.1:54321";
-  const fetchable = fileUrl
-    .replace("http://127.0.0.1:54321", supabaseUrl)
-    .replace("http://localhost:54321", supabaseUrl);
-
-  const fileRes = await fetch(fetchable);
-  if (!fileRes.ok) {
-    throw new Error(`Failed to fetch document file (${fileRes.status})`);
-  }
-  const bytes = new Uint8Array(await fileRes.arrayBuffer());
-  return {
-    bytes,
-    contentType: fileRes.headers.get("content-type") ?? "application/pdf",
-    filename: fileUrl.split("/").pop()?.split("?")[0] || "document.pdf",
-  };
+  return await loadCompanyFile(supabase, fileUrl, companyId);
 }
 
 function pickField(
@@ -318,6 +278,7 @@ async function callMindeeV2(
 async function callMindeeInvoice(
   supabase: SupabaseClient,
   fileUrl: string,
+  companyId: string,
 ): Promise<{ prediction: Record<string, unknown>; raw: unknown }> {
   const apiKey = Deno.env.get("MINDEE_API_KEY");
   if (!apiKey) throw new Error("MINDEE_API_KEY is not set");
@@ -325,6 +286,7 @@ async function callMindeeInvoice(
   const { bytes, contentType, filename } = await loadDocumentBytes(
     supabase,
     fileUrl,
+    companyId,
   );
 
   const modelId = Deno.env.get("MINDEE_MODEL_ID")?.trim();
@@ -853,9 +815,9 @@ Deno.serve(async (req) => {
     let visionImageUrl = doc.file_url;
 
     try {
-      const loaded = await loadDocumentBytes(supabase, doc.file_url);
+      const loaded = await loadDocumentBytes(supabase, doc.file_url, String(doc.company_id));
       visionImageUrl = bytesToDataUrl(loaded.bytes, loaded.contentType);
-      const mindee = await callMindeeInvoice(supabase, doc.file_url);
+      const mindee = await callMindeeInvoice(supabase, doc.file_url, String(doc.company_id));
       prediction = mindee.prediction;
       rawOcr = mindee.raw;
     } catch (err) {

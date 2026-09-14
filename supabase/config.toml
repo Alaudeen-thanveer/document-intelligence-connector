@@ -125,9 +125,11 @@ file_size_limit = "50MiB"
 # objects_path = "./images"
 
 [storage.buckets.invoices]
-public = true
+# Private: client invoices and bank statements are opened only through
+# short-lived signed URLs. Must match migration 20260914110000.
+public = false
 file_size_limit = "50MiB"
-allowed_mime_types = ["application/pdf", "image/png", "image/jpeg", "image/jpg", "image/webp"]
+allowed_mime_types = ["application/pdf", "image/png", "image/jpeg", "image/webp"]
 
 # Allow connections via S3 compatible clients
 [storage.s3_protocol]

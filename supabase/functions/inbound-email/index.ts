@@ -3,21 +3,28 @@
 // attachments, and feeds them into the shared `ingest` function — same path
 // as manual upload. No Gmail/Outlook OAuth.
 //
-// Auth: Mailgun HMAC signature only (not a user JWT). After verify, calls
-// ingest with service_role. Do not require Sign-in here.
+// Auth: Mailgun HMAC signature only (not a user JWT) — see _shared/mailgun.ts
+// for the timestamp window and replay check. After verify, calls ingest with
+// service_role: a background job with no user behind it. Do not require
+// Sign-in here.
+//
+// This is the only unauthenticated way into a client's books, so it refuses
+// early and cheaply: oversized bodies before parsing, unsigned or replayed
+// webhooks before reading attachments, and attachments whose bytes are not a
+// PDF or image before they reach ingest (which scans them for malware).
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { corsHeaders } from "../_shared/cors.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
+import { verifyMailgunWebhook } from "../_shared/mailgun.ts";
+import { MAX_FILE_BYTES, sniffFileType } from "../_shared/file_safety.ts";
 
 const CORS_HEADERS = corsHeaders("authorization, content-type, apikey, x-client-info");
 
-const ALLOWED_TYPES = new Set([
-  "application/pdf",
-  "image/png",
-  "image/jpeg",
-  "image/jpg",
-  "image/webp",
-]);
+/** Mailgun accepts messages up to 25 MB; leave room for multipart overhead. */
+const MAX_BODY_BYTES = 40 * 1024 * 1024;
+/** More attachments than this on one email is not an invoice run. */
+const MAX_ATTACHMENTS = 10;
+const EMAIL_ADDRESS = /^[a-z0-9._+-]{1,64}@[a-z0-9.-]{1,253}$/;
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -38,40 +45,6 @@ function getSupabase(): SupabaseClient {
     requireEnv("SUPABASE_SERVICE_ROLE_KEY"),
     { auth: { persistSession: false, autoRefreshToken: false } },
   );
-}
-
-/** Mailgun webhook signature check. Skipped when MAILGUN_WEBHOOK_SKIP_VERIFY=true. */
-async function verifyMailgunSignature(
-  timestamp: string,
-  token: string,
-  signature: string,
-): Promise<boolean> {
-  if ((Deno.env.get("MAILGUN_WEBHOOK_SKIP_VERIFY") ?? "").toLowerCase() === "true") {
-    return true;
-  }
-  const key = Deno.env.get("MAILGUN_SIGNING_KEY")?.trim();
-  if (!key) {
-    throw new Error(
-      "MAILGUN_SIGNING_KEY is not set (or set MAILGUN_WEBHOOK_SKIP_VERIFY=true for local tests)",
-    );
-  }
-  const enc = new TextEncoder();
-  const cryptoKey = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(key),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const sigBuf = await crypto.subtle.sign(
-    "HMAC",
-    cryptoKey,
-    enc.encode(timestamp + token),
-  );
-  const hex = [...new Uint8Array(sigBuf)]
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-  return hex === signature;
 }
 
 function normalizeRecipient(raw: string): string {
@@ -133,11 +106,24 @@ Deno.serve(async (req) => {
       );
     }
 
+    // Refuse an oversized body before parsing it: formData() buffers it all.
+    const declaredLength = Number(req.headers.get("content-length") ?? NaN);
+    if (!Number.isFinite(declaredLength)) {
+      return jsonResponse({ ok: false, error: "Content-Length is required" }, 411);
+    }
+    if (declaredLength > MAX_BODY_BYTES) {
+      return jsonResponse({ ok: false, error: "Message too large" }, 413);
+    }
+
     const form = await req.formData();
-    const timestamp = String(form.get("timestamp") ?? "");
-    const token = String(form.get("token") ?? "");
-    const signature = String(form.get("signature") ?? "");
-    if (!(await verifyMailgunSignature(timestamp, token, signature))) {
+    const supabase = getSupabase();
+    const verdict = await verifyMailgunWebhook(supabase, {
+      timestamp: String(form.get("timestamp") ?? ""),
+      token: String(form.get("token") ?? ""),
+      signature: String(form.get("signature") ?? ""),
+    });
+    if (!verdict.ok) {
+      console.warn(`inbound-email refused: ${verdict.reason}`);
       return jsonResponse({ ok: false, error: "Invalid Mailgun signature" }, 401);
     }
 
@@ -145,7 +131,7 @@ Deno.serve(async (req) => {
       form.get("recipient") ?? form.get("To") ?? form.get("to") ?? "",
     );
     const recipient = normalizeRecipient(recipientRaw);
-    if (!recipient) {
+    if (!recipient || !EMAIL_ADDRESS.test(recipient)) {
       return jsonResponse({ ok: false, error: "Missing recipient" }, 400);
     }
 
@@ -153,57 +139,48 @@ Deno.serve(async (req) => {
       null;
     const subject = String(form.get("subject") ?? form.get("Subject") ?? "") || null;
 
-    const supabase = getSupabase();
+    // Exact match. This was .ilike(), where % and _ are wildcards: mail to
+    // acme-%@… matched Acme's address without knowing its random suffix.
+    // Addresses are stored lower-case (enforced by constraint).
     const { data: company, error: coErr } = await supabase
       .from("company_config")
-      .select("company_id, inbound_email, company_slug")
-      .ilike("inbound_email", recipient)
+      .select("company_id")
+      .eq("inbound_email", recipient)
       .maybeSingle();
 
-    if (coErr) throw new Error(coErr.message);
+    if (coErr) throw new Error("Could not look up the inbound address");
     if (!company) {
-      return jsonResponse(
-        {
-          ok: false,
-          error: `No company mapped to inbound address ${recipient}`,
-        },
-        404,
-      );
+      return jsonResponse({ ok: false, error: "No company mapped to that inbound address" }, 404);
     }
 
-    // Mailgun: attachment-1..N plus attachment-count
-    const attachments: Array<{ filename: string; type: string; bytes: Uint8Array }> = [];
-    const count = Number(form.get("attachment-count") ?? 0);
+    // Mailgun: attachment-1..N plus attachment-count. Some providers / local
+    // harnesses send a single "attachment" or "file" instead.
+    const files: File[] = [];
+    const count = Math.min(Number(form.get("attachment-count") ?? 0) || 0, MAX_ATTACHMENTS + 1);
     if (count > 0) {
       for (let i = 1; i <= count; i++) {
         const file = form.get(`attachment-${i}`);
-        if (file instanceof File) {
-          const type = (file.type || "application/octet-stream").split(";")[0];
-          if (!ALLOWED_TYPES.has(type) && !file.name.toLowerCase().endsWith(".pdf")) {
-            continue;
-          }
-          attachments.push({
-            filename: file.name || `attachment-${i}.pdf`,
-            type: ALLOWED_TYPES.has(type) ? type : "application/pdf",
-            bytes: new Uint8Array(await file.arrayBuffer()),
-          });
-        }
+        if (file instanceof File) files.push(file);
       }
     } else {
-      // Some providers / local harnesses send a single "attachment"
       for (const [key, value] of form.entries()) {
         if (value instanceof File && (key.startsWith("attachment") || key === "file")) {
-          const type = (value.type || "application/octet-stream").split(";")[0];
-          if (!ALLOWED_TYPES.has(type) && !value.name.toLowerCase().endsWith(".pdf")) {
-            continue;
-          }
-          attachments.push({
-            filename: value.name || "attachment.pdf",
-            type: ALLOWED_TYPES.has(type) ? type : "application/pdf",
-            bytes: new Uint8Array(await value.arrayBuffer()),
-          });
+          files.push(value);
         }
       }
+    }
+    if (files.length > MAX_ATTACHMENTS) {
+      return jsonResponse({ ok: false, error: `More than ${MAX_ATTACHMENTS} attachments` }, 413);
+    }
+
+    // The type is what the bytes are, not what the sender claims.
+    const attachments: Array<{ filename: string; type: string; bytes: Uint8Array }> = [];
+    for (const [i, file] of files.entries()) {
+      if (file.size === 0 || file.size > MAX_FILE_BYTES) continue;
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const type = sniffFileType(bytes);
+      if (!type) continue;
+      attachments.push({ filename: file.name || `attachment-${i + 1}`, type, bytes });
     }
 
     if (attachments.length === 0) {
@@ -242,6 +219,7 @@ Deno.serve(async (req) => {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("inbound-email failed:", message);
-    return jsonResponse({ ok: false, error: message }, 500);
+    // The caller is unauthenticated: no internal detail in the answer.
+    return jsonResponse({ ok: false, error: "Inbound email could not be processed" }, 500);
   }
 });

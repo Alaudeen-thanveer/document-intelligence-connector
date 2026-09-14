@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useOutletContext } from "react-router-dom";
 import type { AppOutletContext } from "../layout/AppLayout";
-import { callEdgeFunction, newActionId } from "../lib/functions";
+import { callEdgeFunction, currentCompanyId, newActionId } from "../lib/functions";
+import { storageRefFromPath } from "../lib/storagePath";
 import { supabase } from "../lib/supabase";
 
 /**
@@ -370,11 +371,15 @@ export function BankPage() {
       return;
     }
     setBusy("upload");
-    const path = `statements/${crypto.randomUUID()}-${file.name.replace(/[^A-Za-z0-9._-]/g, "_")}`;
+    // The bucket is private and folders are per company: the file goes under
+    // this company's folder, and the function is handed a storage ref it
+    // opens with a signed URL — never a public URL.
+    const companyId = await currentCompanyId().catch(() => null);
+    if (!companyId) { setBusy(null); setError("Choose a company before uploading a statement."); return; }
+    const path = `${companyId}/statements/${crypto.randomUUID()}-${file.name.replace(/[^A-Za-z0-9._-]/g, "_")}`;
     const { error: upErr } = await supabase.storage.from("invoices").upload(path, file, { contentType: file.type, upsert: false });
     if (upErr) { setBusy(null); setError(upErr.message); return; }
-    const { data } = supabase.storage.from("invoices").getPublicUrl(path);
-    await ingest({ source: "upload_pdf", file_url: data.publicUrl, original_name: file.name });
+    await ingest({ source: "upload_pdf", file_url: storageRefFromPath(path), original_name: file.name, company_id: companyId });
   }
 
   // ---- decide --------------------------------------------------------

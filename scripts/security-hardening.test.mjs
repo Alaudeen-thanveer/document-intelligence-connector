@@ -14,7 +14,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 
 function env() {
   const file = process.env.ENV_FILE ?? new URL("../.env", import.meta.url);
@@ -153,4 +153,136 @@ test("a stored access token is readable only through Vault, and deleted with its
     body: JSON.stringify({ p_company_id: A.company }),
   }).then((r) => r.json());
   assert.deepEqual(after, [], "the token outlived its connection");
+});
+
+// --- 2. the email ingest path, signed URLs, file safety ---------------------
+/**
+ * These need the functions served with a known MAILGUN_SIGNING_KEY, e.g. an
+ * env file with MAILGUN_SIGNING_KEY set, passed to both `functions serve
+ * --env-file` and this suite as ENV_FILE. Without one they are skipped.
+ */
+const SIGNING_KEY = ENV.MAILGUN_SIGNING_KEY;
+
+function signedForm({ recipient, token = randomUUID().replace(/-/g, ""), timestamp = Math.floor(Date.now() / 1000), file }) {
+  const form = new FormData();
+  const ts = String(timestamp);
+  form.append("timestamp", ts);
+  form.append("token", token);
+  form.append("signature", SIGNING_KEY ? createHmac("sha256", SIGNING_KEY).update(ts + token).digest("hex") : "0".repeat(64));
+  form.append("recipient", recipient);
+  form.append("sender", "vendor@example.com");
+  form.append("attachment-count", "1");
+  form.append("attachment-1", new Blob([file ?? "this is not a pdf"], { type: "application/pdf" }), "invoice.pdf");
+  return form;
+}
+
+const postInbound = (form) =>
+  fetch(`${URL_}/functions/v1/inbound-email`, { method: "POST", headers: { apikey: ANON, Authorization: `Bearer ${ANON}` }, body: form });
+
+async function inboundAddress(t) {
+  if (t.inbound) return t.inbound;
+  const res = await svc("/rest/v1/rpc/assign_inbound_email", {
+    method: "POST",
+    body: JSON.stringify({ p_company_id: t.company, p_slug: `sec-${t === A ? "a" : "b"}`, p_domain: "in.security.test" }),
+  });
+  const text = await res.text();
+  assert.equal(res.status, 200, text);
+  t.inbound = JSON.parse(text);
+  return t.inbound;
+}
+
+test("inbound-email refuses an unsigned or wrongly signed webhook", async () => {
+  const form = signedForm({ recipient: await inboundAddress(A) });
+  form.set("signature", "0".repeat(64));
+  const res = await postInbound(form);
+  assert.equal(res.status, 401, await res.text());
+});
+
+test("inbound-email refuses a stale timestamp even when correctly signed", { skip: !SIGNING_KEY }, async () => {
+  const res = await postInbound(signedForm({ recipient: await inboundAddress(A), timestamp: Math.floor(Date.now() / 1000) - 3600 }));
+  assert.equal(res.status, 401, await res.text());
+});
+
+test("inbound-email accepts a signature token once only", { skip: !SIGNING_KEY }, async () => {
+  const token = `replay${randomUUID().replace(/-/g, "")}`;
+  const first = await postInbound(signedForm({ recipient: await inboundAddress(A), token }));
+  // Past the signature: refused only because the attachment is not a real PDF.
+  assert.equal(first.status, 400, await first.text());
+  const again = await postInbound(signedForm({ recipient: await inboundAddress(A), token }));
+  assert.equal(again.status, 401, `a replayed token was accepted: ${await again.text()}`);
+});
+
+test("inbound-email does not treat % or _ in the recipient as wildcards", { skip: !SIGNING_KEY }, async () => {
+  const real = await inboundAddress(A);
+  const wildcard = real.replace(/-[a-z0-9]+@/, "-%@");
+  const res = await postInbound(signedForm({ recipient: wildcard }));
+  const text = await res.text();
+  // Refused at the recipient, before any company's attachments are looked at.
+  assert.ok([400, 404].includes(res.status) && !/attachment/i.test(text), `a wildcard address reached a company: ${res.status} ${text}`);
+});
+
+test("inbound-email judges attachments by their bytes, not their name or type", { skip: !SIGNING_KEY }, async () => {
+  const res = await postInbound(signedForm({ recipient: await inboundAddress(A), file: "MZ\x90\x00 pretending to be a pdf" }));
+  assert.equal(res.status, 400, await res.text());
+  const docs = await svc(`/rest/v1/documents?company_id=eq.${A.company}&source=eq.email&select=id`).then((r) => r.json());
+  assert.deepEqual(docs, [], "a non-PDF attachment became a document");
+});
+
+test("ingest refuses bytes that are not a PDF or image, whatever the claimed type", async () => {
+  const res = await asUser(A)("/functions/v1/ingest", {
+    method: "POST",
+    body: JSON.stringify({
+      company_id: A.company, source: "upload", filename: "invoice.pdf", content_type: "application/pdf",
+      file_base64: Buffer.from("<html><script>alert(1)</script></html>").toString("base64"), skip_judgment: true,
+    }),
+  });
+  assert.equal(res.status, 422, await res.text());
+});
+
+test("functions refuse file references outside the caller's company folder", async () => {
+  const cases = [
+    ["ingest", { company_id: A.company, filename: "x.pdf", file_url: "http://169.254.169.254/latest/meta-data/" }],
+    ["ingest", { company_id: A.company, filename: "x.pdf", file_url: `storage://invoices/${B.company}/secret.pdf` }],
+    ["ingest", { company_id: A.company, filename: "x.pdf", file_url: `storage://invoices/${A.company}/../${B.company}/secret.pdf` }],
+    ["triage", { company_id: A.company, filename: "x.pdf", sender: "a@b.c", file_url: "http://kong:8000/rest/v1/" }],
+    ["bank-statement", { action: "ingest", company_id: A.company, bank_account_zoho_id: "1", source: "upload_pdf", file_url: "http://example.com/s.pdf" }],
+  ];
+  for (const [fn, body] of cases) {
+    const res = await asUser(A)(`/functions/v1/${fn}`, { method: "POST", body: JSON.stringify(body) });
+    const text = await res.text();
+    assert.equal(res.status, 404, `${fn} did not refuse ${body.file_url}: ${res.status} ${text.slice(0, 200)}`);
+  }
+});
+
+test("a member cannot rewrite their company's inbound address from the browser", async () => {
+  const address = await inboundAddress(A);
+  const res = await asUser(A)(`/rest/v1/company_config?company_id=eq.${A.company}`, {
+    method: "PATCH",
+    body: JSON.stringify({ inbound_email: "hijack@in.security.test" }),
+  });
+  assert.ok(res.status >= 400, `browser changed inbound_email (${res.status})`);
+  const [row] = await svc(`/rest/v1/company_config?company_id=eq.${A.company}&select=inbound_email`).then((r) => r.json());
+  assert.equal(row.inbound_email, address);
+  const other = await asUser(A)(`/rest/v1/company_config?company_id=eq.${A.company}`, {
+    method: "PATCH",
+    body: JSON.stringify({ company_name: "Security Test A" }),
+  });
+  assert.ok(other.ok, `ordinary settings stopped being editable: ${await other.text()}`);
+});
+
+test("the mailbox assignment RPC refuses the browser's keys", async () => {
+  for (const fetcher of [anon, asUser(A)]) {
+    const res = await fetcher("/rest/v1/rpc/assign_inbound_email", {
+      method: "POST",
+      body: JSON.stringify({ p_company_id: B.company, p_slug: "x" }),
+    });
+    assert.ok(res.status >= 400, `assign_inbound_email answered ${res.status}`);
+  }
+});
+
+test("the invoices bucket is private and limits size and type", async () => {
+  const bucket = await svc("/storage/v1/bucket/invoices").then((r) => r.json());
+  assert.equal(bucket.public, false);
+  assert.ok(bucket.file_size_limit > 0 && bucket.file_size_limit <= 52428800);
+  assert.deepEqual([...bucket.allowed_mime_types].sort(), ["application/pdf", "image/jpeg", "image/png", "image/webp"]);
 });

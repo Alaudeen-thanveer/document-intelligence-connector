@@ -94,8 +94,14 @@ export function DocumentViewer({
         const path = invoiceStoragePath(fileUrl);
         setIsPdf(looksLikePdf(path, fileUrl));
 
+        // Only files in the private store are opened, and only through a
+        // signed URL. A row pointing anywhere else is not followed: that
+        // would make the reviewer's browser load an address someone typed.
         if (!path) {
-          if (!cancelled) setUrl(fileUrl);
+          if (!cancelled) {
+            setUrl(null);
+            setError("This document's file is not in the document store, so it cannot be opened.");
+          }
           return;
         }
 

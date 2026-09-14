@@ -39,6 +39,8 @@ import { isProposableAsZohoRule, zohoRuleBodyForPattern, type ZohoBankRule } fro
 import { attachTargetFor, buildLineEvidence, textToPdf } from "./evidence.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
 import { zohoAuthFor, type ZohoAuth } from "../_shared/zoho_auth.ts";
+import { companyObjectPath, loadCompanyFile, StoredFileRefused, storageRef } from "../_shared/storage.ts";
+import { assertSafeFile, UnsafeFile } from "../_shared/file_safety.ts";
 
 const CORS_HEADERS = corsHeaders();
 
@@ -74,15 +76,17 @@ async function getAccessToken(
  * Read a statement PDF/image with the vision model and return loose rows;
  * normalisation happens in parse.ts so PDF and CSV come out identical.
  */
-async function rowsFromFile(fileUrl: string): Promise<{ rows: Array<Record<string, unknown>>; meta: Record<string, unknown> }> {
+async function rowsFromFile(supabase: SupabaseClient, fileUrl: string, companyId: string): Promise<{ rows: Array<Record<string, unknown>>; meta: Record<string, unknown> }> {
   const apiKey = requireEnv("GEMINI_API_KEY");
   const modelName = Deno.env.get("GEMINI_MODEL")?.trim() || "gemini-3.6-flash";
-  const res = await fetch(fileUrl);
-  if (!res.ok) throw new Error(`Could not fetch statement file (${res.status})`);
-  const bytes = new Uint8Array(await res.arrayBuffer());
+  // This company's folder of the document store only, via a signed URL; an
+  // arbitrary URL here used to be fetched by the server as given (SSRF).
+  const file = await loadCompanyFile(supabase, fileUrl, companyId);
+  const bytes = file.bytes;
+  // What the bytes are, not what the upload claimed; anything else is refused.
+  const mimeType = await assertSafeFile(bytes, file.filename);
   let binary = "";
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  const mimeType = res.headers.get("content-type")?.split(";")[0] || "application/pdf";
 
   const model = new GoogleGenerativeAI(apiKey).getGenerativeModel({
     model: modelName,
@@ -220,6 +224,7 @@ async function attachStatementEvidence(
   kind: string,
   zohoId: string,
   actor: string,
+  companyId: string,
 ): Promise<{ attached: boolean; filename?: string; error?: string }> {
   const target = attachTargetFor(kind, zohoId);
   if (!target) return { attached: false, error: "no attachment slot for this record kind" };
@@ -242,11 +247,9 @@ async function attachStatementEvidence(
     // evidence must not vanish because the file could not travel.
     if (stmt.file_url && stmt.file_url.startsWith("storage://invoices/")) {
       try {
-        const path = stmt.file_url.slice("storage://invoices/".length);
-        const { data, error } = await supabase.storage.from("invoices").download(path);
-        if (error || !data) throw new Error(`storage download failed: ${error?.message ?? "no data"}`);
-        const filename = stmt.original_name ?? path.split("/").pop() ?? "statement";
-        const first = await upload(new Uint8Array(await data.arrayBuffer()), data.type || "application/octet-stream", filename);
+        const file = await loadCompanyFile(supabase, stmt.file_url, companyId);
+        const filename = stmt.original_name ?? file.filename ?? "statement";
+        const first = await upload(file.bytes, file.contentType || "application/octet-stream", filename);
         if (first.ok) return { attached: true, filename };
         console.warn(`statement file not attachable (${first.message}) — PDF note instead`);
       } catch (err) {
@@ -396,10 +399,25 @@ Deno.serve(async (req) => {
 
       let parsed: ParseResult;
       let meta: Record<string, unknown> = {};
+      // A statement file must be in this company's folder of the store; the
+      // row keeps the canonical storage ref, never a URL the caller supplied.
+      let storedFileRef: string | null = null;
+      if (input.file_url) {
+        try {
+          storedFileRef = storageRef(companyObjectPath(String(input.file_url), companyId));
+        } catch (err) {
+          if (err instanceof StoredFileRefused) return jsonResponse({ ok: false, error: err.message }, 404);
+          throw err;
+        }
+      }
       if (input.text && String(input.text).trim()) {
         parsed = parseStatementText(String(input.text), { monthFirst });
-      } else if (input.file_url) {
-        const r = await rowsFromFile(String(input.file_url));
+      } else if (storedFileRef) {
+        const r = await rowsFromFile(supabase, storedFileRef, companyId).catch((err) => {
+          if (err instanceof UnsafeFile || err instanceof StoredFileRefused) return err;
+          throw err;
+        });
+        if (r instanceof Error) return jsonResponse({ ok: false, error: r.message }, r instanceof UnsafeFile ? 422 : 404);
         parsed = normalizeModelRows(r.rows, { monthFirst });
         meta = r.meta;
       } else {
@@ -414,7 +432,7 @@ Deno.serve(async (req) => {
       const { data: st, error: stErr } = await supabase.from("bank_statements").insert({
         company_id: companyId, bank_account_zoho_id: bankAccountId,
         bank_account_name: acct?.name ?? (input.bank_account_name ?? null),
-        source, file_url: input.file_url ?? null, original_name: input.original_name ?? null,
+        source, file_url: storedFileRef, original_name: input.original_name ?? null,
         currency: input.currency ?? meta.currency ?? null,
         period_start: dates[0], period_end: dates[dates.length - 1],
         line_count: parsed.lines.length, skipped_rows: parsed.skipped,
@@ -573,7 +591,7 @@ Deno.serve(async (req) => {
               attach = await attachStatementEvidence(supabase, meter.fetch, z,
                 { line_no: Number(line.line_no), txn_date: String(line.txn_date), description: String(line.description ?? ""), reference: (line.reference as string | null) ?? null, side: line.side as "debit" | "credit", amount: Number(line.amount) },
                 { bank_account_name: (stmtRow.bank_account_name as string | null) ?? null, bank_account_zoho_id: String(stmtRow.bank_account_zoho_id), period_start: (stmtRow.period_start as string | null) ?? null, period_end: (stmtRow.period_end as string | null) ?? null, source: String(stmtRow.source), original_name: (stmtRow.original_name as string | null) ?? null, currency: (stmtRow.currency as string | null) ?? null, file_url: (stmtRow.file_url as string | null) ?? null },
-                String((line as { chosen_txn_kind?: string }).chosen_txn_kind ?? r.kind), r.zoho_id, actor);
+                String((line as { chosen_txn_kind?: string }).chosen_txn_kind ?? r.kind), r.zoho_id, actor, companyId);
             }
           }
           await supabase.from("bank_statement_lines").update({ status: "posted", zoho_txn_id: r.zoho_id, zoho_payload: r.payload, zoho_extra_ids: r.extra, posted_at: new Date().toISOString(), error: null }).eq("id", line.id);

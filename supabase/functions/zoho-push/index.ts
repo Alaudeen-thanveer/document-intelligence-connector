@@ -467,7 +467,7 @@ Deno.serve(async (req) => {
       let attachRaw: unknown = null;
       let filename = "";
       try {
-        const file = await loadDocumentBytes(supabase, doc.file_url as string);
+        const file = await loadDocumentBytes(supabase, doc.file_url as string, companyId);
         filename = file.filename;
         const attachPath = postAs === "invoice"
           ? `invoices/${encodeURIComponent(externalDocId)}/attachment`
@@ -829,7 +829,7 @@ Deno.serve(async (req) => {
       recoveredExisting = true;
     }
 
-    const file = await loadDocumentBytes(supabase, doc.file_url as string);
+    const file = await loadDocumentBytes(supabase, doc.file_url as string, companyId);
 
     // On recovery the attachment may already be on the bill — don't duplicate.
     let skipAttach = false;

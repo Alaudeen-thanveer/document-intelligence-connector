@@ -6,6 +6,8 @@ import { corsHeaders } from "../_shared/cors.ts";
 import { createClient, SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { assertSafeFile, MAX_FILE_BYTES, UnsafeFile } from "../_shared/file_safety.ts";
+import { companyObjectPath, StoredFileRefused, storageRef } from "../_shared/storage.ts";
 
 const CORS_HEADERS = corsHeaders();
 
@@ -18,7 +20,10 @@ interface IngestInput {
   content_type?: string;
   /** Raw file as base64 (preferred for email + upload-via-ingest). */
   file_base64?: string;
-  /** Already-uploaded public storage URL (legacy upload path). */
+  /**
+   * An object already in the invoices bucket (storage://invoices/{company}/…).
+   * Must sit under the caller's company; external URLs are refused.
+   */
   file_url?: string;
   sender?: string | null;
   /** When true, skip judgment (tests only). Default false. */
@@ -112,8 +117,6 @@ Deno.serve(async (req) => {
   }
 
   const filename = sanitizeFilename(input.filename ?? "document.pdf");
-  const contentType = (input.content_type ?? "application/pdf").split(";")[0]
-    .trim() || "application/pdf";
   const source: IngestSource = input.source ?? "upload";
 
   // A caller naming a company that is not theirs is refused outright rather
@@ -139,12 +142,25 @@ Deno.serve(async (req) => {
     );
   }
 
+  // Base64 is 4/3 the size of the file; refuse an oversized one before decoding.
+  if (input.file_base64 && input.file_base64.length > Math.ceil(MAX_FILE_BYTES * 4 / 3) + 64) {
+    return jsonResponse({ ok: false, error: "The file is larger than the upload limit." }, 413);
+  }
+
   try {
     const supabase = getSupabase();
-    let fileUrl = input.file_url?.trim() ?? "";
+    let fileUrl = "";
 
     if (input.file_base64) {
-      const bytes = decodeBase64(input.file_base64);
+      let bytes: Uint8Array;
+      try {
+        bytes = decodeBase64(input.file_base64);
+      } catch {
+        return jsonResponse({ ok: false, error: "file_base64 is not valid base64" }, 400);
+      }
+      // Size, real type from the bytes, and a malware scan — before storage.
+      // The stored Content-Type is what the bytes are, not what was claimed.
+      const contentType = await assertSafeFile(bytes, filename);
       // Private bucket path: {company_id}/{uuid}-{filename}
       const path = `${companyId}/${crypto.randomUUID()}-${filename}`;
       const { error: upErr } = await supabase.storage
@@ -156,7 +172,11 @@ Deno.serve(async (req) => {
         });
       if (upErr) throw new Error(`storage upload failed: ${upErr.message}`);
       // Stable storage ref (not a public URL). UI uses signed URLs to open.
-      fileUrl = `storage://invoices/${path}`;
+      fileUrl = storageRef(path);
+    } else {
+      // Only an object already in this company's folder of the store; never
+      // an arbitrary URL, never another company's file.
+      fileUrl = storageRef(companyObjectPath(input.file_url, companyId));
     }
 
     const { data: doc, error: insertError } = await supabase
@@ -199,6 +219,12 @@ Deno.serve(async (req) => {
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    if (err instanceof UnsafeFile) {
+      return jsonResponse({ ok: false, error: message }, 422);
+    }
+    if (err instanceof StoredFileRefused) {
+      return jsonResponse({ ok: false, error: message }, 404);
+    }
     console.error("ingest failed:", message);
     return jsonResponse({ ok: false, error: message }, 500);
   }

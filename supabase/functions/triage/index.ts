@@ -4,9 +4,10 @@
 // Auth: not exposed to the browser. Callers must use service_role (or a user
 // JWT). Anon Bearer is rejected — Situation B.
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "npm:@supabase/supabase-js@2";
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { isAuthFail, requireAuth } from "../_shared/require_user.ts";
 import { companyForCaller, isCompanyFail } from "../_shared/tenant.ts";
+import { companyObjectPath, loadCompanyFile, StoredFileRefused, storageRef } from "../_shared/storage.ts";
 
 type DocType = "invoice" | "purchase_order" | "tax_notice" | "irrelevant";
 
@@ -16,6 +17,8 @@ interface TriageInput {
   filename: string;
   /** Existing documents.id to update; if omitted, a new row is created. */
   document_id?: string;
+  /** Company for a new row; must be one the caller belongs to. */
+  company_id?: string;
   source?: string;
 }
 
@@ -150,15 +153,19 @@ function classifyByHeuristics(
   return null;
 }
 
-/** Pull a bounded amount of text, preferring content that looks like page 1. */
-async function extractPage1Text(fileUrl: string): Promise<string> {
-  const res = await fetch(fileUrl);
-  if (!res.ok) {
-    throw new Error(`Failed to fetch file (${res.status}): ${fileUrl}`);
-  }
-
-  const contentType = (res.headers.get("content-type") ?? "").toLowerCase();
-  const bytes = new Uint8Array(await res.arrayBuffer());
+/**
+ * Pull a bounded amount of text, preferring content that looks like page 1.
+ * The file comes from this company's folder of the document store only,
+ * through a signed URL — this used to fetch() whatever URL it was handed.
+ */
+async function extractPage1Text(
+  supabase: SupabaseClient,
+  fileUrl: string,
+  companyId: string,
+): Promise<string> {
+  const file = await loadCompanyFile(supabase, fileUrl, companyId);
+  const contentType = file.contentType.toLowerCase();
+  const bytes = file.bytes;
   const maxChars = 4000;
 
   if (
@@ -252,25 +259,29 @@ async function classifyWithLlm(page1Text: string): Promise<Classification> {
   };
 }
 
-async function persistClassification(
-  input: TriageInput,
-  classification: Classification,
-): Promise<{ document_id: string }> {
+function getSupabase(): SupabaseClient {
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   if (!supabaseUrl || !serviceKey) {
     throw new Error("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set");
   }
-
-  const supabase = createClient(supabaseUrl, serviceKey, {
+  return createClient(supabaseUrl, serviceKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
+}
 
+async function persistClassification(
+  supabase: SupabaseClient,
+  input: TriageInput,
+  classification: Classification,
+  companyId: string,
+  fileRef: string,
+): Promise<{ document_id: string }> {
   const fields = {
     doc_type: classification.doc_type,
     confidence: classification.confidence,
     status: "triaged",
-    file_url: input.file_url,
+    file_url: fileRef,
   };
 
   if (input.document_id) {
@@ -278,18 +289,21 @@ async function persistClassification(
       .from("documents")
       .update(fields)
       .eq("id", input.document_id)
+      .eq("company_id", companyId)
       .select("id")
       .single();
     if (error) throw new Error(`documents update failed: ${error.message}`);
     return { document_id: data.id as string };
   }
 
+  // The company is always the verified one. This insert used to name none
+  // and fell through to the column default — one fixed company for everyone.
   const { data, error } = await supabase
     .from("documents")
     .insert({
       ...fields,
       source: input.source ?? "webhook",
-      file_url: input.file_url,
+      company_id: companyId,
     })
     .select("id")
     .single();
@@ -312,14 +326,15 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: "Invalid JSON body" }, 400);
   }
 
-  if (input.document_id) {
-    // Optional here, but if they named one it has to be theirs.
-    const tenant = await companyForCaller(auth, {
-      documentId: input.document_id,
-      errorBody: (m) => ({ error: m }),
-    });
-    if (isCompanyFail(tenant)) return tenant.response;
-  }
+  // Always: the document named, else the company named, else the caller's
+  // own. A new document is never created without a verified company.
+  const tenant = await companyForCaller(auth, {
+    documentId: input?.document_id ?? null,
+    companyId: typeof input?.company_id === "string" ? input.company_id : null,
+    errorBody: (m) => ({ error: m }),
+  });
+  if (isCompanyFail(tenant)) return tenant.response;
+  const companyId = tenant.companyId;
 
   if (!input?.file_url || !input?.sender || !input?.filename) {
     return jsonResponse(
@@ -328,18 +343,33 @@ Deno.serve(async (req) => {
     );
   }
 
+  let fileRef: string;
   try {
+    fileRef = storageRef(companyObjectPath(input.file_url, companyId));
+  } catch (err) {
+    if (err instanceof StoredFileRefused) return jsonResponse({ error: err.message }, 404);
+    throw err;
+  }
+
+  try {
+    const supabase = getSupabase();
     let classification = classifyByHeuristics(input.filename, input.sender);
 
     if (
       !classification ||
       classification.confidence < HEURISTIC_CONFIDENCE_THRESHOLD
     ) {
-      const page1 = await extractPage1Text(input.file_url);
+      const page1 = await extractPage1Text(supabase, fileRef, companyId);
       classification = await classifyWithLlm(page1);
     }
 
-    const { document_id } = await persistClassification(input, classification);
+    const { document_id } = await persistClassification(
+      supabase,
+      input,
+      classification,
+      companyId,
+      fileRef,
+    );
 
     return jsonResponse({
       document_id,
