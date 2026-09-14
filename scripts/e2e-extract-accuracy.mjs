@@ -86,7 +86,9 @@ const headers = {
 };
 
 const pdf = buildInvoicePdf();
-const objectPath = `accuracy/${Date.now()}-acme-invoice-1042.pdf`;
+// Files live under their company's folder; functions refuse any other path.
+const COMPANY_ID = process.env.COMPANY_ID || "00000000-0000-4000-8000-000000000001";
+const objectPath = `${COMPANY_ID}/accuracy/${Date.now()}-acme-invoice-1042.pdf`;
 
 const uploadRes = await fetch(
   `${supabaseUrl}/storage/v1/object/invoices/${objectPath}`,
@@ -106,7 +108,7 @@ if (!uploadRes.ok) {
 }
 
 const fileUrl =
-  `${supabaseUrl}/storage/v1/object/public/invoices/${objectPath}`;
+  `storage://invoices/${objectPath}`;
 
 const docRes = await fetch(`${supabaseUrl}/rest/v1/documents`, {
   method: "POST",
@@ -116,6 +118,7 @@ const docRes = await fetch(`${supabaseUrl}/rest/v1/documents`, {
     Prefer: "return=representation",
   },
   body: JSON.stringify({
+    company_id: COMPANY_ID,
     source: "accuracy_check",
     file_url: fileUrl,
     status: "triaged",

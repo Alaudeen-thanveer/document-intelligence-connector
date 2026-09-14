@@ -353,3 +353,69 @@ test("a member cannot forge audit_log rows from the browser", async () => {
   });
   assert.ok(res.status >= 400, `browser inserted into audit_log (${res.status})`);
 });
+
+// --- 4. row-level security: membership + auth.uid(), nothing for anon -------
+test("a login stamped with a company it is not a member of sees none of that company", async () => {
+  const email = `sec-stamp-${Date.now()}@local.test`;
+  const u = await svc("/auth/v1/admin/users", {
+    method: "POST",
+    body: JSON.stringify({ email, password: PASSWORD, email_confirm: true, app_metadata: { company_id: A.company } }),
+  }).then((r) => r.json());
+  try {
+    // A bank statement and a setting in A for the stamp to reach, if it could.
+    const st = await svc("/rest/v1/bank_statements", {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ company_id: A.company, bank_account_zoho_id: "sec-1", source: "paste", line_count: 0 }),
+    });
+    assert.ok(st.ok, await st.text());
+    const token = await signIn(email);
+    for (const table of ["company_config", "bank_statements", "bank_statement_lines", "audit_log", "bk_history_raw", "zoho_api_calls", "documents", "approval_events"]) {
+      const rows = await call(ANON, token)(`/rest/v1/${table}?select=company_id`).then((r) => r.json());
+      assert.ok(Array.isArray(rows), `${table}: ${JSON.stringify(rows)}`);
+      assert.equal(rows.filter((r) => r.company_id === A.company).length, 0, `${table} honoured a stamp without membership`);
+    }
+    const write = await call(ANON, token)(`/rest/v1/company_config?company_id=eq.${A.company}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ company_name: "stamp-only write" }),
+    }).then((r) => r.json());
+    assert.deepEqual(write, [], "a stamp without membership changed A's settings");
+  } finally {
+    await svc(`/rest/v1/bank_statements?company_id=eq.${A.company}`, { method: "DELETE" });
+    await svc(`/auth/v1/admin/users/${u.id}`, { method: "DELETE" });
+  }
+});
+
+test("anon can read, write or call nothing in the tenant schema", async () => {
+  for (const table of ["documents", "company_config", "company_members", "bank_statement_lines", "zoho_entities", "zoho_connections", "approval_events", "documents_grid"]) {
+    const res = await anon(`/rest/v1/${table}?select=*&limit=1`);
+    const body = await res.text();
+    assert.ok(res.status >= 400 || body === "[]", `anon read ${table}: ${res.status} ${body.slice(0, 120)}`);
+    const ins = await anon(`/rest/v1/${table}`, { method: "POST", body: "{}" });
+    assert.ok(ins.status >= 400, `anon wrote ${table}: ${ins.status}`);
+  }
+  for (const fn of ["current_company_id", "user_in_company", "my_companies", "set_current_company", "approval_events_verify"]) {
+    const res = await anon(`/rest/v1/rpc/${fn}`, { method: "POST", body: "{}" });
+    assert.ok(res.status >= 400, `anon called ${fn}: ${res.status}`);
+  }
+});
+
+test("a row inserted without company_id lands in the caller's company, or nowhere", async () => {
+  const vendor = `sec-vendor-${Date.now()}`;
+  const mine = await asUser(A)("/rest/v1/vendor_account_rules", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({ vendor_zoho_id: vendor, vendor_name: "Sec Vendor", account_zoho_id: "1", account_name: "x" }),
+  });
+  const text = await mine.text();
+  assert.equal(mine.status, 201, text);
+  assert.equal(JSON.parse(text)[0].company_id, A.company, "the default filed the row outside the caller's company");
+  await svc(`/rest/v1/vendor_account_rules?vendor_zoho_id=eq.${vendor}`, { method: "DELETE" });
+
+  const orphan = await svc("/rest/v1/documents", {
+    method: "POST",
+    body: JSON.stringify({ source: "upload", file_url: "x", status: "uploaded", doc_type: "invoice" }),
+  });
+  assert.ok(orphan.status >= 400, `a document with no company was accepted (${orphan.status})`);
+});

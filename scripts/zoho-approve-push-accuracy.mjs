@@ -115,7 +115,9 @@ async function rest(path, init = {}) {
 }
 
 const pdf = buildInvoicePdf();
-const objectPath = `accuracy/zoho-${Date.now()}.pdf`;
+// Files live under their company's folder; functions refuse any other path.
+const COMPANY_ID = process.env.COMPANY_ID || "00000000-0000-4000-8000-000000000001";
+const objectPath = `${COMPANY_ID}/accuracy/zoho-${Date.now()}.pdf`;
 const up = await fetch(
   `${supabaseUrl}/storage/v1/object/invoices/${objectPath}`,
   {
@@ -134,11 +136,12 @@ if (!up.ok) {
   process.exit(1);
 }
 const fileUrl =
-  `${supabaseUrl}/storage/v1/object/public/invoices/${objectPath}`;
+  `storage://invoices/${objectPath}`;
 
 const [doc] = await rest("/rest/v1/documents", {
   method: "POST",
   body: JSON.stringify({
+    company_id: COMPANY_ID,
     source: "zoho_accuracy",
     file_url: fileUrl,
     status: "needs_review",
