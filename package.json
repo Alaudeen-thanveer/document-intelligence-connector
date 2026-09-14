@@ -12,6 +12,7 @@
     "web:dev": "npm --prefix apps/web run dev",
     "web:build": "npm --prefix apps/web run build",
     "test:isolation": "node --test scripts/tenant-isolation.test.mjs",
+    "test:security": "node --test scripts/security-hardening.test.mjs",
     "typecheck:functions": "node scripts/typecheck-functions.mjs"
   },
   "devDependencies": {

@@ -104,13 +104,14 @@ export async function zohoAuthFor(
 ): Promise<ZohoAuth> {
   const conn = await loadConnection(supabase, companyId);
 
-  const { data: cached } = opts.forceRefresh
+  // The cached token is encrypted in Vault; this RPC decrypts it for the
+  // service role only, and only while it is unexpired.
+  const { data: cachedRows } = opts.forceRefresh
     ? { data: null }
-    : await supabase
-    .from("zoho_access_tokens")
-    .select("access_token, expires_at")
-    .eq("company_id", companyId)
-    .maybeSingle();
+    : await supabase.rpc("zoho_access_token_get", { p_company_id: companyId });
+  const cached = (Array.isArray(cachedRows) ? cachedRows[0] : null) as
+    | { access_token?: string; expires_at?: string }
+    | null;
 
   if (cached?.access_token && cached.expires_at) {
     const expiresAt = Date.parse(String(cached.expires_at));
@@ -143,12 +144,14 @@ export async function zohoAuthFor(
   }
 
   const accessToken = String(payload.access_token);
-  await supabase.from("zoho_access_tokens").upsert({
-    company_id: companyId,
-    access_token: accessToken,
-    expires_at: new Date(Date.now() + 55 * 60_000).toISOString(),
-    updated_at: new Date().toISOString(),
+  // Into Vault, never a plain column. A failed cache write is not fatal: the
+  // token is still good for this request, the next one just refreshes again.
+  const { error: putError } = await supabase.rpc("zoho_access_token_put", {
+    p_company_id: companyId,
+    p_access_token: accessToken,
+    p_expires_at: new Date(Date.now() + 55 * 60_000).toISOString(),
   });
+  if (putError) console.warn(`Could not cache the Zoho access token: ${putError.message}`);
 
   return {
     accessToken,

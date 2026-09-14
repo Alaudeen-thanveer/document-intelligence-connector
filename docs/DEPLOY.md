@@ -37,9 +37,11 @@ What the chain leaves you with, and what to check:
   pg_tables where schemaname = 'public' and not rowsecurity;` must be 0.
 - The `invoices` storage bucket **private**. The migration that makes it so
   raises if it is still public; if `db push` succeeds, it is private.
-- Vault enabled (the per-company Zoho refresh token lives there). The
-  `zoho_refresh_token` and `zoho_connect` functions are granted to
-  `service_role` only.
+- Vault enabled. Both Zoho credentials live there, encrypted: the
+  per-company refresh token and the short-lived access token it mints
+  (`zoho_access_tokens` holds only the secret id and expiry). The
+  `zoho_refresh_token`, `zoho_connect`, `zoho_access_token_get` and
+  `zoho_access_token_put` functions are granted to `service_role` only.
 
 ## 3. Secrets — before any function is deployed
 
