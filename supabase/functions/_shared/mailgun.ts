@@ -42,8 +42,13 @@ export async function verifyMailgunWebhook(
     console.error("MAILGUN_WEBHOOK_SKIP_VERIFY is set on a non-local stack; ignoring it.");
   }
 
+  // Unconfigured is a refusal, not a crash: nothing can be verified, and an
+  // anonymous caller should get the same 401 as any other unsigned webhook.
   const key = Deno.env.get("MAILGUN_SIGNING_KEY")?.trim();
-  if (!key) throw new Error("MAILGUN_SIGNING_KEY is not set");
+  if (!key) {
+    console.error("MAILGUN_SIGNING_KEY is not set; refusing every inbound webhook.");
+    return { ok: false, reason: "signing key not configured" };
+  }
 
   const { timestamp, token, signature } = fields;
   const ts = Number(timestamp);
